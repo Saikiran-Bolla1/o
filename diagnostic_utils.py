@@ -224,6 +224,7 @@ def build_comprehensive_dtc_results_table(
         "data": table_data
     }
 
+
 def build_dtc_rule_summary_table(
     allowed_dtcs: List[DTCInfo],
     expected_dtcs: List[DTCInfo],
