@@ -154,14 +154,16 @@ def status_matches(dut_status: str, rule_status: str) -> bool:
             return False
     return s_dut.replace("0x", "").replace("0b", "") == s_rule.replace("0x", "").replace("0b", "")
 
+
 def build_comprehensive_dtc_results_table(
-    dut_dtcs: List[DTCInfo],
-    allowed_dtcs: List[DTCInfo],
-    muted_dtcs: List[DTCInfo],
-    expected_dtcs: List[DTCInfo]
+        dut_dtcs: List[DTCInfo],
+        allowed_dtcs: List[DTCInfo],
+        muted_dtcs: List[DTCInfo],
+        expected_dtcs: List[DTCInfo]
 ) -> Dict[str, Any]:
     """
     Builds a comprehensive results table for DTC evaluation.
+    Handles special cases for "status=any" in expected and muted rules.
     """
     table_data = []
     rule_sets = [
@@ -177,10 +179,20 @@ def build_comprehensive_dtc_results_table(
             for rule in rules:
                 if dtc_matches_code(dut, rule):
                     dtc_plus_status = f"{parse_hex_or_bin(rule.DTC)}+{parse_hex_or_bin(rule.status)}"
-                    if status_matches(dut.status, rule.status):
-                        result = "none" if type_name in [STATUS_ALLOWED, STATUS_MUTED] else "pass"
+
+                    # Handle "status=any" for specific rule types
+                    if rule.status == STATUS_ANY:
+                        if type_name == STATUS_EXPECTED:
+                            result = "pass"  # Expected DTCs with "status=any" should pass
+                        elif type_name in [STATUS_ALLOWED, STATUS_MUTED]:
+                            result = "none"  # Muted/Allowed DTCs with "status=any" should result in "none"
                     else:
-                        result = "fail"
+                        # Regular status matching logic
+                        if status_matches(dut.status, rule.status):
+                            result = "none" if type_name in [STATUS_ALLOWED, STATUS_MUTED] else "pass"
+                        else:
+                            result = "fail"
+
                     row = [
                         dtc_code,
                         dtc_status,
@@ -194,6 +206,8 @@ def build_comprehensive_dtc_results_table(
                     break
             if found:
                 break
+
+        # If no match is found, mark as "Unexpected"
         if not found:
             row = [
                 dtc_code,
