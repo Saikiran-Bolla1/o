@@ -71,18 +71,6 @@ class DiagResponse:
                 f"response={self.response}, expected={self.expected}, "
                 f"type={self.responsetype}, result={self.result})")
 
-def parse_hex_or_bin(val: str) -> str:
-    """
-    Converts a value to hexadecimal or binary representation as a string.
-    Handles strings, integers, and invalid inputs gracefully.
-    """
-    try:
-        if isinstance(val, str) and val.lower().startswith("0x"):
-            return val.lower()
-        return hex(int(str(val), 0))
-    except (ValueError, TypeError):
-        return str(val)
-
 
 
 def get_muted_dtcs() -> List[DTCInfo]:
@@ -94,8 +82,7 @@ def get_muted_dtcs() -> List[DTCInfo]:
         muted = config.muted_troubles.DTC if config and config.muted_troubles else []
     except AttributeError:
         muted = []
-    return [DTCInfo(DTC=parse_hex_or_bin(x), status=STATUS_ANY) for x in (muted or [])]
-
+    return [DTCInfo(DTC=parse_to_int_or_hex(x), status=STATUS_ANY) for x in (muted or [])]
 
 def dtc_matches_code(dtc: DTCInfo, rule: DTCInfo) -> bool:
     """
@@ -109,50 +96,41 @@ def dtc_matches_code(dtc: DTCInfo, rule: DTCInfo) -> bool:
         bool: True if the codes match, False otherwise.
     """
     try:
-        dtc_code = parse_hex_or_bin(dtc.DTC)
-        rule_code = parse_hex_or_bin(rule.DTC)
+        dtc_code = parse_to_int_or_hex(dtc.DTC)
+        rule_code = parse_to_int_or_hex(rule.DTC)
         return dtc_code == rule_code
     except Exception as e:
-        # Log or handle error if needed
         print(f"Error in dtc_matches_code: {e}")
         return False
 
 def status_matches(dut_status: str, rule_status: str) -> bool:
     """
     Compares the status of the DUT with the rule status.
-    Handles "any" status and binary patterns.
+    Handles "any" status.
     """
-    s_dut = str(dut_status).lower()
-    s_rule = str(rule_status).lower()
-    if s_rule == STATUS_ANY:
-        return True
-    if s_rule.startswith("0b"):
-        try:
-            rule_val = int(s_rule, 2)
-            dut_val = int(s_dut, 16) if s_dut.startswith("0x") else int(s_dut, 2)
-            return dut_val == rule_val
-        except (ValueError, TypeError):
-            return False
-    if set(s_rule) <= {"0", "1", "*"} and 1 <= len(s_rule) <= 8:
-        try:
-            pattern = s_rule.ljust(8, '*')
-            dut_bin = bin(int(s_dut, 16))[2:].zfill(8) if s_dut.startswith("0x") else bin(int(s_dut, 2))[2:].zfill(8)
-            for idx, rs in enumerate(pattern):
-                if rs == "1" and dut_bin[idx] != "1":
-                    return False
-                if rs == "0" and dut_bin[idx] != "0":
-                    return False
-            return True
-        except (ValueError, TypeError):
-            return False
-    if s_rule.startswith("0x"):
-        try:
-            rule_val = int(s_rule, 16)
-            dut_val = int(s_dut, 16) if s_dut.startswith("0x") else int(s_dut, 2)
-            return dut_val == rule_val
-        except (ValueError, TypeError):
-            return False
-    return s_dut.replace("0x", "").replace("0b", "") == s_rule.replace("0x", "").replace("0b", "")
+    if rule_status == STATUS_ANY:
+        return True  # Matches any status
+    try:
+        dut_status_int = parse_to_int_or_hex(dut_status)
+        rule_status_int = parse_to_int_or_hex(rule_status)
+        return dut_status_int == rule_status_int
+    except ValueError:
+        return False
+
+def parse_to_int_or_hex(value: str) -> str:
+    """
+    Converts a value to hexadecimal string for consistent comparison and reporting.
+    Handles the special case for "any" and binary strings (0b), as well as wildcard patterns.
+    """
+    if isinstance(value, str) and value.lower() == STATUS_ANY:
+        return STATUS_ANY  # Return "any" directly
+    if isinstance(value, str) and value.lower().startswith("0x"):
+        return value.lower()
+    if isinstance(value, str) and value.lower().startswith("0b"):
+        return f"0x{int(value, 2):02X}"  # Convert binary to hex
+    if isinstance(value, str) and set(value) <= {"0", "1", "*"}:
+        return value  # Return wildcard patterns as-is
+    return f"0x{int(value):02X}"
 
 
 def build_comprehensive_dtc_results_table(
@@ -172,13 +150,13 @@ def build_comprehensive_dtc_results_table(
         (STATUS_EXPECTED, expected_dtcs),
     ]
     for dut in dut_dtcs:
-        dtc_code = parse_hex_or_bin(dut.DTC)
-        dtc_status = parse_hex_or_bin(dut.status)
+        dtc_code = parse_to_int_or_hex(dut.DTC)
+        dtc_status = parse_to_int_or_hex(dut.status)
         found = False
         for type_name, rules in rule_sets:
             for rule in rules:
                 if dtc_matches_code(dut, rule):
-                    dtc_plus_status = f"{parse_hex_or_bin(rule.DTC)}+{parse_hex_or_bin(rule.status)}"
+                    dtc_plus_status = f"{parse_to_int_or_hex(rule.DTC)}+{parse_to_int_or_hex(rule.status)}"
 
                     # Handle "status=any" for specific rule types
                     if rule.status == STATUS_ANY:
@@ -230,18 +208,24 @@ def build_dtc_rule_summary_table(
     expected_dtcs: List[DTCInfo],
     muted_dtcs: List[DTCInfo]
 ) -> Dict[str, Any]:
+    """
+    Builds the rule summary table with DTC codes and statuses formatted in hexadecimal.
+    """
     table_data = []
     for rule in allowed_dtcs:
-        table_data.append([STATUS_ALLOWED, parse_hex_or_bin(rule.DTC), parse_hex_or_bin(rule.status)])
+        table_data.append([STATUS_ALLOWED, parse_to_int_or_hex(rule.DTC), parse_to_int_or_hex(rule.status)])
     for rule in expected_dtcs:
-        table_data.append([STATUS_EXPECTED, parse_hex_or_bin(rule.DTC), parse_hex_or_bin(rule.status)])
+        table_data.append([STATUS_EXPECTED, parse_to_int_or_hex(rule.DTC), parse_to_int_or_hex(rule.status)])
     for rule in muted_dtcs:
-        table_data.append([STATUS_MUTED, parse_hex_or_bin(rule.DTC), parse_hex_or_bin(rule.status)])
+        table_data.append([STATUS_MUTED, parse_to_int_or_hex(rule.DTC), parse_to_int_or_hex(rule.status)])
     return {
         "name": "DTC Rule Summary",
         "column_header": ["Type", "DTC", "Status"],
         "data": table_data
     }
+
+
+
 
 def evaluate_dtc_block(
     dut_dtcs: List[DTCInfo],
@@ -278,10 +262,8 @@ def evaluate_dtc_block(
     add_step(status, f"DTC evaluation overall status: {status}")
 
     for dtc in dut_dtcs:
-        dtc_objs.append(DTC(parse_hex_or_bin(dtc.DTC), parse_hex_or_bin(dtc.status)))
+        dtc_objs.append(DTC(parse_to_int_or_hex(dtc.DTC), parse_to_int_or_hex(dtc.status)))
     return dtc_objs
-
-
 
 def evaluate_diagnostic_expected_response(
     did: Any,
