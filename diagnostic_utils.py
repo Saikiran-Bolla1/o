@@ -72,6 +72,10 @@ class DiagResponse:
                 f"type={self.responsetype}, result={self.result})")
 
 def parse_hex_or_bin(val: str) -> str:
+    """
+    Converts a value to hexadecimal or binary representation as a string.
+    Handles strings, integers, and invalid inputs gracefully.
+    """
     try:
         if isinstance(val, str) and val.lower().startswith("0x"):
             return val.lower()
@@ -79,7 +83,12 @@ def parse_hex_or_bin(val: str) -> str:
     except (ValueError, TypeError):
         return str(val)
 
+
+
 def get_muted_dtcs() -> List[DTCInfo]:
+    """
+    Retrieves muted DTCs from the configuration.
+    """
     config = ConfigManager().config
     try:
         muted = config.muted_troubles.DTC if config and config.muted_troubles else []
@@ -87,7 +96,32 @@ def get_muted_dtcs() -> List[DTCInfo]:
         muted = []
     return [DTCInfo(DTC=parse_hex_or_bin(x), status=STATUS_ANY) for x in (muted or [])]
 
+
+def dtc_matches_code(dtc: DTCInfo, rule: DTCInfo) -> bool:
+    """
+    Compares the DTC code of the DUT and the rule for a match.
+
+    Args:
+        dtc (DTCInfo): DTC object from the DUT.
+        rule (DTCInfo): DTC object from the rule.
+
+    Returns:
+        bool: True if the codes match, False otherwise.
+    """
+    try:
+        dtc_code = parse_hex_or_bin(dtc.DTC)
+        rule_code = parse_hex_or_bin(rule.DTC)
+        return dtc_code == rule_code
+    except Exception as e:
+        # Log or handle error if needed
+        print(f"Error in dtc_matches_code: {e}")
+        return False
+
 def status_matches(dut_status: str, rule_status: str) -> bool:
+    """
+    Compares the status of the DUT with the rule status.
+    Handles "any" status and binary patterns.
+    """
     s_dut = str(dut_status).lower()
     s_rule = str(rule_status).lower()
     if s_rule == STATUS_ANY:
@@ -95,24 +129,14 @@ def status_matches(dut_status: str, rule_status: str) -> bool:
     if s_rule.startswith("0b"):
         try:
             rule_val = int(s_rule, 2)
-            if s_dut.startswith("0x"):
-                dut_val = int(s_dut, 16)
-            elif s_dut.startswith("0b"):
-                dut_val = int(s_dut, 2)
-            else:
-                dut_val = int(s_dut, 16)
+            dut_val = int(s_dut, 16) if s_dut.startswith("0x") else int(s_dut, 2)
             return dut_val == rule_val
         except (ValueError, TypeError):
             return False
     if set(s_rule) <= {"0", "1", "*"} and 1 <= len(s_rule) <= 8:
         try:
             pattern = s_rule.ljust(8, '*')
-            if s_dut.startswith("0x"):
-                dut_bin = bin(int(s_dut, 16))[2:].zfill(8)
-            elif s_dut.startswith("0b"):
-                dut_bin = bin(int(s_dut, 2))[2:].zfill(8)
-            else:
-                dut_bin = bin(int(s_dut, 16))[2:].zfill(8)
+            dut_bin = bin(int(s_dut, 16))[2:].zfill(8) if s_dut.startswith("0x") else bin(int(s_dut, 2))[2:].zfill(8)
             for idx, rs in enumerate(pattern):
                 if rs == "1" and dut_bin[idx] != "1":
                     return False
@@ -124,19 +148,11 @@ def status_matches(dut_status: str, rule_status: str) -> bool:
     if s_rule.startswith("0x"):
         try:
             rule_val = int(s_rule, 16)
-            if s_dut.startswith("0x"):
-                dut_val = int(s_dut, 16)
-            elif s_dut.startswith("0b"):
-                dut_val = int(s_dut, 2)
-            else:
-                dut_val = int(s_dut, 16)
+            dut_val = int(s_dut, 16) if s_dut.startswith("0x") else int(s_dut, 2)
             return dut_val == rule_val
         except (ValueError, TypeError):
             return False
     return s_dut.replace("0x", "").replace("0b", "") == s_rule.replace("0x", "").replace("0b", "")
-
-def dtc_matches_code(dtc: DTCInfo, rule: DTCInfo) -> bool:
-    return str(dtc.DTC).lower() == str(rule.DTC).lower()
 
 def build_comprehensive_dtc_results_table(
     dut_dtcs: List[DTCInfo],
@@ -144,6 +160,9 @@ def build_comprehensive_dtc_results_table(
     muted_dtcs: List[DTCInfo],
     expected_dtcs: List[DTCInfo]
 ) -> Dict[str, Any]:
+    """
+    Builds a comprehensive results table for DTC evaluation.
+    """
     table_data = []
     rule_sets = [
         (STATUS_ALLOWED, allowed_dtcs),
@@ -215,10 +234,17 @@ def evaluate_dtc_block(
     expected_dtcs: List[DTCInfo],
     report: Any = None
 ) -> List[DTC]:
+    """
+    Evaluates DTCs based on allowed, expected, and muted rules.
+    """
     muted_dtcs = get_muted_dtcs()
+    dtc_objs = []
+
+    # Generate summary table for the rules
     summary_table = build_dtc_rule_summary_table(allowed_dtcs, expected_dtcs, muted_dtcs)
     add_table(summary_table)
-    dtc_objs = []
+
+    # If no DTCs are present, return PASS
     if not dut_dtcs:
         table = {
             "name": "DTC Comprehensive Evaluation",
@@ -229,6 +255,7 @@ def evaluate_dtc_block(
         add_step("PASS", "DTC evaluation overall status: PASS")
         return dtc_objs
 
+    # Comprehensive evaluation of DTCs
     table = build_comprehensive_dtc_results_table(dut_dtcs, allowed_dtcs, muted_dtcs, expected_dtcs)
     results = [row[5] for row in table["data"] if row[5]]
     status = "FAIL" if any(r == "fail" for r in results) else "PASS"
@@ -238,6 +265,8 @@ def evaluate_dtc_block(
     for dtc in dut_dtcs:
         dtc_objs.append(DTC(parse_hex_or_bin(dtc.DTC), parse_hex_or_bin(dtc.status)))
     return dtc_objs
+
+
 
 def evaluate_diagnostic_expected_response(
     did: Any,
@@ -366,7 +395,7 @@ def evaluate_diagnostic_expected_response(
             tx_bytes=to_hex_str(did_bytes),
             rx_bytes=to_hex_str(actual_bytes),
             expected=to_hex_str(expected_bytes) if expected_bytes is not None else to_hex_str(expected_response),
-            status=result
+            status=result  # Ensure this uses the correct evaluation result
         )
     except Exception as e:
         table = {
