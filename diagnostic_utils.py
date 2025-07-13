@@ -125,7 +125,7 @@ def parse_to_int_or_hex(value: str) -> str:
     if isinstance(value, str) and value.lower() == STATUS_ANY:
         return STATUS_ANY  # Return "any" directly
     if isinstance(value, str) and value.lower().startswith("0x"):
-        return value.lower()
+        return f"0x{int(value, 16):X}".lower()
     if isinstance(value, str) and value.lower().startswith("0b"):
         return f"0x{int(value, 2):02X}"  # Convert binary to hex
     if isinstance(value, str) and set(value) <= {"0", "1", "*"}:
@@ -333,10 +333,14 @@ def evaluate_diagnostic_expected_response(
     # Case: No expected response
     if expected_response == "none":
         responsetype = "none"
-        if not actual_response:
-            result = "NONE"
-        else:
-            reason = f"Expected no response, got {to_hex_str(actual_response)}"
+        result = "NONE"  # Always set status to "NONE", regardless of actual response
+        reason = f"Expected no response, received: {to_hex_str(actual_response)}" if actual_response else "Expected no response and none was received"
+
+    # Case: Any other expected response
+    elif not actual_response:
+        # Throw an error if actual_response is empty but expected_response is not "none"
+        reason = f"Expected response {to_hex_str(expected_response)}, but received no response."
+        raise ValueError(reason)
 
     # Case: Length check for 0x22 with ln(N) format
     elif isinstance(expected_response, str) and expected_response.startswith("ln(") and expected_response.endswith(")"):
