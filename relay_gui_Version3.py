@@ -39,7 +39,7 @@ class RelayControl(QWidget):
         self.current_page = 0
         self.switch_states = {}  # {(DeviceID, PinNo): value}
         self.fault_map = {}
-        self.shorttopin_pairs = {}  # {(group_idx): target_idx}
+        self.shorttopin_pairs = {}  # {group_idx: target_idx}
 
         main_layout = QVBoxLayout(self)
         nav_layout = QHBoxLayout()
@@ -148,43 +148,14 @@ class RelayControl(QWidget):
                     enabled = "Common" in fault_entry and len(self.groups) > 1
                 else:
                     enabled = False
-
                 btn.setEnabled(enabled)
 
-                if action == "OpenLoad" and enabled:
-                    entry = fault_entry.get("OpenLoad")
-                    device, pin = entry.get('DeviceID'), entry.get('PinNo')
-                    state = self.getswitch(device, pin)
-                elif action == "ShortToUBat" and enabled:
-                    entry1 = fault_entry.get("Common")
-                    entry2 = fault_entry.get("UBat")
-                    state = self.getswitch(entry1.get('DeviceID'), entry1.get('PinNo')) and self.getswitch(entry2.get('DeviceID'), entry2.get('PinNo'))
-                elif action == "ShortToGND" and enabled:
-                    entry1 = fault_entry.get("Common")
-                    entry2 = fault_entry.get("GND")
-                    state = self.getswitch(entry1.get('DeviceID'), entry1.get('PinNo')) and self.getswitch(entry2.get('DeviceID'), entry2.get('PinNo'))
-                elif action == "ShortToPin" and enabled:
-                    target_idx = self.shorttopin_pairs.get(idx)
-                    if target_idx is not None:
-                        target_line_key = self.group_line_keys[target_idx]
-                        src_entry = fault_entry.get("Common")
-                        tgt_entry = self.fault_map.get(target_line_key, {}).get("Common")
-                        if src_entry and tgt_entry:
-                            src_on = self.getswitch(src_entry.get('DeviceID'), src_entry.get('PinNo'))
-                            tgt_on = self.getswitch(tgt_entry.get('DeviceID'), tgt_entry.get('PinNo'))
-                            state = src_on and tgt_on
-                        else:
-                            state = 0
-                    else:
-                        state = 0
-                else:
-                    state = 0
-
-                btn.setChecked(bool(state))
+                # Set checked state according to actual activation
+                state = self.is_fault_active(idx, action)
+                btn.setChecked(state)
                 self.set_style(btn, state)
-
                 btn.clicked.connect(self.make_toggle_callback(idx, action, btn))
-                self.button_refs[(idx, action_idx)] = btn
+                self.button_refs[(idx, action)] = btn
                 group_row.addWidget(btn)
 
             container = QWidget()
@@ -203,16 +174,6 @@ class RelayControl(QWidget):
             btn.setStyleSheet("background-color: lightgreen")
         else:
             btn.setStyleSheet("background-color: lightgray")
-
-    def prev_page(self):
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.update_page()
-
-    def next_page(self):
-        if (self.current_page + 1) * GROUPS_PER_PAGE < len(self.groups):
-            self.current_page += 1
-            self.update_page()
 
     def deactivate_all_faults_in_group(self, group_idx):
         """Deactivate all faults in the group (set all relevant pins to 0) and reset ShortToPin pairing."""
@@ -245,67 +206,103 @@ class RelayControl(QWidget):
                 self.setswitch(tgt_entry.get('DeviceID'), tgt_entry.get('PinNo'), 0)
             self.shorttopin_pairs.pop(group_idx, None)
 
-    def toggle_switch(self, group_idx, action, btn):
+    def deactivate_shorttopin_for_target(self, target_idx):
+        """Deactivate shorttopin for all groups that target this group."""
+        to_remove = []
+        for src_idx, tgt_idx in self.shorttopin_pairs.items():
+            if tgt_idx == target_idx:
+                src_line_key = self.group_line_keys[src_idx]
+                tgt_line_key = self.group_line_keys[tgt_idx]
+                src_entry = self.fault_map.get(src_line_key, {}).get("Common")
+                tgt_entry = self.fault_map.get(tgt_line_key, {}).get("Common")
+                if src_entry and tgt_entry:
+                    self.setswitch(src_entry.get('DeviceID'), src_entry.get('PinNo'), 0)
+                    self.setswitch(tgt_entry.get('DeviceID'), tgt_entry.get('PinNo'), 0)
+                to_remove.append(src_idx)
+        for idx in to_remove:
+            self.shorttopin_pairs.pop(idx, None)
+
+    def is_fault_active(self, group_idx, action):
         line_key = self.group_line_keys[group_idx]
         fault_entry = self.fault_map.get(line_key, {})
-        # Deactivate all before activating the selected
+        if action == "OpenLoad":
+            entry = fault_entry.get("OpenLoad")
+            if entry:
+                return self.getswitch(entry.get('DeviceID'), entry.get('PinNo')) == 1
+        elif action == "ShortToUBat":
+            entry1 = fault_entry.get("Common")
+            entry2 = fault_entry.get("UBat")
+            if entry1 and entry2:
+                return self.getswitch(entry1.get('DeviceID'), entry1.get('PinNo')) == 1 \
+                       and self.getswitch(entry2.get('DeviceID'), entry2.get('PinNo')) == 1
+        elif action == "ShortToGND":
+            entry1 = fault_entry.get("Common")
+            entry2 = fault_entry.get("GND")
+            if entry1 and entry2:
+                return self.getswitch(entry1.get('DeviceID'), entry1.get('PinNo')) == 1 \
+                       and self.getswitch(entry2.get('DeviceID'), entry2.get('PinNo')) == 1
+        elif action == "ShortToPin":
+            if group_idx in self.shorttopin_pairs:
+                target_idx = self.shorttopin_pairs[group_idx]
+                src_entry = fault_entry.get("Common")
+                tgt_entry = self.fault_map.get(self.group_line_keys[target_idx], {}).get("Common")
+                if src_entry and tgt_entry:
+                    return self.getswitch(src_entry.get('DeviceID'), src_entry.get('PinNo')) == 1 \
+                           and self.getswitch(tgt_entry.get('DeviceID'), tgt_entry.get('PinNo')) == 1
+        return False
+
+    def toggle_switch(self, group_idx, action, btn):
+        # If already active, deactivate all
+        if self.is_fault_active(group_idx, action):
+            self.deactivate_all_faults_in_group(group_idx)
+            self.update_page()  # Refresh buttons
+            return
+
+        # Deactivate all faults in the group
         self.deactivate_all_faults_in_group(group_idx)
+
+        line_key = self.group_line_keys[group_idx]
+        fault_entry = self.fault_map.get(line_key, {})
 
         if action == "OpenLoad":
             entry = fault_entry.get("OpenLoad", {})
             device, pin = entry.get('DeviceID'), entry.get('PinNo')
-            new_state = 1
-            self.setswitch(device, pin, new_state)
-            btn.setChecked(True)
-            self.set_style(btn, True)
+            self.setswitch(device, pin, 1)
         elif action == "ShortToUBat":
             entry1 = fault_entry.get("Common", {})
             entry2 = fault_entry.get("UBat", {})
             dev1, pin1 = entry1.get('DeviceID'), entry1.get('PinNo')
             dev2, pin2 = entry2.get('DeviceID'), entry2.get('PinNo')
-            new_state = 1
-            self.setswitch(dev1, pin1, new_state)
-            self.setswitch(dev2, pin2, new_state)
-            btn.setChecked(True)
-            self.set_style(btn, True)
+            self.setswitch(dev1, pin1, 1)
+            self.setswitch(dev2, pin2, 1)
         elif action == "ShortToGND":
             entry1 = fault_entry.get("Common", {})
             entry2 = fault_entry.get("GND", {})
             dev1, pin1 = entry1.get('DeviceID'), entry1.get('PinNo')
             dev2, pin2 = entry2.get('DeviceID'), entry2.get('PinNo')
-            new_state = 1
-            self.setswitch(dev1, pin1, new_state)
-            self.setswitch(dev2, pin2, new_state)
-            btn.setChecked(True)
-            self.set_style(btn, True)
+            self.setswitch(dev1, pin1, 1)
+            self.setswitch(dev2, pin2, 1)
         elif action == "ShortToPin":
             src_entry = fault_entry.get("Common", {})
             if not src_entry:
                 QMessageBox.warning(self, "Error", "This line does not have a Common pin.")
                 return
-
-            target_idx = self.shorttopin_pairs.get(group_idx)
-            if target_idx is not None:
-                # Already paired: reverse both Common pins (deactivated by deactivate_all_faults_in_group)
-                btn.setChecked(False)
-                self.set_style(btn, False)
-            else:
-                # Prompt user to select another line
-                dlg = LineSelectDialog(self.groups, group_idx, self)
-                if dlg.exec_() == QDialog.Accepted:
-                    target_idx = dlg.get_selection()
-                    tgt_line_key = self.group_line_keys[target_idx]
-                    tgt_entry = self.fault_map.get(tgt_line_key, {}).get("Common", {})
-                    if not tgt_entry:
-                        QMessageBox.warning(self, "Error", "Selected line does not have a Common pin.")
-                        return
-                    dev1, pin1 = src_entry.get('DeviceID'), src_entry.get('PinNo')
-                    dev2, pin2 = tgt_entry.get('DeviceID'), tgt_entry.get('PinNo')
-                    self.setswitch(dev1, pin1, 1)
-                    self.setswitch(dev2, pin2, 1)
-                    btn.setChecked(True)
-                    self.set_style(btn, True)
-                    self.shorttopin_pairs[group_idx] = target_idx
+            dlg = LineSelectDialog(self.groups, group_idx, self)
+            if dlg.exec_() == QDialog.Accepted:
+                target_idx = dlg.get_selection()
+                # Deactivate any previous shorttopin with this target
+                self.deactivate_shorttopin_for_target(target_idx)
+                tgt_line_key = self.group_line_keys[target_idx]
+                tgt_entry = self.fault_map.get(tgt_line_key, {}).get("Common", {})
+                if not tgt_entry:
+                    QMessageBox.warning(self, "Error", "Selected line does not have a Common pin.")
+                    return
+                dev1, pin1 = src_entry.get('DeviceID'), src_entry.get('PinNo')
+                dev2, pin2 = tgt_entry.get('DeviceID'), tgt_entry.get('PinNo')
+                self.setswitch(dev1, pin1, 1)
+                self.setswitch(dev2, pin2, 1)
+                self.shorttopin_pairs[group_idx] = target_idx
+        self.update_page()  # Refresh buttons
 
     def setswitch(self, idevice, ipin, new_state):
         if idevice is None or ipin is None:
