@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 GROUPS_PER_PAGE = 12
-FAULT_TYPES = ["OpenLoad", "ShortToGND", "ShortToUBat", "ShortToCoil"]
+FAULT_TYPES = ["Openload", "Comman", "UBAT", "GND"]
 
 class RelayControl(QWidget):
     def __init__(self):
@@ -17,8 +17,8 @@ class RelayControl(QWidget):
         self.resize(1100, 750)
         self.groups = []
         self.current_page = 0
-        self.switch_states = {}  # {(device, switch): value}
-        self.fault_map = []      # Loaded from JSON
+        self.switch_states = {}  # {(device, pin): value}
+        self.fault_map = {}      # Loaded from JSON
         self.button_refs = {}    # {(group_idx, action_idx): button}
 
         main_layout = QVBoxLayout(self)
@@ -115,25 +115,27 @@ class RelayControl(QWidget):
             label.setFixedWidth(220)
             group_row.addWidget(label)
 
+            line_key = f"line_{idx+1}"
+            fault_entry = self.fault_map.get(line_key, {})
+
             for action_idx, fault in enumerate(FAULT_TYPES):
                 btn = QPushButton(fault)
                 btn.setCheckable(True)
-
-                # Get device & switch for this group/fault
-                entry = self.get_fault_entry(idx + 1, fault)
+                # Get device & pin for this group/fault
+                entry = fault_entry.get(fault)
                 if entry:
-                    device = entry['device']
-                    switch = entry['switch']
+                    device = entry.get('device')
+                    pin = entry.get('pin')
                 else:
-                    device, switch = None, None
+                    device, pin = None, None
 
-                state = self.getswitch(device, switch) if device is not None and switch is not None else 0
+                state = self.getswitch(device, pin) if device is not None and pin is not None else 0
                 btn.setChecked(state)
                 self.set_style(btn, state)
-                btn.setEnabled(device is not None and switch is not None)
+                btn.setEnabled(device is not None and pin is not None)
 
                 btn.clicked.connect(
-                    lambda checked, gidx=idx + 1, fault=fault, btn=btn:
+                    lambda checked, gidx=idx, fault=fault, btn=btn:
                         self.toggle_switch(gidx, fault, btn)
                 )
                 self.button_refs[(idx, action_idx)] = btn
@@ -164,40 +166,32 @@ class RelayControl(QWidget):
             self.update_page()
 
     def toggle_switch(self, group_idx, fault_name, btn):
-        entry = self.get_fault_entry(group_idx, fault_name)
+        line_key = f"line_{group_idx+1}"
+        entry = self.fault_map.get(line_key, {}).get(fault_name)
         if not entry:
-            self.console.append(f"No mapping for Group {group_idx} - {fault_name}")
+            self.console.append(f"No mapping for {line_key} - {fault_name}")
             return
-        device = entry['device']
-        switch = entry['switch']
-        curr_state = self.getswitch(device, switch)
+        device = entry.get('device')
+        pin = entry.get('pin')
+        curr_state = self.getswitch(device, pin)
         new_state = 0 if curr_state else 1
-        self.setswitch(device, switch, new_state)
+        self.setswitch(device, pin, new_state)
         btn.setChecked(bool(new_state))
         self.set_style(btn, new_state)
 
-    def setswitch(self, idevice, iswitch, new_state):
+    def setswitch(self, idevice, ipin, new_state):
         # Store state and log to console (replace with serial logic as needed)
-        if idevice is None or iswitch is None:
+        if idevice is None or ipin is None:
             self.console.append(f"setswitch(None, None, {new_state}) [no-op]")
             return
-        self.switch_states[(idevice, iswitch)] = new_state
-        self.console.append(f"setswitch(device={idevice}, switch={iswitch}, value={new_state})")
+        self.switch_states[(idevice, ipin)] = new_state
+        self.console.append(f"setswitch(device={idevice}, pin={ipin}, value={new_state})")
 
-    def getswitch(self, idevice, iswitch):
+    def getswitch(self, idevice, ipin):
         # Return the stored state or 0, replace with real query as needed
-        if idevice is None or iswitch is None:
+        if idevice is None or ipin is None:
             return 0
-        return self.switch_states.get((idevice, iswitch), 0)
-
-    def get_fault_entry(self, group_num, fault_name):
-        # Find the entry for group and fault
-        for item in self.fault_map:
-            if isinstance(item, dict) and \
-               (item.get("group") == group_num or str(item.get("group")) == str(group_num)) and \
-               item.get("fault", "").lower() == fault_name.lower():
-                return item
-        return None
+        return self.switch_states.get((idevice, ipin), 0)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
