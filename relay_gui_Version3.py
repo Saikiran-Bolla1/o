@@ -1,55 +1,203 @@
 import sys
 import csv
 import json
+import traceback
+import time
+import serial
+import win32com.client
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog,
     QTextEdit, QMessageBox, QScrollArea, QMainWindow, QDockWidget, QAction
 )
 from PyQt5.QtCore import Qt
 
-# ---- RELAY HARDWARE MODULE BEGIN ----
-class RelayHW:
+# ---- NUMATO RELAY HARDWARE MODULE BEGIN ----
+class NumatoRelay:
     def __init__(self):
-        self.relays = {}  # (device_id, pin_no): value
-        self.connected_ports = []
+        self.InitDone = 0
+        self.baudrate = 19200
+        self.NumatoPorts = []
+        self.Device_obj = []
+        self.NumHandlDic = {}
 
-    def init(self):
-        # Initialize hardware/serial
-        print("RelayHW: Initialized")
+    def init(self, console_callback=None):
+        try:
+            self.NumatoPorts = []
+            self.Device_obj = []
+            self.NumHandlDic = {}
+            wmi = win32com.client.GetObject("winmgmts:")
+            for eachPort in wmi.InstancesOf("Win32_SerialPort"):
+                SerportName = eachPort.Name
+                if str(SerportName).find("USB Serial Device") != -1:
+                    self.NumatoPorts.append(str(SerportName.split("(")[1][:-1]))
+            self.Device_obj = [p for p in self.NumatoPorts]
+            for each_port in self.Device_obj:
+                devType = "USB Serial Device"
+                DeviceNumber = serial.Serial(each_port, self.baudrate, timeout=1)
+                DeviceNumber.write(str.encode('id get\r'))
+                time.sleep(0.1)
+                response = DeviceNumber.read(100).decode(errors='ignore')
+                try:
+                    DeviceID = response.split('\r')[1].split('\n')[0]
+                except Exception:
+                    DeviceID = ""
+                if DeviceID != "":
+                    self.NumHandlDic[DeviceID] = {'DeviceNumber': each_port, 'DeviceType': devType}
+                DeviceNumber.write(str.encode('relay writeall 000000\r'))
+                DeviceNumber.close()
+            self.InitDone = 1
+            msg = "NumatoRelay: Connected (init successful)"
+            if console_callback:
+                console_callback(msg)
+        except Exception as e:
+            msg = f"NumatoRelay: Init failed: {e}\n{traceback.format_exc()}"
+            if console_callback:
+                console_callback(msg)
+            self.InitDone = 0
 
-    def deinit(self):
-        print("RelayHW: Deinitialized")
-        self.connected_ports = []
+    def deinit(self, console_callback=None):
+        try:
+            if self.InitDone == 1:
+                for each_port in self.Device_obj:
+                    try:
+                        DeviceNumber = serial.Serial(each_port, self.baudrate, timeout=1)
+                        DeviceNumber.close()
+                    except Exception:
+                        pass
+                self.NumHandlDic = {}
+                self.InitDone = 0
+                msg = "NumatoRelay: Disconnected (deinit successful)"
+                if console_callback:
+                    console_callback(msg)
+        except Exception as e:
+            msg = f"NumatoRelay: Deinit failed: {e}\n{traceback.format_exc()}"
+            if console_callback:
+                console_callback(msg)
 
-    def setswitch(self, device_id, pin_no, value):
-        self.relays[(device_id, pin_no)] = value
+    def setswitch(self, device_id, pin_no, value, console_callback=None):
+        try:
+            max_retries = 3
+            attempts = 0
+            while attempts < max_retries:
+                try:
+                    device_info = self.NumHandlDic[device_id]
+                    port = device_info['DeviceNumber']
+                    serPort = serial.Serial(port, self.baudrate, timeout=1)
+                    serPort.write(str.encode('id get\r'))
+                    time.sleep(0.1)
+                    response = serPort.read_all().decode(errors='ignore')
+                    lines = response.splitlines()
+                    DeviceID_resp = ""
+                    for line in lines:
+                        line = line.strip()
+                        if line and line.isalnum():
+                            DeviceID_resp = line
+                            break
+                    if DeviceID_resp == device_id:
+                        relayIndex = str(pin_no) if int(pin_no) < 10 else chr(55 + int(pin_no))
+                        relayCmd = 'on' if int(value) == 1 else 'off'
+                        serPort.write(str.encode(f'relay {relayCmd} {relayIndex}\r\n'))
+                        msg = f"NumatoRelay: setswitch sent {relayCmd} to device {device_id} on switch {pin_no}"
+                        if console_callback:
+                            console_callback(msg)
+                        serPort.close()
+                        return
+                    else:
+                        msg = f"NumatoRelay: DeviceID mismatch. Expected {device_id}, got {DeviceID_resp}"
+                        if console_callback:
+                            console_callback(msg)
+                        serPort.close()
+                        return
+                except KeyError:
+                    msg = f"NumatoRelay: Invalid device ID: {device_id}"
+                    if console_callback:
+                        console_callback(msg)
+                    break
+                except serial.SerialException as se:
+                    attempts += 1
+                    msg = f"NumatoRelay: Serial error on attempt {attempts}: {se}"
+                    if console_callback:
+                        console_callback(msg)
+                except Exception as e:
+                    attempts += 1
+                    msg = f"NumatoRelay: Unexpected error on attempt {attempts}: {e}"
+                    if console_callback:
+                        console_callback(msg)
+                finally:
+                    try:
+                        if 'serPort' in locals() and serPort.is_open:
+                            serPort.close()
+                    except Exception:
+                        pass
+            final_msg = f"NumatoRelay: Failed to set switch after {max_retries} attempts for device {device_id}"
+            if console_callback:
+                console_callback(final_msg)
+        except Exception as e:
+            msg = f"NumatoRelay: setswitch failed: {e}\n{traceback.format_exc()}"
+            if console_callback:
+                console_callback(msg)
 
-    def getswitch(self, device_id, pin_no):
-        return self.relays.get((device_id, pin_no), 0)
+    def getswitch(self, device_id, pin_no, console_callback=None):
+        try:
+            device_info = self.NumHandlDic[device_id]
+            port = device_info['DeviceNumber']
+            serPort = serial.Serial(port, self.baudrate, timeout=1)
+            serPort.write(str.encode('id get\r'))
+            time.sleep(0.1)
+            response = serPort.read_all().decode(errors='ignore')
+            lines = response.splitlines()
+            DeviceID_resp = ""
+            for line in lines:
+                line = line.strip()
+                if line and line.isalnum():
+                    DeviceID_resp = line
+                    break
+            if DeviceID_resp == device_id:
+                relayIndex = str(pin_no) if int(pin_no) < 10 else chr(55 + int(pin_no))
+                serPort.write(str.encode(f'relay read {relayIndex}\r\n'))
+                time.sleep(0.1)
+                try:
+                    iValue = (serPort.read(100)).decode().split('\r')[1].split('\n')[0]
+                except Exception:
+                    iValue = "0"
+                msg = f"NumatoRelay: getswitch(DeviceID={device_id}, pin={pin_no}) = {iValue}"
+                if console_callback:
+                    console_callback(msg)
+                serPort.close()
+                return int(iValue)
+            else:
+                msg = f"NumatoRelay: DeviceID mismatch. Expected {device_id}, got {DeviceID_resp}"
+                if console_callback:
+                    console_callback(msg)
+                serPort.close()
+                return 0
+        except Exception as e:
+            msg = f"NumatoRelay: getswitch failed: {e}\n{traceback.format_exc()}"
+            if console_callback:
+                console_callback(msg)
+            return 0
 
-    def reset_all_relays(self):
-        keys = list(self.relays.keys())
-        for k in keys:
-            self.relays[k] = 0
-        print("RelayHW: All relays reset.")
-
-    def connect_all(self):
-        # Simulate connecting all 14 COM ports
-        self.connected_ports = [f"COM{i+1}" for i in range(14)]
-        print("RelayHW: All ports connected.")
-
-    def disconnect_all(self):
-        self.connected_ports = []
-        print("RelayHW: All ports disconnected.")
-
-    def is_connected(self):
-        return len(self.connected_ports) == 14
-
-relay_hw = RelayHW()
-# ---- RELAY HARDWARE MODULE END ----
+    def clearrelays(self, console_callback=None):
+        try:
+            for device_id, device_info in self.NumHandlDic.items():
+                port = device_info['DeviceNumber']
+                serPort = serial.Serial(port, self.baudrate, timeout=1)
+                serPort.write(str.encode('relay writeall 000000\r'))
+                serPort.close()
+            msg = "NumatoRelay: All relays cleared (clearrelays successful)"
+            if console_callback:
+                console_callback(msg)
+        except Exception as e:
+            msg = f"NumatoRelay: clearrelays failed: {e}\n{traceback.format_exc()}"
+            if console_callback:
+                console_callback(msg)
+# ---- NUMATO RELAY HARDWARE MODULE END ----
 
 GROUPS_PER_PAGE = 12
 ACTION_TYPES = ["OpenLoad", "ShortToUBat", "ShortToGND", "ShortToPin"]
+
+# Instantiate the relay hardware globally
+relay_hw = NumatoRelay()
 
 class RelayControl(QMainWindow):
     def __init__(self):
@@ -135,9 +283,8 @@ class RelayControl(QMainWindow):
         view_menu.addAction(reset_action)
         view_menu.addAction(self.pin_action)
 
-        # Simulate relay hardware init and serial disconnected
         try:
-            relay_hw.init()
+            relay_hw.init(self.console.append)
             self.console.append("Relay hardware initialized.")
         except Exception as e:
             self.console.append(f"Relay hardware init failed: {e}")
@@ -332,21 +479,21 @@ class RelayControl(QMainWindow):
 
     def setswitch(self, device_id, pin_no, value):
         try:
-            relay_hw.setswitch(device_id, pin_no, value)
+            relay_hw.setswitch(device_id, pin_no, value, self.console.append)
             self.console.append(f"setswitch(DeviceID={device_id}, PinNo={pin_no}, value={value})")
         except Exception as e:
             self.console.append(f"Error setting relay: {device_id},{pin_no} to {value}: {e}")
 
     def getswitch(self, device_id, pin_no):
         try:
-            return relay_hw.getswitch(device_id, pin_no)
+            return relay_hw.getswitch(device_id, pin_no, self.console.append)
         except Exception as e:
             self.console.append(f"Error reading relay: {device_id},{pin_no}: {e}")
             return 0
 
     def clear_relays(self):
         try:
-            relay_hw.reset_all_relays()
+            relay_hw.clearrelays(self.console.append)
             self.console.append("All relays have been cleared (set to OFF).")
             self.active_faults = {}
             self.shorttopin_selected = set()
@@ -356,7 +503,7 @@ class RelayControl(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            relay_hw.deinit()
+            relay_hw.deinit(self.console.append)
             self.console.append("Relay hardware deinitialized.")
         except Exception as e:
             self.console.append(f"Relay hardware deinit failed: {e}")
@@ -379,7 +526,7 @@ class RelayControl(QMainWindow):
 
     def connect_all_serial_ports(self):
         try:
-            relay_hw.connect_all()
+            relay_hw.init(self.console.append)
             self.console.append("All serial ports connected.")
             self.update_serial_indicator()
         except Exception as e:
@@ -388,7 +535,7 @@ class RelayControl(QMainWindow):
 
     def disconnect_all_serial_ports(self):
         try:
-            relay_hw.disconnect_all()
+            relay_hw.deinit(self.console.append)
             self.console.append("All serial ports disconnected.")
             self.update_serial_indicator()
         except Exception as e:
@@ -396,7 +543,7 @@ class RelayControl(QMainWindow):
             self.update_serial_indicator()
 
     def update_serial_indicator(self):
-        if relay_hw.is_connected():
+        if relay_hw.InitDone:
             self.serial_indicator.setText("Serial: Connected (All)")
             self.serial_indicator.setStyleSheet("color: green; font-weight: bold;")
         else:
