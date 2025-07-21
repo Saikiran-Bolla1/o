@@ -3,18 +3,21 @@ import csv
 import json
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog,
-    QTextEdit, QMessageBox, QScrollArea
+    QTextEdit, QMessageBox, QScrollArea, QMainWindow, QDockWidget, QAction, QMenu, QMenuBar
 )
 from PyQt5.QtCore import Qt
 
 GROUPS_PER_PAGE = 12
 ACTION_TYPES = ["OpenLoad", "ShortToUBat", "ShortToGND", "ShortToPin"]
 
-class RelayControl(QWidget):
+class RelayControl(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Numato Relay Controller - Paginated Groups")
         self.resize(1200, 800)
+        # central widget (main relay UI)
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
         self.groups = []
         self.group_line_keys = []
         self.current_page = 0
@@ -23,7 +26,8 @@ class RelayControl(QWidget):
         self.active_faults = {}  # {group_idx: action}
         self.shorttopin_selected = set()  # set of group indexes where ShortToPin is active
 
-        main_layout = QVBoxLayout(self)
+        # Main layout
+        main_layout = QVBoxLayout(central_widget)
         nav_layout = QHBoxLayout()
         self.prev_btn = QPushButton("Previous")
         self.prev_btn.clicked.connect(self.prev_page)
@@ -35,15 +39,7 @@ class RelayControl(QWidget):
         nav_layout.addWidget(self.next_btn)
         main_layout.addLayout(nav_layout)
 
-        file_layout = QHBoxLayout()
-        self.load_groups_btn = QPushButton("Load Group Names")
-        self.load_groups_btn.clicked.connect(self.load_groups)
-        file_layout.addWidget(self.load_groups_btn)
-        self.load_faults_btn = QPushButton("Load Fault JSON")
-        self.load_faults_btn.clicked.connect(self.load_fault_json)
-        file_layout.addWidget(self.load_faults_btn)
-        main_layout.addLayout(file_layout)
-
+        # (Removed direct file buttons, now in menu)
         self.scroll_area = QScrollArea()
         self.groups_widget = QWidget()
         self.groups_layout = QVBoxLayout(self.groups_widget)
@@ -52,10 +48,47 @@ class RelayControl(QWidget):
         self.scroll_area.setWidget(self.groups_widget)
         main_layout.addWidget(self.scroll_area, stretch=1)
 
+        # Console as dockable widget
         self.console = QTextEdit()
         self.console.setReadOnly(True)
-        main_layout.addWidget(QLabel("Console Output:"))
-        main_layout.addWidget(self.console, stretch=1)
+        self.console_dock = QDockWidget("Console Output", self)
+        self.console_dock.setWidget(self.console)
+        self.console_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.console_dock)
+        self.console_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable)
+        self.console_dock.setFloating(False)
+        self.console_dock.setVisible(True)
+
+        # Pin/unpin action for dock
+        self.pin_action = QAction("Pin Console", self)
+        self.pin_action.setCheckable(True)
+        self.pin_action.setChecked(True)
+        self.pin_action.triggered.connect(self.toggle_pin_console)
+        self.console_dock.visibilityChanged.connect(self.on_console_visibility_changed)
+
+        # File menu
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+        # Exit
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        # Load JSON
+        load_json_action = QAction("Load JSON", self)
+        load_json_action.triggered.connect(self.load_fault_json)
+        file_menu.addAction(load_json_action)
+        # Load CSV
+        load_csv_action = QAction("Load GroupNames CSV", self)
+        load_csv_action.triggered.connect(self.load_groups)
+        file_menu.addAction(load_csv_action)
+
+        # View menu
+        view_menu = menubar.addMenu("View")
+        reset_action = QAction("Reset", self)
+        reset_action.triggered.connect(self.reset_view)
+        view_menu.addAction(reset_action)
+        # Pin/unpin
+        view_menu.addAction(self.pin_action)
 
         self.set_default_groups()
         self.update_page()
@@ -63,6 +96,16 @@ class RelayControl(QWidget):
     def set_default_groups(self):
         self.groups = [f"Group {i+1}" for i in range(108)]
         self.group_line_keys = [f"Line_{i+1:02d}" for i in range(108)]
+
+    def reset_view(self):
+        self.current_page = 0
+        self.set_default_groups()
+        self.fault_map = {}
+        self.switch_states = {}
+        self.active_faults = {}
+        self.shorttopin_selected = set()
+        self.console.clear()
+        self.update_page()
 
     def load_groups(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Open Group Name File", "", "CSV Files (*.csv);;Text Files (*.txt);;All Files (*)")
@@ -100,11 +143,9 @@ class RelayControl(QWidget):
             widget = self.groups_layout.itemAt(i).widget()
             if widget:
                 widget.setParent(None)
-
         start = self.current_page * GROUPS_PER_PAGE
         end = min(start + GROUPS_PER_PAGE, len(self.groups))
         self.button_refs = {}
-
         for idx in range(start, end):
             group_name = self.groups[idx]
             line_key = self.group_line_keys[idx]
@@ -112,7 +153,6 @@ class RelayControl(QWidget):
             label = QLabel(f"{group_name} - {line_key}")
             label.setFixedWidth(300)
             group_row.addWidget(label)
-
             fault_entry = self.fault_map.get(line_key, {})
             for action in ACTION_TYPES:
                 btn = QPushButton(action)
@@ -133,7 +173,6 @@ class RelayControl(QWidget):
             container = QWidget()
             container.setLayout(group_row)
             self.groups_layout.addWidget(container)
-
         self.page_label.setText(f"Page {self.current_page + 1} / {((len(self.groups) - 1) // GROUPS_PER_PAGE) + 1}")
         self.prev_btn.setEnabled(self.current_page > 0)
         self.next_btn.setEnabled(end < len(self.groups))
@@ -255,6 +294,22 @@ class RelayControl(QWidget):
         if idevice is None or ipin is None:
             return 0
         return self.switch_states.get((idevice, ipin), 0)
+
+    # Dock widget pin/unpin logic
+    def toggle_pin_console(self):
+        if self.pin_action.isChecked():
+            self.addDockWidget(Qt.BottomDockWidgetArea, self.console_dock)
+            self.console_dock.setFloating(False)
+            self.console_dock.setVisible(True)
+            self.pin_action.setText("Pin Console")
+        else:
+            self.console_dock.setFloating(True)
+            self.console_dock.setVisible(True)
+            self.pin_action.setText("Unpin Console")
+
+    def on_console_visibility_changed(self, visible):
+        if not visible:
+            self.pin_action.setChecked(False)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
