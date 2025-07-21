@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog,
     QTextEdit, QMessageBox, QScrollArea, QMainWindow, QDockWidget, QAction
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 
 # ---- NUMATO RELAY HARDWARE MODULE BEGIN ----
 class NumatoRelay:
@@ -276,6 +276,9 @@ class RelayControl(QMainWindow):
         load_csv_action = QAction("Load GroupNames CSV", self)
         load_csv_action.triggered.connect(self.load_groups)
         file_menu.addAction(load_csv_action)
+        clear_console_action = QAction("Clear Console", self)  # <---- Added
+        clear_console_action.triggered.connect(self.clear_console)  # <---- Added
+        file_menu.addAction(clear_console_action)  # <---- Added
 
         view_menu = menubar.addMenu("View")
         reset_action = QAction("Reset", self)
@@ -377,7 +380,11 @@ class RelayControl(QMainWindow):
         self.next_btn.setEnabled(end < len(self.groups))
 
     def make_toggle_callback(self, group_idx, action, btn):
-        return lambda checked: self.toggle_switch(group_idx, action, btn)
+        def callback(checked):
+            self.toggle_switch(group_idx, action, btn)
+            # Immediate color feedback for UI
+            self.set_style(btn, btn.isChecked())
+        return callback
 
     def set_style(self, btn, state):
         btn.setStyleSheet("background-color: lightgreen" if state else "background-color: lightgray")
@@ -475,7 +482,9 @@ class RelayControl(QMainWindow):
                     self.setswitch(entry.get('DeviceID'), entry.get('PinNo'), 1)
                 self.shorttopin_selected.add(group_idx)
             self.active_faults[group_idx] = action
-        self.update_page()
+
+        # Wait a short time for hardware state to settle, then update the UI
+        QTimer.singleShot(200, self.update_page)
 
     def setswitch(self, device_id, pin_no, value):
         try:
@@ -549,6 +558,8 @@ class RelayControl(QMainWindow):
         else:
             self.serial_indicator.setText("Serial: Disconnected")
             self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
+    def clear_console(self):
+        self.console.clear()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
