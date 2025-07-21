@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 GROUPS_PER_PAGE = 12
-FAULT_TYPES = ["Openload", "Comman", "UBAT", "GND"]
+FAULT_TYPES = ["OpenLoad", "Common", "UBat", "GND"]
 
 class RelayControl(QWidget):
     def __init__(self):
@@ -17,7 +17,7 @@ class RelayControl(QWidget):
         self.resize(1100, 750)
         self.groups = []
         self.current_page = 0
-        self.switch_states = {}  # {(device, pin): value}
+        self.switch_states = {}  # {(DeviceID, PinNo): value}
         self.fault_map = {}      # Loaded from JSON
         self.button_refs = {}    # {(group_idx, action_idx): button}
 
@@ -121,16 +121,18 @@ class RelayControl(QWidget):
             for action_idx, fault in enumerate(FAULT_TYPES):
                 btn = QPushButton(fault)
                 btn.setCheckable(True)
-                # Get device & pin for this group/fault
+                btn.setAutoExclusive(False)  # Independent toggles
+
+                # Get DeviceID & PinNo for this group/fault
                 entry = fault_entry.get(fault)
                 if entry:
-                    device = entry.get('device')
-                    pin = entry.get('pin')
+                    device = entry.get('DeviceID')
+                    pin = entry.get('PinNo')
                 else:
                     device, pin = None, None
 
                 state = self.getswitch(device, pin) if device is not None and pin is not None else 0
-                btn.setChecked(state)
+                btn.setChecked(bool(state))
                 self.set_style(btn, state)
                 btn.setEnabled(device is not None and pin is not None)
 
@@ -171,13 +173,13 @@ class RelayControl(QWidget):
         if not entry:
             self.console.append(f"No mapping for {line_key} - {fault_name}")
             return
-        device = entry.get('device')
-        pin = entry.get('pin')
+        device = entry.get('DeviceID')
+        pin = entry.get('PinNo')
         curr_state = self.getswitch(device, pin)
         new_state = 0 if curr_state else 1
         self.setswitch(device, pin, new_state)
-        btn.setChecked(bool(new_state))
-        self.set_style(btn, new_state)
+        btn.setChecked(bool(new_state))  # Ensures the button stays "stuck"
+        self.set_style(btn, new_state)   # Always update visual style
 
     def setswitch(self, idevice, ipin, new_state):
         # Store state and log to console (replace with serial logic as needed)
@@ -185,7 +187,7 @@ class RelayControl(QWidget):
             self.console.append(f"setswitch(None, None, {new_state}) [no-op]")
             return
         self.switch_states[(idevice, ipin)] = new_state
-        self.console.append(f"setswitch(device={idevice}, pin={ipin}, value={new_state})")
+        self.console.append(f"setswitch(DeviceID={idevice}, PinNo={ipin}, value={new_state})")
 
     def getswitch(self, idevice, ipin):
         # Return the stored state or 0, replace with real query as needed
