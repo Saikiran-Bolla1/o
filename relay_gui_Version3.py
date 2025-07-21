@@ -19,7 +19,6 @@ class RelayControl(QWidget):
         self.current_page = 0
         self.switch_states = {}  # {(DeviceID, PinNo): value}
         self.fault_map = {}      # Loaded from JSON
-        self.button_refs = {}    # {(group_idx, action_idx): button}
 
         main_layout = QVBoxLayout(self)
 
@@ -115,15 +114,14 @@ class RelayControl(QWidget):
             label.setFixedWidth(220)
             group_row.addWidget(label)
 
-            line_key = f"line_{idx+1}"
+            line_key = f"Line_{idx+1:02d}"  # Match JSON keys like Line_01, Line_02, ...
             fault_entry = self.fault_map.get(line_key, {})
 
             for action_idx, fault in enumerate(FAULT_TYPES):
                 btn = QPushButton(fault)
                 btn.setCheckable(True)
-                btn.setAutoExclusive(False)  # Independent toggles
+                btn.setAutoExclusive(False)
 
-                # Get DeviceID & PinNo for this group/fault
                 entry = fault_entry.get(fault)
                 if entry:
                     device = entry.get('DeviceID')
@@ -137,8 +135,7 @@ class RelayControl(QWidget):
                 btn.setEnabled(device is not None and pin is not None)
 
                 btn.clicked.connect(
-                    lambda checked, gidx=idx, fault=fault, btn=btn:
-                        self.toggle_switch(gidx, fault, btn)
+                    self.make_toggle_callback(idx, fault, btn)
                 )
                 self.button_refs[(idx, action_idx)] = btn
                 group_row.addWidget(btn)
@@ -150,6 +147,9 @@ class RelayControl(QWidget):
         self.page_label.setText(f"Page {self.current_page + 1} / {((len(self.groups) - 1) // GROUPS_PER_PAGE) + 1}")
         self.prev_btn.setEnabled(self.current_page > 0)
         self.next_btn.setEnabled(end < len(self.groups))
+
+    def make_toggle_callback(self, group_idx, fault_name, btn):
+        return lambda checked: self.toggle_switch(group_idx, fault_name, btn)
 
     def set_style(self, btn, state):
         if state:
@@ -168,7 +168,7 @@ class RelayControl(QWidget):
             self.update_page()
 
     def toggle_switch(self, group_idx, fault_name, btn):
-        line_key = f"line_{group_idx+1}"
+        line_key = f"Line_{group_idx+1:02d}"
         entry = self.fault_map.get(line_key, {}).get(fault_name)
         if not entry:
             self.console.append(f"No mapping for {line_key} - {fault_name}")
@@ -178,8 +178,8 @@ class RelayControl(QWidget):
         curr_state = self.getswitch(device, pin)
         new_state = 0 if curr_state else 1
         self.setswitch(device, pin, new_state)
-        btn.setChecked(bool(new_state))  # Ensures the button stays "stuck"
-        self.set_style(btn, new_state)   # Always update visual style
+        btn.setChecked(bool(new_state))
+        self.set_style(btn, new_state)
 
     def setswitch(self, idevice, ipin, new_state):
         # Store state and log to console (replace with serial logic as needed)
@@ -190,7 +190,6 @@ class RelayControl(QWidget):
         self.console.append(f"setswitch(DeviceID={idevice}, PinNo={ipin}, value={new_state})")
 
     def getswitch(self, idevice, ipin):
-        # Return the stored state or 0, replace with real query as needed
         if idevice is None or ipin is None:
             return 0
         return self.switch_states.get((idevice, ipin), 0)
