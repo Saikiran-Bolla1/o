@@ -3,7 +3,7 @@ import csv
 import json
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog,
-    QTextEdit, QMessageBox, QScrollArea, QMainWindow, QDockWidget, QAction, QMenu, QMenuBar
+    QTextEdit, QMessageBox, QScrollArea, QMainWindow, QDockWidget, QAction, QMenu, QMenuBar, QComboBox
 )
 from PyQt5.QtCore import Qt
 
@@ -24,10 +24,10 @@ class RelayControl(QMainWindow):
         self.groups = []
         self.group_line_keys = []
         self.current_page = 0
-        self.switch_states = {}  # {(DeviceID, PinNo): value}
+        self.switch_states = {}
         self.fault_map = {}
-        self.active_faults = {}  # {group_idx: action}
-        self.shorttopin_selected = set()  # set of group indexes where ShortToPin is active
+        self.active_faults = {}
+        self.shorttopin_selected = set()
 
         self.serial_connection = None
         self.serial_port_name = None
@@ -35,14 +35,37 @@ class RelayControl(QMainWindow):
         # Main layout
         main_layout = QVBoxLayout(central_widget)
         nav_layout = QHBoxLayout()
+
         self.prev_btn = QPushButton("Previous")
         self.prev_btn.clicked.connect(self.prev_page)
         self.next_btn = QPushButton("Next")
         self.next_btn.clicked.connect(self.next_page)
         self.page_label = QLabel("Page 1")
+
         nav_layout.addWidget(self.prev_btn)
         nav_layout.addWidget(self.page_label)
         nav_layout.addWidget(self.next_btn)
+
+        nav_layout.addStretch()
+
+        # Serial Port Indicator and controls
+        self.serial_indicator = QLabel("Serial: Disconnected")
+        self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
+        nav_layout.addWidget(self.serial_indicator)
+
+        self.serial_port_selector = QComboBox()
+        self.serial_port_selector.setMinimumWidth(120)
+        nav_layout.addWidget(self.serial_port_selector)
+        self.refresh_serial_ports()
+
+        self.serial_connect_btn = QPushButton("Connect")
+        self.serial_connect_btn.clicked.connect(self.connect_serial_port_from_selector)
+        nav_layout.addWidget(self.serial_connect_btn)
+
+        self.serial_disconnect_btn = QPushButton("Disconnect")
+        self.serial_disconnect_btn.clicked.connect(self.disconnect_serial_port)
+        nav_layout.addWidget(self.serial_disconnect_btn)
+
         main_layout.addLayout(nav_layout)
 
         self.scroll_area = QScrollArea()
@@ -74,23 +97,23 @@ class RelayControl(QMainWindow):
         # File menu
         menubar = self.menuBar()
         file_menu = menubar.addMenu("File")
-        # Exit
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
-        # Load JSON
         load_json_action = QAction("Load JSON", self)
         load_json_action.triggered.connect(self.load_fault_json)
         file_menu.addAction(load_json_action)
-        # Load CSV
         load_csv_action = QAction("Load GroupNames CSV", self)
         load_csv_action.triggered.connect(self.load_groups)
         file_menu.addAction(load_csv_action)
 
         # Serial menu
         serial_menu = menubar.addMenu("Serial")
+        refresh_ports_action = QAction("Refresh Ports", self)
+        refresh_ports_action.triggered.connect(self.refresh_serial_ports)
+        serial_menu.addAction(refresh_ports_action)
         connect_serial_action = QAction("Connect to Serial Port", self)
-        connect_serial_action.triggered.connect(self.connect_serial_port)
+        connect_serial_action.triggered.connect(self.connect_serial_port_from_selector)
         serial_menu.addAction(connect_serial_action)
         disconnect_serial_action = QAction("Disconnect Serial Port", self)
         disconnect_serial_action.triggered.connect(self.disconnect_serial_port)
@@ -207,7 +230,6 @@ class RelayControl(QMainWindow):
             self.update_page()
 
     def deactivate_fault(self, group_idx, action):
-        """Deactivate specific fault in a group."""
         line_key = self.group_line_keys[group_idx]
         fault_entry = self.fault_map.get(line_key, {})
         if action == "OpenLoad":
@@ -233,7 +255,6 @@ class RelayControl(QMainWindow):
             self.shorttopin_selected.discard(group_idx)
 
     def deactivate_all_faults_in_group(self, group_idx):
-        """Deactivate all faults in the group."""
         for action in ACTION_TYPES:
             self.deactivate_fault(group_idx, action)
 
@@ -263,13 +284,10 @@ class RelayControl(QMainWindow):
 
     def toggle_switch(self, group_idx, action, btn):
         if self.is_fault_active(group_idx, action):
-            # If already active, deactivate
             self.deactivate_fault(group_idx, action)
             self.active_faults.pop(group_idx, None)
         else:
-            # Deactivate any previous fault in this group (including ShortToPin)
             self.deactivate_all_faults_in_group(group_idx)
-            # Activate the selected fault
             line_key = self.group_line_keys[group_idx]
             fault_entry = self.fault_map.get(line_key, {})
             if action == "OpenLoad":
@@ -324,39 +342,50 @@ class RelayControl(QMainWindow):
         if not visible:
             self.pin_action.setChecked(False)
 
-    # Serial port connection logic
-    def connect_serial_port(self):
-        if self.serial_connection is not None and self.serial_connection.is_open:
-            self.console.append("Already connected to serial port.")
-            return
-
+    def refresh_serial_ports(self):
         ports = serial.tools.list_ports.comports()
-        port_names = [port.device for port in ports]
-        if not port_names:
-            QMessageBox.critical(self, "Serial Port Error", "No serial ports found.")
+        self.serial_port_selector.clear()
+        for port in ports:
+            self.serial_port_selector.addItem(port.device)
+        if not ports:
+            self.serial_port_selector.addItem("No ports found")
+        self.serial_port_selector.setEnabled(bool(ports))
+
+    def connect_serial_port_from_selector(self):
+        port = self.serial_port_selector.currentText()
+        if port == "No ports found" or not port:
+            self.console.append("No serial port selected or found.")
+            self.serial_indicator.setText("Serial: Disconnected")
+            self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
             return
-        # If only one, auto-select, else ask
-        if len(port_names) == 1:
-            port = port_names[0]
-        else:
-            port, ok = QFileDialog.getOpenFileName(self, "Select Serial Port", "", ";;".join(port_names))
-            if not ok or not port:
-                return
+        if self.serial_connection is not None and self.serial_connection.is_open:
+            self.console.append(f"Already connected to serial port: {self.serial_port_name}")
+            self.serial_indicator.setText(f"Serial: Connected ({self.serial_port_name})")
+            self.serial_indicator.setStyleSheet("color: green; font-weight: bold;")
+            return
         try:
             self.serial_connection = serial.Serial(port, 9600, timeout=1)
             self.serial_port_name = port
             self.console.append(f"Connected to serial port: {port}")
+            self.serial_indicator.setText(f"Serial: Connected ({port})")
+            self.serial_indicator.setStyleSheet("color: green; font-weight: bold;")
         except Exception as e:
-            self.console.append(f"Failed to connect to serial port: {e}")
+            self.console.append(f"Failed to connect to serial port {port}: {e}")
+            self.serial_indicator.setText("Serial: Disconnected")
+            self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
 
     def disconnect_serial_port(self):
         if self.serial_connection is not None and self.serial_connection.is_open:
             self.serial_connection.close()
             self.console.append(f"Disconnected from serial port: {self.serial_port_name}")
+            self.serial_indicator.setText("Serial: Disconnected")
+            self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
             self.serial_connection = None
             self.serial_port_name = None
         else:
             self.console.append("No serial port connected.")
+            self.serial_indicator.setText("Serial: Disconnected")
+            self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
