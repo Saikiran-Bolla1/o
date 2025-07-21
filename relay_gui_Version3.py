@@ -114,7 +114,8 @@ class RelayControl(QWidget):
             label.setFixedWidth(220)
             group_row.addWidget(label)
 
-            line_key = f"Line_{idx+1:02d}"  # Match JSON keys like Line_01, Line_02, ...
+            # JSON key: Line_01, Line_02, ..., Line_108
+            line_key = f"Line_{idx+1:02d}"
             fault_entry = self.fault_map.get(line_key, {})
 
             for action_idx, fault in enumerate(FAULT_TYPES):
@@ -134,9 +135,7 @@ class RelayControl(QWidget):
                 self.set_style(btn, state)
                 btn.setEnabled(device is not None and pin is not None)
 
-                btn.clicked.connect(
-                    self.make_toggle_callback(idx, fault, btn)
-                )
+                btn.clicked.connect(self.make_toggle_callback(idx, fault, btn))
                 self.button_refs[(idx, action_idx)] = btn
                 group_row.addWidget(btn)
 
@@ -149,6 +148,7 @@ class RelayControl(QWidget):
         self.next_btn.setEnabled(end < len(self.groups))
 
     def make_toggle_callback(self, group_idx, fault_name, btn):
+        # This binds the current values for signal/slot
         return lambda checked: self.toggle_switch(group_idx, fault_name, btn)
 
     def set_style(self, btn, state):
