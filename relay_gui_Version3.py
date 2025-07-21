@@ -7,6 +7,10 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 
+# For serial port detection and connection
+import serial
+import serial.tools.list_ports
+
 GROUPS_PER_PAGE = 12
 ACTION_TYPES = ["OpenLoad", "ShortToUBat", "ShortToGND", "ShortToPin"]
 
@@ -15,7 +19,6 @@ class RelayControl(QMainWindow):
         super().__init__()
         self.setWindowTitle("Numato Relay Controller - Paginated Groups")
         self.resize(1200, 800)
-        # central widget (main relay UI)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         self.groups = []
@@ -25,6 +28,9 @@ class RelayControl(QMainWindow):
         self.fault_map = {}
         self.active_faults = {}  # {group_idx: action}
         self.shorttopin_selected = set()  # set of group indexes where ShortToPin is active
+
+        self.serial_connection = None
+        self.serial_port_name = None
 
         # Main layout
         main_layout = QVBoxLayout(central_widget)
@@ -39,7 +45,6 @@ class RelayControl(QMainWindow):
         nav_layout.addWidget(self.next_btn)
         main_layout.addLayout(nav_layout)
 
-        # (Removed direct file buttons, now in menu)
         self.scroll_area = QScrollArea()
         self.groups_widget = QWidget()
         self.groups_layout = QVBoxLayout(self.groups_widget)
@@ -82,12 +87,20 @@ class RelayControl(QMainWindow):
         load_csv_action.triggered.connect(self.load_groups)
         file_menu.addAction(load_csv_action)
 
+        # Serial menu
+        serial_menu = menubar.addMenu("Serial")
+        connect_serial_action = QAction("Connect to Serial Port", self)
+        connect_serial_action.triggered.connect(self.connect_serial_port)
+        serial_menu.addAction(connect_serial_action)
+        disconnect_serial_action = QAction("Disconnect Serial Port", self)
+        disconnect_serial_action.triggered.connect(self.disconnect_serial_port)
+        serial_menu.addAction(disconnect_serial_action)
+
         # View menu
         view_menu = menubar.addMenu("View")
         reset_action = QAction("Reset", self)
         reset_action.triggered.connect(self.reset_view)
         view_menu.addAction(reset_action)
-        # Pin/unpin
         view_menu.addAction(self.pin_action)
 
         self.set_default_groups()
@@ -310,6 +323,40 @@ class RelayControl(QMainWindow):
     def on_console_visibility_changed(self, visible):
         if not visible:
             self.pin_action.setChecked(False)
+
+    # Serial port connection logic
+    def connect_serial_port(self):
+        if self.serial_connection is not None and self.serial_connection.is_open:
+            self.console.append("Already connected to serial port.")
+            return
+
+        ports = serial.tools.list_ports.comports()
+        port_names = [port.device for port in ports]
+        if not port_names:
+            QMessageBox.critical(self, "Serial Port Error", "No serial ports found.")
+            return
+        # If only one, auto-select, else ask
+        if len(port_names) == 1:
+            port = port_names[0]
+        else:
+            port, ok = QFileDialog.getOpenFileName(self, "Select Serial Port", "", ";;".join(port_names))
+            if not ok or not port:
+                return
+        try:
+            self.serial_connection = serial.Serial(port, 9600, timeout=1)
+            self.serial_port_name = port
+            self.console.append(f"Connected to serial port: {port}")
+        except Exception as e:
+            self.console.append(f"Failed to connect to serial port: {e}")
+
+    def disconnect_serial_port(self):
+        if self.serial_connection is not None and self.serial_connection.is_open:
+            self.serial_connection.close()
+            self.console.append(f"Disconnected from serial port: {self.serial_port_name}")
+            self.serial_connection = None
+            self.serial_port_name = None
+        else:
+            self.console.append("No serial port connected.")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
