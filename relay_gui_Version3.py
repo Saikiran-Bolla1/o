@@ -250,6 +250,8 @@ class RelayControl(QMainWindow):
         # Console as dockable widget
         self.console = QTextEdit()
         self.console.setReadOnly(True)
+        self.console.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.console.customContextMenuRequested.connect(self.show_console_context_menu)
         self.console_dock = QDockWidget("Console Output", self)
         self.console_dock.setWidget(self.console)
         self.console_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
@@ -341,43 +343,47 @@ class RelayControl(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Failed to load JSON: {e}")
 
     def update_page(self):
-        for i in reversed(range(self.groups_layout.count())):
-            widget = self.groups_layout.itemAt(i).widget()
-            if widget:
-                widget.setParent(None)
-        start = self.current_page * GROUPS_PER_PAGE
-        end = min(start + GROUPS_PER_PAGE, len(self.groups))
-        self.button_refs = {}
-        for idx in range(start, end):
-            group_name = self.groups[idx]
-            line_key = self.group_line_keys[idx]
-            group_row = QHBoxLayout()
-            label = QLabel(f"{group_name} - {line_key}")
-            label.setFixedWidth(300)
-            group_row.addWidget(label)
-            fault_entry = self.fault_map.get(line_key, {})
-            for action in ACTION_TYPES:
-                btn = QPushButton(action)
-                btn.setCheckable(True)
-                btn.setAutoExclusive(False)
-                enabled = (
-                    (action == "OpenLoad" and "OpenLoad" in fault_entry) or
-                    (action == "ShortToUBat" and "Common" in fault_entry and "UBat" in fault_entry) or
-                    (action == "ShortToGND" and "Common" in fault_entry and "GND" in fault_entry) or
-                    (action == "ShortToPin" and "Common" in fault_entry)
-                )
-                btn.setEnabled(enabled)
-                btn.setChecked(self.is_fault_active(idx, action))
-                self.set_style(btn, btn.isChecked())
-                btn.clicked.connect(self.make_toggle_callback(idx, action, btn))
-                self.button_refs[(idx, action)] = btn
-                group_row.addWidget(btn)
-            container = QWidget()
-            container.setLayout(group_row)
-            self.groups_layout.addWidget(container)
-        self.page_label.setText(f"Page {self.current_page + 1} / {((len(self.groups) - 1) // GROUPS_PER_PAGE) + 1}")
-        self.prev_btn.setEnabled(self.current_page > 0)
-        self.next_btn.setEnabled(end < len(self.groups))
+    for i in reversed(range(self.groups_layout.count())):
+        widget = self.groups_layout.itemAt(i).widget()
+        if widget:
+            widget.setParent(None)
+    start = self.current_page * GROUPS_PER_PAGE
+    end = min(start + GROUPS_PER_PAGE, len(self.groups))
+    self.button_refs = {}
+    for idx in range(start, end):
+        group_name = self.groups[idx]
+        line_key = self.group_line_keys[idx]
+        group_row = QHBoxLayout()
+        label = QLabel(f"{group_name} - {line_key}")
+        label.setFixedWidth(300)
+        group_row.addWidget(label)
+        fault_entry = self.fault_map.get(line_key, {})
+        for action in ACTION_TYPES:
+            btn = QPushButton(action)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(False)
+            enabled = (
+                (action == "OpenLoad" and "OpenLoad" in fault_entry) or
+                (action == "ShortToUBat" and "Common" in fault_entry and "UBat" in fault_entry) or
+                (action == "ShortToGND" and "Common" in fault_entry and "GND" in fault_entry) or
+                (action == "ShortToPin" and "Common" in fault_entry)
+            )
+            btn.setEnabled(enabled)
+            btn.setChecked(self.is_fault_active(idx, action))
+            self.set_style(btn, btn.isChecked())
+            btn.clicked.connect(self.make_toggle_callback(idx, action, btn))
+            self.button_refs[(idx, action)] = btn
+            group_row.addWidget(btn)
+        container = QWidget()
+        container.setLayout(group_row)
+        self.groups_layout.addWidget(container)
+    self.page_label.setText(f"Page {self.current_page + 1} / {((len(self.groups) - 1) // GROUPS_PER_PAGE) + 1}")
+    self.prev_btn.setEnabled(self.current_page > 0)
+    self.next_btn.setEnabled(end < len(self.groups))
+    # --- Force widget/layout update here ---
+    self.groups_widget.adjustSize()
+    self.groups_widget.update()
+    self.scroll_area.update()
 
     def make_toggle_callback(self, group_idx, action, btn):
         def callback(checked):
@@ -558,6 +564,15 @@ class RelayControl(QMainWindow):
         else:
             self.serial_indicator.setText("Serial: Disconnected")
             self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
+
+    def show_console_context_menu(self, pos):
+        menu = self.console.createStandardContextMenu()
+        menu.addSeparator()
+        clear_action = QAction("Clear Console", self.console)
+        clear_action.triggered.connect(self.clear_console)
+        menu.addAction(clear_action)
+        menu.exec_(self.console.mapToGlobal(pos))
+        
     def clear_console(self):
         self.console.clear()
 
