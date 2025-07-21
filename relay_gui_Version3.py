@@ -8,12 +8,12 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 GROUPS_PER_PAGE = 12
-ACTION_TYPES = ["OpenLoad", "ShortToUBat", "ShortToGND", "ShortToCoil", "ShortToPin"]
+ACTION_TYPES = ["OpenLoad", "ShortToUBat", "ShortToGND", "ShortToPin"]
 
-class CoilPinDialog(QDialog):
+class PinSelectDialog(QDialog):
     def __init__(self, pinlist, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Select Two Pins for ShortToCoil")
+        self.setWindowTitle("Select Two Pins for ShortToPin")
         self.pins = pinlist
         layout = QFormLayout(self)
         self.combo1 = QComboBox()
@@ -26,26 +26,9 @@ class CoilPinDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        
     def get_selection(self):
         return self.combo1.currentText(), self.combo2.currentText()
-
-class LineSelectDialog(QDialog):
-    def __init__(self, group_names, exclude_idx, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Select Line to Short")
-        layout = QVBoxLayout(self)
-        self.combo = QComboBox()
-        for i, name in enumerate(group_names):
-            if i != exclude_idx:
-                self.combo.addItem(name, i)
-        layout.addWidget(QLabel("Select another group/line:"))
-        layout.addWidget(self.combo)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-    def get_selection(self):
-        return self.combo.currentData()
 
 class RelayControl(QWidget):
     def __init__(self):
@@ -94,6 +77,7 @@ class RelayControl(QWidget):
 
         self.set_default_groups()
         self.update_page()
+        self.shorttopin_pairs = {}  # {(group_idx): (dev1, pin1, dev2, pin2)}
 
     def set_default_groups(self):
         self.groups = [f"Group {i+1}" for i in range(108)]
@@ -150,7 +134,6 @@ class RelayControl(QWidget):
 
             fault_entry = self.fault_map.get(line_key, {})
 
-            # Pin list for ShortToCoil
             all_pins = []
             for k, v in fault_entry.items():
                 pin_str = f"{k} (Device:{v.get('DeviceID','')},Pin:{v.get('PinNo','')})"
@@ -161,23 +144,19 @@ class RelayControl(QWidget):
                 btn.setCheckable(True)
                 btn.setAutoExclusive(False)
 
-                # Enable logic
                 if action == "OpenLoad":
                     enabled = "OpenLoad" in fault_entry
                 elif action == "ShortToUBat":
                     enabled = "Common" in fault_entry and "UBat" in fault_entry
                 elif action == "ShortToGND":
                     enabled = "Common" in fault_entry and "GND" in fault_entry
-                elif action == "ShortToCoil":
-                    enabled = len(all_pins) >= 2
                 elif action == "ShortToPin":
-                    enabled = "Common" in fault_entry
+                    enabled = len(all_pins) >= 2
                 else:
                     enabled = False
 
                 btn.setEnabled(enabled)
 
-                # Button state: ON if all relevant pins are ON
                 if action == "OpenLoad" and enabled:
                     entry = fault_entry.get("OpenLoad")
                     device, pin = entry.get('DeviceID'), entry.get('PinNo')
@@ -259,48 +238,41 @@ class RelayControl(QWidget):
             self.setswitch(dev2, pin2, new_state)
             btn.setChecked(bool(new_state))
             self.set_style(btn, new_state)
-        elif action == "ShortToCoil":
-            if len(all_pins) < 2:
-                QMessageBox.warning(self, "Not enough pins", "Not enough pins to perform ShortToCoil.")
-                return
-            dlg = CoilPinDialog(all_pins, self)
-            if dlg.exec_() == QDialog.Accepted:
-                sel1, sel2 = dlg.get_selection()
-                def parse_pin(s):
-                    import re
-                    m = re.search(r'\(Device:(.*?),Pin:(.*?)\)', s)
-                    return (m.group(1).strip(), int(m.group(2).strip())) if m else (None, None)
-                dev1, pin1 = parse_pin(sel1)
-                dev2, pin2 = parse_pin(sel2)
-                if dev1 == dev2 and pin1 == pin2:
-                    QMessageBox.warning(self, "Invalid", "Select two different pins.")
-                    return
-                curr_state = self.getswitch(dev1, pin1) and self.getswitch(dev2, pin2)
-                new_state = 0 if curr_state else 1
-                self.setswitch(dev1, pin1, new_state)
-                self.setswitch(dev2, pin2, new_state)
-                btn.setChecked(bool(new_state))
-                self.set_style(btn, new_state)
         elif action == "ShortToPin":
-            # Show dialog to select another group/line
-            dlg = LineSelectDialog(self.groups, group_idx, self)
-            if dlg.exec_() == QDialog.Accepted:
-                target_idx = dlg.get_selection()
-                src_line_key = self.group_line_keys[group_idx]
-                tgt_line_key = self.group_line_keys[target_idx]
-                src_entry = self.fault_map.get(src_line_key, {}).get("Common")
-                tgt_entry = self.fault_map.get(tgt_line_key, {}).get("Common")
-                if not src_entry or not tgt_entry:
-                    QMessageBox.warning(self, "Error", "Common pin mapping missing in one or both lines.")
-                    return
-                dev1, pin1 = src_entry.get("DeviceID"), src_entry.get("PinNo")
-                dev2, pin2 = tgt_entry.get("DeviceID"), tgt_entry.get("PinNo")
-                curr_state = self.getswitch(dev1, pin1) and self.getswitch(dev2, pin2)
-                new_state = 0 if curr_state else 1
-                self.setswitch(dev1, pin1, new_state)
-                self.setswitch(dev2, pin2, new_state)
-                btn.setChecked(bool(new_state))
-                self.set_style(btn, new_state)
+            if len(all_pins) < 2:
+                QMessageBox.warning(self, "Not enough pins", "Not enough pins to perform ShortToPin.")
+                return
+
+            # If a pair was previously selected for this group, use it to reverse; else prompt
+            previous = self.shorttopin_pairs.get(group_idx)
+            if previous:
+                dev1, pin1, dev2, pin2 = previous
+            else:
+                dlg = PinSelectDialog(all_pins, self)
+                if dlg.exec_() == QDialog.Accepted:
+                    sel1, sel2 = dlg.get_selection()
+                    def parse_pin(s):
+                        import re
+                        m = re.search(r'\(Device:(.*?),Pin:(.*?)\)', s)
+                        return (m.group(1).strip(), int(m.group(2).strip())) if m else (None, None)
+                    dev1, pin1 = parse_pin(sel1)
+                    dev2, pin2 = parse_pin(sel2)
+                    if dev1 == dev2 and pin1 == pin2:
+                        QMessageBox.warning(self, "Invalid", "Select two different pins.")
+                        return
+                    self.shorttopin_pairs[group_idx] = (dev1, pin1, dev2, pin2)
+                else:
+                    return  # Dialog cancelled
+            # Toggle both pins
+            curr_state = self.getswitch(dev1, pin1) and self.getswitch(dev2, pin2)
+            new_state = 0 if curr_state else 1
+            self.setswitch(dev1, pin1, new_state)
+            self.setswitch(dev2, pin2, new_state)
+            btn.setChecked(bool(new_state))
+            self.set_style(btn, new_state)
+            # If OFF, forget the pair
+            if new_state == 0:
+                self.shorttopin_pairs.pop(group_idx, None)
 
     def setswitch(self, idevice, ipin, new_state):
         if idevice is None or ipin is None:
