@@ -3,40 +3,47 @@ import csv
 import json
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog,
-    QTextEdit, QMessageBox, QScrollArea, QMainWindow, QDockWidget, QAction, QComboBox
+    QTextEdit, QMessageBox, QScrollArea, QMainWindow, QDockWidget, QAction
 )
 from PyQt5.QtCore import Qt
 
 # ---- RELAY HARDWARE MODULE BEGIN ----
-# This section simulates relay_hw.py functionality.
-# Replace these stubs with your actual relay board code.
-
 class RelayHW:
     def __init__(self):
         self.relays = {}  # (device_id, pin_no): value
+        self.connected_ports = []
 
     def init(self):
         # Initialize hardware/serial
         print("RelayHW: Initialized")
 
     def deinit(self):
-        # Deinitialize hardware/serial
         print("RelayHW: Deinitialized")
+        self.connected_ports = []
 
     def setswitch(self, device_id, pin_no, value):
-        # Set relay to value (0/1)
         self.relays[(device_id, pin_no)] = value
 
     def getswitch(self, device_id, pin_no):
-        # Return relay state (0/1)
         return self.relays.get((device_id, pin_no), 0)
 
     def reset_all_relays(self):
-        # Set all relays to 0
         keys = list(self.relays.keys())
         for k in keys:
             self.relays[k] = 0
         print("RelayHW: All relays reset.")
+
+    def connect_all(self):
+        # Simulate connecting all 14 COM ports
+        self.connected_ports = [f"COM{i+1}" for i in range(14)]
+        print("RelayHW: All ports connected.")
+
+    def disconnect_all(self):
+        self.connected_ports = []
+        print("RelayHW: All ports disconnected.")
+
+    def is_connected(self):
+        return len(self.connected_ports) == 14
 
 relay_hw = RelayHW()
 # ---- RELAY HARDWARE MODULE END ----
@@ -71,33 +78,15 @@ class RelayControl(QMainWindow):
         nav_layout.addWidget(self.next_btn)
         nav_layout.addStretch()
 
-        # Serial Port Indicator, Controls (simulated)
+        # Serial Port Indicator, Connect/Disconnect Buttons
         self.serial_indicator = QLabel("Serial: Disconnected")
         self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
         nav_layout.addWidget(self.serial_indicator)
-
-        self.serial_port_selector = QComboBox()
-        self.serial_port_selector.addItem("COM1")
-        self.serial_port_selector.addItem("COM2")
-        self.serial_port_selector.addItem("COM3")
-        self.serial_port_selector.addItem("COM4")
-        self.serial_port_selector.addItem("COM5")
-        self.serial_port_selector.addItem("COM6")
-        self.serial_port_selector.addItem("COM7")
-        self.serial_port_selector.addItem("COM8")
-        self.serial_port_selector.addItem("COM9")
-        self.serial_port_selector.addItem("COM10")
-        self.serial_port_selector.addItem("COM11")
-        self.serial_port_selector.addItem("COM12")
-        self.serial_port_selector.addItem("COM13")
-        self.serial_port_selector.addItem("COM14")
-        self.serial_port_selector.setMinimumWidth(100)
-        nav_layout.addWidget(self.serial_port_selector)
-        self.serial_connect_btn = QPushButton("Connect")
-        self.serial_connect_btn.clicked.connect(self.connect_serial_port)
+        self.serial_connect_btn = QPushButton("Connect All")
+        self.serial_connect_btn.clicked.connect(self.connect_all_serial_ports)
         nav_layout.addWidget(self.serial_connect_btn)
-        self.serial_disconnect_btn = QPushButton("Disconnect")
-        self.serial_disconnect_btn.clicked.connect(self.disconnect_serial_port)
+        self.serial_disconnect_btn = QPushButton("Disconnect All")
+        self.serial_disconnect_btn.clicked.connect(self.disconnect_all_serial_ports)
         nav_layout.addWidget(self.serial_disconnect_btn)
 
         main_layout.addLayout(nav_layout)
@@ -152,7 +141,7 @@ class RelayControl(QMainWindow):
             self.console.append("Relay hardware initialized.")
         except Exception as e:
             self.console.append(f"Relay hardware init failed: {e}")
-        self.serial_port_connected = False
+        self.update_serial_indicator()
 
         self.set_default_groups()
         self.update_page()
@@ -388,35 +377,29 @@ class RelayControl(QMainWindow):
         if not visible:
             self.pin_action.setChecked(False)
 
-    # Serial connection simulation (for real use, replace with pyserial)
-    def connect_serial_port(self):
-        port = self.serial_port_selector.currentText()
-        if self.serial_port_connected:
-            self.console.append(f"Already connected to serial port: {port}")
-            self.serial_indicator.setText(f"Serial: Connected ({port})")
-            self.serial_indicator.setStyleSheet("color: green; font-weight: bold;")
-            return
+    def connect_all_serial_ports(self):
         try:
-            # Simulate connection success
-            self.serial_port_connected = True
-            self.serial_indicator.setText(f"Serial: Connected ({port})")
-            self.serial_indicator.setStyleSheet("color: green; font-weight: bold;")
-            self.console.append(f"Connected to serial port: {port}")
+            relay_hw.connect_all()
+            self.console.append("All serial ports connected.")
+            self.update_serial_indicator()
         except Exception as e:
-            self.console.append(f"Failed to connect to serial port {port}: {e}")
-            self.serial_indicator.setText("Serial: Disconnected")
-            self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
-            self.serial_port_connected = False
+            self.console.append(f"Failed to connect all serial ports: {e}")
+            self.update_serial_indicator()
 
-    def disconnect_serial_port(self):
-        if self.serial_port_connected:
-            port = self.serial_port_selector.currentText()
-            self.serial_port_connected = False
-            self.serial_indicator.setText("Serial: Disconnected")
-            self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
-            self.console.append(f"Disconnected from serial port: {port}")
+    def disconnect_all_serial_ports(self):
+        try:
+            relay_hw.disconnect_all()
+            self.console.append("All serial ports disconnected.")
+            self.update_serial_indicator()
+        except Exception as e:
+            self.console.append(f"Failed to disconnect all serial ports: {e}")
+            self.update_serial_indicator()
+
+    def update_serial_indicator(self):
+        if relay_hw.is_connected():
+            self.serial_indicator.setText("Serial: Connected (All)")
+            self.serial_indicator.setStyleSheet("color: green; font-weight: bold;")
         else:
-            self.console.append("No serial port connected.")
             self.serial_indicator.setText("Serial: Disconnected")
             self.serial_indicator.setStyleSheet("color: red; font-weight: bold;")
 
