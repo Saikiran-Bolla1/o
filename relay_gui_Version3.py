@@ -20,7 +20,8 @@ class RelayControl(QWidget):
         self.current_page = 0
         self.switch_states = {}  # {(DeviceID, PinNo): value}
         self.fault_map = {}
-        self.shorttopin_selected = []  # List of group indexes with active ShortToPin (max 2)
+        self.active_faults = {}  # {group_idx: action}
+        self.shorttopin_selected = set()  # set of group indexes where ShortToPin is active
 
         main_layout = QVBoxLayout(self)
         nav_layout = QHBoxLayout()
@@ -153,31 +154,36 @@ class RelayControl(QWidget):
             self.current_page += 1
             self.update_page()
 
-    def deactivate_all_faults_in_group(self, group_idx):
+    def deactivate_fault(self, group_idx, action):
+        """Deactivate specific fault in a group."""
         line_key = self.group_line_keys[group_idx]
         fault_entry = self.fault_map.get(line_key, {})
-        # OpenLoad
-        entry = fault_entry.get("OpenLoad")
-        if entry:
-            self.setswitch(entry.get('DeviceID'), entry.get('PinNo'), 0)
-        # ShortToUBat
-        entry1 = fault_entry.get("Common")
-        entry2 = fault_entry.get("UBat")
-        if entry1 and entry2:
-            self.setswitch(entry1.get('DeviceID'), entry1.get('PinNo'), 0)
-            self.setswitch(entry2.get('DeviceID'), entry2.get('PinNo'), 0)
-        # ShortToGND
-        entry1 = fault_entry.get("Common")
-        entry2 = fault_entry.get("GND")
-        if entry1 and entry2:
-            self.setswitch(entry1.get('DeviceID'), entry1.get('PinNo'), 0)
-            self.setswitch(entry2.get('DeviceID'), entry2.get('PinNo'), 0)
-        # ShortToPin
-        if group_idx in self.shorttopin_selected:
-            src_entry = fault_entry.get("Common")
-            if src_entry:
-                self.setswitch(src_entry.get('DeviceID'), src_entry.get('PinNo'), 0)
-            self.shorttopin_selected.remove(group_idx)
+        if action == "OpenLoad":
+            entry = fault_entry.get("OpenLoad")
+            if entry:
+                self.setswitch(entry.get('DeviceID'), entry.get('PinNo'), 0)
+        elif action == "ShortToUBat":
+            entry1 = fault_entry.get("Common")
+            entry2 = fault_entry.get("UBat")
+            if entry1 and entry2:
+                self.setswitch(entry1.get('DeviceID'), entry1.get('PinNo'), 0)
+                self.setswitch(entry2.get('DeviceID'), entry2.get('PinNo'), 0)
+        elif action == "ShortToGND":
+            entry1 = fault_entry.get("Common")
+            entry2 = fault_entry.get("GND")
+            if entry1 and entry2:
+                self.setswitch(entry1.get('DeviceID'), entry1.get('PinNo'), 0)
+                self.setswitch(entry2.get('DeviceID'), entry2.get('PinNo'), 0)
+        elif action == "ShortToPin":
+            entry = fault_entry.get("Common")
+            if entry:
+                self.setswitch(entry.get('DeviceID'), entry.get('PinNo'), 0)
+            self.shorttopin_selected.discard(group_idx)
+
+    def deactivate_all_faults_in_group(self, group_idx):
+        """Deactivate all faults in the group."""
+        for action in ACTION_TYPES:
+            self.deactivate_fault(group_idx, action)
 
     def is_fault_active(self, group_idx, action):
         line_key = self.group_line_keys[group_idx]
@@ -199,51 +205,43 @@ class RelayControl(QWidget):
                 return self.getswitch(entry1.get('DeviceID'), entry1.get('PinNo')) == 1 and \
                        self.getswitch(entry2.get('DeviceID'), entry2.get('PinNo')) == 1
         elif action == "ShortToPin":
-            return group_idx in self.shorttopin_selected
+            entry = fault_entry.get("Common")
+            return group_idx in self.shorttopin_selected and entry and self.getswitch(entry.get('DeviceID'), entry.get('PinNo')) == 1
         return False
 
     def toggle_switch(self, group_idx, action, btn):
-        if action == "ShortToPin":
-            # Toggle logic for ShortToPin: Only allow up to 2 groups active at once
-            if group_idx in self.shorttopin_selected:
-                # Deactivate this group's Common pin
-                line_key = self.group_line_keys[group_idx]
-                src_entry = self.fault_map.get(line_key, {}).get("Common")
-                if src_entry:
-                    self.setswitch(src_entry.get('DeviceID'), src_entry.get('PinNo'), 0)
-                self.shorttopin_selected.remove(group_idx)
-            else:
-                if len(self.shorttopin_selected) < 2:
-                    # Activate this group's Common pin
-                    line_key = self.group_line_keys[group_idx]
-                    src_entry = self.fault_map.get(line_key, {}).get("Common")
-                    if src_entry:
-                        self.setswitch(src_entry.get('DeviceID'), src_entry.get('PinNo'), 1)
-                    self.shorttopin_selected.append(group_idx)
-                # If already 2 active, do nothing (ignore more)
+        if self.is_fault_active(group_idx, action):
+            # If already active, deactivate
+            self.deactivate_fault(group_idx, action)
+            self.active_faults.pop(group_idx, None)
         else:
-            # Deselect all other faults in this group first
+            # Deactivate any previous fault in this group (including ShortToPin)
             self.deactivate_all_faults_in_group(group_idx)
+            # Activate the selected fault
             line_key = self.group_line_keys[group_idx]
             fault_entry = self.fault_map.get(line_key, {})
             if action == "OpenLoad":
-                entry = fault_entry.get("OpenLoad", {})
-                device, pin = entry.get('DeviceID'), entry.get('PinNo')
-                self.setswitch(device, pin, 1)
+                entry = fault_entry.get("OpenLoad")
+                if entry:
+                    self.setswitch(entry.get('DeviceID'), entry.get('PinNo'), 1)
             elif action == "ShortToUBat":
-                entry1 = fault_entry.get("Common", {})
-                entry2 = fault_entry.get("UBat", {})
-                dev1, pin1 = entry1.get('DeviceID'), entry1.get('PinNo')
-                dev2, pin2 = entry2.get('DeviceID'), entry2.get('PinNo')
-                self.setswitch(dev1, pin1, 1)
-                self.setswitch(dev2, pin2, 1)
+                entry1 = fault_entry.get("Common")
+                entry2 = fault_entry.get("UBat")
+                if entry1 and entry2:
+                    self.setswitch(entry1.get('DeviceID'), entry1.get('PinNo'), 1)
+                    self.setswitch(entry2.get('DeviceID'), entry2.get('PinNo'), 1)
             elif action == "ShortToGND":
-                entry1 = fault_entry.get("Common", {})
-                entry2 = fault_entry.get("GND", {})
-                dev1, pin1 = entry1.get('DeviceID'), entry1.get('PinNo')
-                dev2, pin2 = entry2.get('DeviceID'), entry2.get('PinNo')
-                self.setswitch(dev1, pin1, 1)
-                self.setswitch(dev2, pin2, 1)
+                entry1 = fault_entry.get("Common")
+                entry2 = fault_entry.get("GND")
+                if entry1 and entry2:
+                    self.setswitch(entry1.get('DeviceID'), entry1.get('PinNo'), 1)
+                    self.setswitch(entry2.get('DeviceID'), entry2.get('PinNo'), 1)
+            elif action == "ShortToPin":
+                entry = fault_entry.get("Common")
+                if entry:
+                    self.setswitch(entry.get('DeviceID'), entry.get('PinNo'), 1)
+                self.shorttopin_selected.add(group_idx)
+            self.active_faults[group_idx] = action
         self.update_page()
 
     def setswitch(self, idevice, ipin, new_state):
