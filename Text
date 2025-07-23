@@ -1,0 +1,50 @@
+import openpyxl
+
+# Load the workbook
+wb = openpyxl.load_workbook('example.xlsx')
+
+# List all sheet names
+print("Sheets:", wb.sheetnames)
+
+# Select a sheet by name
+sheet = wb['Sheet1']
+
+# Read cell values (cell-wise)
+for row in sheet.iter_rows(min_row=1, max_row=sheet.max_row, min_col=1, max_col=sheet.max_column):
+    for cell in row:
+        print(f"Cell {cell.coordinate}: {cell.value}")
+
+# Access a specific cell
+value = sheet['A1'].value
+print("Value in A1:", value)
+
+
+
+import openpyxl
+
+# Create a new workbook and sheet
+wb = openpyxl.Workbook()
+sheet = wb.active
+sheet.title = "Sheet1"
+
+# Write to specific cells
+sheet['A1'] = 'Hello'
+sheet['B1'] = 123
+
+# Write row-wise or column-wise
+data = [
+    ['Name', 'Age'],
+    ['Alice', 30],
+    ['Bob', 25]
+]
+
+for i, row in enumerate(data, start=1):
+    for j, value in enumerate(row, start=1):
+        sheet.cell(row=i, column=j, value=value)
+
+# Add another sheet
+wb.create_sheet(title="AnotherSheet")
+wb['AnotherSheet']['A1'] = "New Sheet Cell"
+
+# Save the workbook
+wb.save('output.xlsx')
