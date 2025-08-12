@@ -1,0 +1,497 @@
+import os
+import time
+from typing import Any, Optional
+
+import win32com.client
+from asammdf import MDF
+from TestPackage.logger.logger_manager import get_logger
+from TestPackage.report.viewer import test_report_context
+
+
+class CanapeSignal:
+    """Abstraction for a CANape measurement signal (read/write/validate)."""
+    def __init__(self, canape, name: str):
+        self._canape = canape
+        self.name = name
+
+    @property
+    def value(self) -> Any:
+        try:
+            val = self._canape.Measurement.GetSignalValue(self.name)
+            test_report_context.add_step("PASSED", f"Read signal {self.name}: {val}")
+            return val
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Error reading signal {self.name}: {e}")
+            raise
+
+    @value.setter
+    def value(self, v: Any) -> None:
+        try:
+            self._canape.Measurement.SetSignalValue(self.name, v)
+            test_report_context.add_step("PASSED", f"Set signal {self.name} = {v}")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Error setting signal {self.name}: {e}")
+            raise
+
+    def validate(self, expected: Any) -> bool:
+        actual = self.value
+        if actual == expected:
+            test_report_context.add_step("PASSED", f"Validation passed: {self.name} == {expected}")
+            return True
+        else:
+            test_report_context.add_step("FAILED", f"Validation failed: {self.name} = {actual}, expected {expected}")
+            return False
+
+
+class CanapeCalibrationObject:
+    """Abstraction for a CANape calibration object (parameter, axis, map)."""
+    def __init__(self, calobj, device_name: str, object_name: str):
+        self._calobj = calobj
+        self.device_name = device_name
+        self.object_name = object_name
+
+    def read(self) -> None:
+        try:
+            self._calobj.Read()
+            test_report_context.add_step("PASSED", f"Read calibration object {self.device_name}.{self.object_name}")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Error reading calibration object {self.device_name}.{self.object_name}: {e}")
+            raise
+
+    def write(self) -> None:
+        try:
+            self._calobj.Write()
+            test_report_context.add_step("PASSED", f"Wrote calibration object {self.device_name}.{self.object_name}")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Error writing calibration object {self.device_name}.{self.object_name}: {e}")
+            raise
+
+    @property
+    def value(self) -> Any:
+        try:
+            val = self._calobj.Value
+            test_report_context.add_step("PASSED", f"Read value of {self.device_name}.{self.object_name}: {val}")
+            return val
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Error reading value of {self.device_name}.{self.object_name}: {e}")
+            raise
+
+    @value.setter
+    def value(self, v: Any) -> None:
+        try:
+            self._calobj.Value = v
+            test_report_context.add_step("PASSED", f"Set value of {self.device_name}.{self.object_name}")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Error setting value of {self.device_name}.{self.object_name}: {e}")
+            raise
+
+    @property
+    def x_dim(self) -> Optional[int]:
+        try:
+            return getattr(self._calobj, "XDim", None)
+        except Exception:
+            return None
+
+    @property
+    def y_dim(self) -> Optional[int]:
+        try:
+            return getattr(self._calobj, "YDim", None)
+        except Exception:
+            return None
+
+    def validate(self, expected: Any) -> bool:
+        self.read()
+        actual = self.value
+        if actual == expected:
+            test_report_context.add_step("PASSED", f"Validation passed: {self.device_name}.{self.object_name} == expected")
+            return True
+        else:
+            test_report_context.add_step("FAILED", f"Validation failed: {self.device_name}.{self.object_name} != expected")
+            return False
+
+
+# Backwards-compatibility alias
+class CanapeVariable(CanapeSignal):
+    pass
+
+
+class CanapeRecorder:
+    """
+    Context manager for CANape MDF/MF4 recording.
+
+    Example:
+        with canape.recorder("output.mf4", manage_measurement=True, start_delay_s=0.5) as rec:
+            ...
+        samples = rec["EngineSpeed"]
+    """
+    def __init__(
+        self,
+        canape,
+        mdf_path: str,
+        manage_measurement: bool = False,
+        start_delay_s: float = 0.0,
+        stop_delay_s: float = 0.0,
+        overwrite: bool = True,
+    ):
+        self._canape = canape
+        self.mdf_path = mdf_path
+        self.manage_measurement = manage_measurement
+        self.start_delay_s = max(0.0, float(start_delay_s))
+        self.stop_delay_s = max(0.0, float(stop_delay_s))
+        self.overwrite = overwrite
+
+        self.logger = get_logger()
+        self._mdf_data: Optional[MDF] = None
+        self._started_measurement = False
+
+    def __enter__(self):
+        # Prepare output directory
+        try:
+            out_dir = os.path.dirname(self.mdf_path)
+            if out_dir and not os.path.exists(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+                self.logger.info(f"Created directory for MDF recording: {out_dir}")
+
+            if self.overwrite and os.path.exists(self.mdf_path):
+                try:
+                    os.remove(self.mdf_path)
+                    self.logger.info(f"Removed existing MDF/MF4 file: {self.mdf_path}")
+                except Exception as e_rm:
+                    self.logger.warning(f"Could not remove existing MDF/MF4 file: {self.mdf_path} ({e_rm})")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed preparing MDF path: {e}")
+            self.logger.error(f"Failed preparing MDF path: {e}")
+            raise
+
+        # Optionally start measurement
+        if self.manage_measurement:
+            try:
+                is_running = False
+                try:
+                    if hasattr(self._canape.Measurement, "Running"):
+                        is_running = bool(self._canape.Measurement.Running)
+                    elif hasattr(self._canape.Measurement, "IsRunning"):
+                        is_running = bool(self._canape.Measurement.IsRunning)
+                    else:
+                        # Fallback attempt
+                        is_running = bool(self._canape.Measurement.Started) if hasattr(self._canape.Measurement, "Started") else False
+                except Exception:
+                    is_running = False
+
+                if not is_running:
+                    self._canape.Measurement.Start()
+                    self._started_measurement = True
+                    test_report_context.add_step("PASSED", "Measurement started.")
+                    self.logger.info("Measurement started.")
+                    if self.start_delay_s > 0:
+                        time.sleep(self.start_delay_s)
+            except Exception as e:
+                test_report_context.add_step("FAILED", f"Failed to start measurement: {e}")
+                self.logger.error(f"Failed to start measurement: {e}")
+                raise
+
+        # Start MDF recording
+        try:
+            self._canape.Measurement.StartMeasurementRecording(self.mdf_path)
+            test_report_context.add_step("PASSED", f"Started MDF recording: {self.mdf_path}")
+            self.logger.info(f"Started MDF recording: {self.mdf_path}")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed to start MDF recording: {e}")
+            self.logger.error(f"Failed to start MDF recording: {e}")
+            # If we started measurement here, try to stop it
+            if self.manage_measurement and self._started_measurement:
+                try:
+                    self._canape.Measurement.Stop()
+                except Exception:
+                    pass
+            raise
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Optional capture tail before stopping
+        if self.stop_delay_s > 0:
+            time.sleep(self.stop_delay_s)
+
+        # Stop recording
+        try:
+            self._canape.Measurement.StopMeasurementRecording()
+            test_report_context.add_step("PASSED", "Stopped MDF recording.")
+            self.logger.info("Stopped MDF recording.")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed to stop MDF recording: {e}")
+            self.logger.error(f"Failed to stop MDF recording: {e}")
+
+        # Optionally stop measurement
+        if self.manage_measurement and self._started_measurement:
+            try:
+                self._canape.Measurement.Stop()
+                test_report_context.add_step("PASSED", "Measurement stopped.")
+                self.logger.info("Measurement stopped.")
+            except Exception as e:
+                test_report_context.add_step("FAILED", f"Failed to stop measurement: {e}")
+                self.logger.error(f"Failed to stop measurement: {e}")
+
+        # Load MDF data
+        try:
+            self._mdf_data = MDF(self.mdf_path)
+            test_report_context.add_step("PASSED", f"Loaded MDF/MF4 file: {self.mdf_path}")
+            self.logger.info(f"Loaded MDF/MF4 file: {self.mdf_path}")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed to load MDF/MF4 file: {e}")
+            self.logger.error(f"Failed to load MDF/MF4 file: {e}")
+
+    def __getitem__(self, signal_name: str):
+        """Access recorded signal data after recording. Returns numpy array of samples."""
+        if self._mdf_data is None:
+            raise RuntimeError("MDF/MF4 data not loaded. Ensure you access after the 'with' block.")
+        try:
+            sig = self._mdf_data.get(signal_name)
+            data = sig.samples if hasattr(sig, 'samples') else sig
+            test_report_context.add_step("PASSED", f"Accessed signal '{signal_name}' from MDF/MF4")
+            return data
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Signal '{signal_name}' not found in MDF/MF4: {e}")
+            self.logger.error(f"Signal '{signal_name}' not found in MDF/MF4: {e}")
+            raise KeyError(f"Signal '{signal_name}' not found in MDF/MF4: {e}")
+
+    def get_with_timestamps(self, signal_name: str):
+        """Return (timestamps, samples) if available in the MDF."""
+        if self._mdf_data is None:
+            raise RuntimeError("MDF/MF4 data not loaded. Ensure you access after the 'with' block.")
+        try:
+            sig = self._mdf_data.get(signal_name)
+            if hasattr(sig, "timestamps") and hasattr(sig, "samples"):
+                test_report_context.add_step("PASSED", f"Accessed signal '{signal_name}' with timestamps from MDF/MF4")
+                return sig.timestamps, sig.samples
+            # Fallback: only data available
+            test_report_context.add_step("PASSED", f"Accessed signal '{signal_name}' (no timestamps available) from MDF/MF4")
+            return None, sig if not hasattr(sig, "samples") else sig.samples
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Signal '{signal_name}' not found in MDF/MF4: {e}")
+            self.logger.error(f"Signal '{signal_name}' not found in MDF/MF4: {e}")
+            raise KeyError(f"Signal '{signal_name}' not found in MDF/MF4: {e}")
+
+
+class _MeasurementSession:
+    """Context manager to start/stop measurement."""
+    def __init__(self, canape, start_delay_s: float = 0.0, stop_delay_s: float = 0.0):
+        self._canape = canape
+        self.start_delay_s = max(0.0, float(start_delay_s))
+        self.stop_delay_s = max(0.0, float(stop_delay_s))
+        self.logger = get_logger()
+
+    def __enter__(self):
+        try:
+            self._canape.Measurement.Start()
+            test_report_context.add_step("PASSED", "Measurement started.")
+            self.logger.info("Measurement started.")
+            if self.start_delay_s > 0:
+                time.sleep(self.start_delay_s)
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed to start measurement: {e}")
+            self.logger.error(f"Failed to start measurement: {e}")
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.stop_delay_s > 0:
+            time.sleep(self.stop_delay_s)
+        try:
+            self._canape.Measurement.Stop()
+            test_report_context.add_step("PASSED", "Measurement stopped.")
+            self.logger.info("Measurement stopped.")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed to stop measurement: {e}")
+            self.logger.error(f"Failed to stop measurement: {e}")
+
+
+class CanapeController:
+    """
+    Main CANape COM Automation controller.
+
+    Usage:
+        canape = CanapeController(project_path)
+        sig = canape["EngineSpeed"]
+        sig.value = 20
+        v = sig.value
+        sig.validate(20)
+
+        calib = canape.calibration("XCPsim", "KF1")
+        calib.read()
+        arr = calib.value
+        calib.value = arr
+        calib.write()
+
+        with canape.recorder("file.mf4", manage_measurement=True) as rec:
+            ...
+        samples = rec["EngineSpeed"]
+    """
+    def __init__(self, project_path: str, visible: bool = True):
+        self.logger = get_logger()
+        try:
+            self.canape = win32com.client.Dispatch("CANape.Application")
+        except Exception as e:
+            self.logger.error(f"[CANape] Error creating CANape application object: {e}")
+            test_report_context.add_step("FAILED", f"[CANape] Error creating CANape application object: {e}")
+            raise
+
+        if hasattr(self.canape, "Visible"):
+            self.canape.Visible = visible
+
+        if self.canape is None:
+            msg = "[CANape] CANape is not running."
+            self.logger.error(msg)
+            test_report_context.add_step("FAILED", msg)
+            raise RuntimeError(msg)
+
+        self.logger.info("[CANape] CANape application object created successfully.")
+        test_report_context.add_step("PASSED", "[CANape] CANape application object created successfully.")
+
+        try:
+            # Prefer OpenProject if available; fallback to Open1 if only that is provided in a specific setup
+            if hasattr(self.canape, "OpenProject"):
+                self.canape.OpenProject(project_path)
+            else:
+                # Open1(path, ?, ?, showUI: bool) signature varies by CANape version; attempt sensible defaults
+                self.canape.Open1(project_path, 1, 50000, bool(visible))
+            self.logger.info(f"[CANape] Project '{project_path}' opened successfully.")
+            test_report_context.add_step("PASSED", f"[CANape] Project '{project_path}' opened successfully.")
+        except Exception as e:
+            self.logger.error(f"[CANape] Error opening project: {e}")
+            test_report_context.add_step("FAILED", f"[CANape] Error opening project: {e}")
+            try:
+                self.canape.Quit()
+            except Exception:
+                pass
+            raise
+
+    def __getitem__(self, signal_name: str) -> CanapeSignal:
+        """Access a CANape measurement signal for reading/writing/validation: canape['SignalName']"""
+        return CanapeSignal(self.canape, signal_name)
+
+    # Measurement helpers
+    def start_measurement(self, start_delay_s: float = 0.0) -> None:
+        try:
+            self.canape.Measurement.Start()
+            test_report_context.add_step("PASSED", "Measurement started.")
+            self.logger.info("Measurement started.")
+            if start_delay_s > 0:
+                time.sleep(start_delay_s)
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed to start measurement: {e}")
+            self.logger.error(f"Failed to start measurement: {e}")
+            raise
+
+    def stop_measurement(self, stop_delay_s: float = 0.0) -> None:
+        try:
+            if stop_delay_s > 0:
+                time.sleep(stop_delay_s)
+            self.canape.Measurement.Stop()
+            test_report_context.add_step("PASSED", "Measurement stopped.")
+            self.logger.info("Measurement stopped.")
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed to stop measurement: {e}")
+            self.logger.error(f"Failed to stop measurement: {e}")
+            raise
+
+    def measurement(self, start_delay_s: float = 0.0, stop_delay_s: float = 0.0) -> _MeasurementSession:
+        """Context manager to start/stop measurement."""
+        return _MeasurementSession(self.canape, start_delay_s, stop_delay_s)
+
+    # Calibration helpers
+    def calibration(self, device_name: str, object_name: str) -> CanapeCalibrationObject:
+        """Get a calibration object wrapper from a device (adds the object to the device if needed)."""
+        try:
+            dev = None
+            # Try to access device by name via common COM collection patterns
+            for accessor in ("Item",):
+                try:
+                    dev = getattr(self.canape.Devices, accessor)(device_name)
+                    break
+                except Exception:
+                    continue
+            if dev is None:
+                try:
+                    dev = self.canape.Devices(device_name)  # type: ignore
+                except Exception:
+                    pass
+            if dev is None:
+                raise RuntimeError(f"Device '{device_name}' not found. Ensure it is added to the project/session.")
+
+            # Ensure calibration object exists/loaded
+            try:
+                dev.CalibrationObjects.Add(object_name)
+            except Exception:
+                # It's fine if it already exists
+                pass
+
+            calobj = None
+            for accessor in ("Item",):
+                try:
+                    calobj = getattr(dev.CalibrationObjects, accessor)(object_name)
+                    break
+                except Exception:
+                    continue
+            if calobj is None:
+                try:
+                    calobj = dev.CalibrationObjects(object_name)  # type: ignore
+                except Exception as e:
+                    raise RuntimeError(f"Calibration object '{object_name}' not found on device '{device_name}': {e}")
+
+            test_report_context.add_step("PASSED", f"Calibration object {device_name}.{object_name} ready.")
+            return CanapeCalibrationObject(calobj, device_name, object_name)
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed to access calibration object {device_name}.{object_name}: {e}")
+            self.logger.error(f"Failed to access calibration object {device_name}.{object_name}: {e}")
+            raise
+
+    # Recorder
+    def recorder(
+        self,
+        mdf_path: str,
+        manage_measurement: bool = False,
+        start_delay_s: float = 0.0,
+        stop_delay_s: float = 0.0,
+        overwrite: bool = True,
+    ) -> CanapeRecorder:
+        """
+        Context manager for recording MDF/MF4 and accessing recorded signals.
+
+        Parameters:
+        - mdf_path: Output path for MDF/MF4 file.
+        - manage_measurement: If True, this will start/stop the measurement around recording.
+        - start_delay_s: Optional delay after starting measurement before recording starts (if manage_measurement=True).
+        - stop_delay_s: Optional delay before stopping recording (to capture tail).
+        - overwrite: Remove existing MDF file if present.
+        """
+        return CanapeRecorder(
+            self.canape,
+            mdf_path=mdf_path,
+            manage_measurement=manage_measurement,
+            start_delay_s=start_delay_s,
+            stop_delay_s=stop_delay_s,
+            overwrite=overwrite,
+        )
+
+    # Device helpers (optional)
+    def add_device(self, name: str, a2l_path: str, protocol: str = "XCP", transport_layer: int = 1):
+        """Add a device to the session (e.g., dev = canape.add_device('XCPsim','XCPsim.a2l'))."""
+        try:
+            dev = self.canape.Devices.Add(name, a2l_path, protocol, transport_layer)
+            test_report_context.add_step("PASSED", f"Device '{name}' added with A2L '{a2l_path}'.")
+            self.logger.info(f"Device '{name}' added.")
+            return dev
+        except Exception as e:
+            test_report_context.add_step("FAILED", f"Failed to add device '{name}': {e}")
+            self.logger.error(f"Failed to add device '{name}': {e}")
+            raise
+
+    def quit(self):
+        try:
+            self.canape.Quit()
+            self.logger.info("[CANape] CANape closed.")
+            test_report_context.add_step("PASSED", "[CANape] CANape closed.")
+        except Exception as e:
+            self.logger.error(f"[CANape] Error closing CANape: {e}")
+            test_report_context.add_step("FAILED", f"[CANape] Error closing CANape: {e}")
