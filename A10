@@ -1,0 +1,52 @@
+import re
+from elftools.elf.elffile import ELFFile
+
+# 1. Load ELF symbol addresses
+def get_elf_symbol_map(elf_path):
+    symbols = {}
+    with open(elf_path, "rb") as f:
+        elf = ELFFile(f)
+        for sec_name in (".symtab", ".dynsym"):
+            sec = elf.get_section_by_name(sec_name)
+            if not sec:
+                continue
+            for sym in sec.iter_symbols():
+                # Accept only STT_OBJECT and STT_FUNC if needed
+                if sym['st_info']['type'] in ('STT_OBJECT', 'STT_FUNC') and sym['st_value'] != 0:
+                    symbols[sym.name] = sym['st_value']
+    return symbols
+
+# 2. Match A2L variable names to ELF symbols
+def get_matching_address(a2l_var_name, elf_symbol_map):
+    # Try exact match
+    if a2l_var_name in elf_symbol_map:
+        return elf_symbol_map[a2l_var_name]
+    # Try alternative patterns, e.g. A2L uses name._1_, ELF uses name_1_
+    alt_name = re.sub(r'\._(\d+)_', r'_\1_', a2l_var_name)
+    if alt_name in elf_symbol_map:
+        return elf_symbol_map[alt_name]
+    # Try even more patterns as needed
+    return None
+
+# 3. Update the A2L address (simplified example)
+def update_a2l_addresses(a2l_lines, elf_symbol_map):
+    pattern = re.compile(r'\bMEASUREMENT\s+(\S+)\s+\"')
+    for i, line in enumerate(a2l_lines):
+        m = pattern.search(line)
+        if m:
+            var_name = m.group(1)
+            addr = get_matching_address(var_name, elf_symbol_map)
+            if addr is not None:
+                # Find and update ECU_ADDRESS or address field in following lines
+                for j in range(i, min(i+10, len(a2l_lines))):
+                    if "ECU_ADDRESS" in a2l_lines[j]:
+                        a2l_lines[j] = re.sub(r'ECU_ADDRESS\s+\S+', f'ECU_ADDRESS 0x{addr:X}', a2l_lines[j])
+    return a2l_lines
+
+# Example usage
+elf_symbol_map = get_elf_symbol_map("your.elf")
+with open("your.a2l", "r") as f:
+    a2l_lines = f.readlines()
+new_a2l_lines = update_a2l_addresses(a2l_lines, elf_symbol_map)
+with open("updated.a2l", "w") as f:
+    f.writelines(new_a2l_lines)
