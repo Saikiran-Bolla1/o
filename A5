@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""
+Add new MEASUREMENT blocks to an A2L file for a user-supplied list of symbol names.
+Addresses are resolved from the ELF file. Only symbols present in the ELF are added.
+
+Usage:
+  python scripts/update_a2l_with_user_symbols_from_elf.py --a2l-in input.a2l --symbols user_symbols.txt --elf app.elf --a2l-out output.a2l
+
+Symbols file format (plain text, one symbol per line):
+  MyVar1
+  MyVar2
+  MyVar3
+"""
+
+import argparse
+import re
+from pathlib import Path
+from elftools.elf.elffile import ELFFile
+
+def get_elf_symbol_map(elf_path):
+    symbols = {}
+    with open(elf_path, "rb") as f:
+        elf = ELFFile(f)
+        for sec_name in (".symtab", ".dynsym"):
+            sec = elf.get_section_by_name(sec_name)
+            if not sec:
+                continue
+            for sym in sec.iter_symbols():
+                if sym['st_info']['type'] == 'STT_OBJECT' and sym['st_value'] != 0:
+                    symbols[sym.name] = sym['st_value']
+    return symbols
+
+def read_user_symbols(symbols_path):
+    symbols = []
+    with open(symbols_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                symbols.append(line)
+    return symbols
+
+def get_existing_measurements(a2l_lines):
+    measurement_re = re.compile(r"\bMEASUREMENT\s+(\S+)\s+\"")
+    found = set()
+    for line in a2l_lines:
+        m = measurement_re.search(line)
+        if m:
+            found.add(m.group(1))
+    return found
+
+def append_measurements(a2l_lines, symbols_to_add, elf_symbol_map, existing):
+    end_module_idx = None
+    for i, line in enumerate(a2l_lines[::-1]):
+        if "/end MODULE" in line:
+            end_module_idx = len(a2l_lines) - 1 - i
+            break
+    if end_module_idx is None:
+        end_module_idx = len(a2l_lines)
+
+    new_blocks = []
+    added = 0
+    for name in symbols_to_add:
+        if name in existing:
+            continue
+        addr = elf_symbol_map.get(name)
+        if addr is None:
+            print(f"Warning: Symbol '{name}' not found in ELF, skipping.")
+            continue
+        new_blocks.append(f"    /begin MEASUREMENT {name} \"{name}\"")
+        new_blocks.append(f"      UINT {addr:#X} 1 0 65535")
+        new_blocks.append(f"      ECU_ADDRESS {addr:#X}")
+        new_blocks.append(f"      FORMAT \"%d\"")
+        new_blocks.append(f"      /end MEASUREMENT")
+        added += 1
+
+    a2l_lines = a2l_lines[:end_module_idx] + new_blocks + a2l_lines[end_module_idx:]
+    return a2l_lines, added
+
+def main():
+    parser = argparse.ArgumentParser(description="Add user symbols from ELF to A2L as MEASUREMENTs.")
+    parser.add_argument("--a2l-in", required=True, type=Path, help="Input A2L file")
+    parser.add_argument("--symbols", required=True, type=Path, help="Symbols file (one symbol per line)")
+    parser.add_argument("--elf", required=True, type=Path, help="ELF file")
+    parser.add_argument("--a2l-out", required=True, type=Path, help="Output A2L file")
+    args = parser.parse_args()
+
+    elf_symbol_map = get_elf_symbol_map(str(args.elf))
+    user_symbols = read_user_symbols(str(args.symbols))
+    a2l_lines = args.a2l_in.read_text(encoding="latin-1").splitlines()
+    existing = get_existing_measurements(a2l_lines)
+    a2l_lines, added = append_measurements(a2l_lines, user_symbols, elf_symbol_map, existing)
+    args.a2l_out.write_text("\n".join(a2l_lines) + "\n", encoding="latin-1")
+    print(f"Added {added} new MEASUREMENT blocks to {args.a2l_out}")
+
+if __name__ == "__main__":
+    main()
