@@ -1,9 +1,15 @@
+#!/usr/bin/env python3
+"""
+Update A2L addresses for array elements (e.g. name._1_, name._2_, ...) using ELF file.
+Assumes ELF symbol is 'name' (the array) and each A2L variable represents an element.
+"""
+
+import argparse
 import re
+from pathlib import Path
 from elftools.elf.elffile import ELFFile
 
-# 1. Load ELF symbol addresses
-def get_elf_symbol_map(elf_path):
-    symbols = {}
+def get_elf_array_baseaddr(elf_path, array_name):
     with open(elf_path, "rb") as f:
         elf = ELFFile(f)
         for sec_name in (".symtab", ".dynsym"):
@@ -11,42 +17,42 @@ def get_elf_symbol_map(elf_path):
             if not sec:
                 continue
             for sym in sec.iter_symbols():
-                # Accept only STT_OBJECT and STT_FUNC if needed
-                if sym['st_info']['type'] in ('STT_OBJECT', 'STT_FUNC') and sym['st_value'] != 0:
-                    symbols[sym.name] = sym['st_value']
-    return symbols
-
-# 2. Match A2L variable names to ELF symbols
-def get_matching_address(a2l_var_name, elf_symbol_map):
-    # Try exact match
-    if a2l_var_name in elf_symbol_map:
-        return elf_symbol_map[a2l_var_name]
-    # Try alternative patterns, e.g. A2L uses name._1_, ELF uses name_1_
-    alt_name = re.sub(r'\._(\d+)_', r'_\1_', a2l_var_name)
-    if alt_name in elf_symbol_map:
-        return elf_symbol_map[alt_name]
-    # Try even more patterns as needed
+                if sym.name == array_name and sym['st_value'] != 0:
+                    return sym['st_value']
     return None
 
-# 3. Update the A2L address (simplified example)
-def update_a2l_addresses(a2l_lines, elf_symbol_map):
-    pattern = re.compile(r'\bMEASUREMENT\s+(\S+)\s+\"')
+def update_a2l_array_addresses(a2l_lines, array_name, base_addr, element_size):
+    # Match lines: MEASUREMENT name._<i>_ "<desc>"
+    pattern = re.compile(rf"\bMEASUREMENT\s+{re.escape(array_name)}\._(\d+)_\s+\"")
     for i, line in enumerate(a2l_lines):
         m = pattern.search(line)
         if m:
-            var_name = m.group(1)
-            addr = get_matching_address(var_name, elf_symbol_map)
-            if addr is not None:
-                # Find and update ECU_ADDRESS or address field in following lines
-                for j in range(i, min(i+10, len(a2l_lines))):
-                    if "ECU_ADDRESS" in a2l_lines[j]:
-                        a2l_lines[j] = re.sub(r'ECU_ADDRESS\s+\S+', f'ECU_ADDRESS 0x{addr:X}', a2l_lines[j])
+            idx = int(m.group(1)) - 1  # 0-based index
+            addr = base_addr + element_size * idx
+            # Find and update ECU_ADDRESS or address field in following lines
+            for j in range(i, min(i+10, len(a2l_lines)):
+                if "ECU_ADDRESS" in a2l_lines[j]:
+                    a2l_lines[j] = re.sub(r'ECU_ADDRESS\s+\S+', f'ECU_ADDRESS 0x{addr:X}', a2l_lines[j])
     return a2l_lines
 
-# Example usage
-elf_symbol_map = get_elf_symbol_map("your.elf")
-with open("your.a2l", "r") as f:
-    a2l_lines = f.readlines()
-new_a2l_lines = update_a2l_addresses(a2l_lines, elf_symbol_map)
-with open("updated.a2l", "w") as f:
-    f.writelines(new_a2l_lines)
+def main():
+    parser = argparse.ArgumentParser(description="Update A2L addresses for array elements from ELF file.")
+    parser.add_argument("--a2l-in", required=True, type=Path, help="Input A2L file")
+    parser.add_argument("--elf", required=True, type=Path, help="ELF file")
+    parser.add_argument("--a2l-out", required=True, type=Path, help="Output A2L file")
+    parser.add_argument("--array-name", required=True, help="Array symbol name in ELF (e.g., name)")
+    parser.add_argument("--element-size", required=True, type=int, help="Size of array element in bytes (e.g., 4 for int)")
+    args = parser.parse_args()
+
+    base_addr = get_elf_array_baseaddr(str(args.elf), args.array_name)
+    if base_addr is None:
+        print(f"Error: Array symbol '{args.array_name}' not found in ELF.")
+        return
+
+    a2l_lines = args.a2l_in.read_text(encoding="latin-1").splitlines()
+    updated_lines = update_a2l_array_addresses(a2l_lines, args.array_name, base_addr, args.element_size)
+    args.a2l_out.write_text("\n".join(updated_lines) + "\n", encoding="latin-1")
+    print(f"Updated addresses for array '{args.array_name}' in {args.a2l_out}")
+
+if __name__ == "__main__":
+    main()
