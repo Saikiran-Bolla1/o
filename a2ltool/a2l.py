@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 _BEGIN_RE = re.compile(r'(?is)/\s*begin\b')
 _END_RE = re.compile(r'(?is)/\s*end\b')
 _INCLUDE_RE = re.compile(r'(?im)^\s*(?:/)?include\s+"([^"\r\n]+)"\s*$')
-_HEADER_RE = re.compile(r'(?is)^\s*/\s*begin\s+([A-Za-z_][\w\.-]*)\s+([A-Za-z_][\w\.-]*)')
+_HEADER_RE = re.compile(r'(?is)^\s*/\s*begin\s+([A-Za-z_][\w\.-]*)\s+([A-Za-z_][\w\.-]*|"[^"]*")')
 
 # Objects we consider as uniquely keyed by kind+name inside MODULEs during merge
 MERGE_OBJECT_KINDS = {
@@ -67,63 +67,57 @@ class A2LDocument:
 
     def _scan_blocks(self, text: Optional[str] = None, region: Optional[Tuple[int, int]] = None) -> List[BlockSpan]:
         s = self._text if text is None else text
-        n = len(s)
-        i = 0 if region is None else region[0]
-        end_lim = n if region is None else region[1]
-
-        stack: List[Tuple[str, int, int]] = []  # (kind_upper, header_start, begin_token_start)
-        blocks: List[BlockSpan] = []
-
-        STATE_NORMAL, STATE_STRING, STATE_COMMENT = 0, 1, 2
-        state = STATE_NORMAL
-        while i < end_lim:
-            ch = s[i]
-            if state == STATE_NORMAL:
-                if ch == '"':
-                    state = STATE_STRING
-                    i += 1
-                    continue
-                if ch == '/' and i + 1 < end_lim and s[i + 1] == '*':
-                    state = STATE_COMMENT
-                    i += 2
-                    continue
-                if _BEGIN_RE.match(s, i):
-                    header_start = i
-                    hm = _HEADER_RE.match(s, i)
-                    if hm:
-                        kind = hm.group(1).upper()
-                        stack.append((kind, header_start, i))
-                    i += 1
-                    continue
-                if _END_RE.match(s, i):
-                    em = _END_RE.match(s, i)
-                    j = em.end() if em else i + 4
-                    while j < end_lim and s[j].isspace():
-                        j += 1
-                    kstart = j
-                    while j < end_lim and (s[j].isalnum() or s[j] in "._-"):
-                        j += 1
-                    if stack:
-                        kind_expected, header_start, begin_start = stack.pop()
-                        header_end = self._find_header_end(s, begin_start, end_lim)
-                        name = self._extract_name_from_header(s, header_start)
-                        blocks.append(BlockSpan(kind=kind_expected, name=name, start=begin_start, end=j, header_start=header_start, header_end=header_end))
-                    i = j + 1
-                    continue
-                i += 1
-            elif state == STATE_STRING:
-                if ch == '\\' and i + 1 < end_lim:
-                    i += 2
-                    continue
-                if ch == '"':
-                    state = STATE_NORMAL
-                i += 1
-            elif state == STATE_COMMENT:
-                if ch == '*' and i + 1 < end_lim and s[i + 1] == '/':
-                    state = STATE_NORMAL
-                    i += 2
-                    continue
-                i += 1
+        start_pos = 0 if region is None else region[0]
+        end_pos = len(s) if region is None else region[1]
+        
+        if region:
+            s = s[start_pos:end_pos]
+        
+        # Use simpler regex approach
+        begin_pattern = re.compile(r'/begin\s+(\w+)\s+(\w+|"[^"]*")')
+        end_pattern = re.compile(r'/end\s+(\w+)')
+        
+        begins = [(m.start(), m.group(1), m.group(2)) for m in begin_pattern.finditer(s)]
+        ends = [(m.start(), m.group(1)) for m in end_pattern.finditer(s)]
+        
+        # Stack to match begins with ends
+        stack = []
+        blocks = []
+        
+        # Create combined list of events
+        events = []
+        for pos, kind, name in begins:
+            events.append((pos, 'begin', kind, name))
+        for pos, kind in ends:
+            events.append((pos, 'end', kind, None))
+        
+        # Sort by position
+        events.sort()
+        
+        for pos, event_type, kind, name in events:
+            if event_type == 'begin':
+                # Remove quotes from name
+                clean_name = name.strip('"')
+                header_start = pos + start_pos
+                header_end = s.find('\n', pos)
+                if header_end == -1:
+                    header_end = len(s)
+                else:
+                    header_end += 1
+                header_end += start_pos
+                stack.append((kind.upper(), clean_name, pos + start_pos, header_start, header_end))
+            elif event_type == 'end' and stack:
+                expected_kind, block_name, block_start, header_start, header_end = stack.pop()
+                if expected_kind == kind.upper():
+                    blocks.append(BlockSpan(
+                        kind=expected_kind,
+                        name=block_name,
+                        start=block_start,
+                        end=pos + start_pos + len(f"/end {kind}"),
+                        header_start=header_start,
+                        header_end=header_end
+                    ))
+        
         blocks.sort(key=lambda b: b.start)
         return blocks
 
@@ -139,7 +133,11 @@ class A2LDocument:
             line_end = len(s)
         hm = _HEADER_RE.match(s, header_start)
         if hm:
-            return hm.group(2)
+            name = hm.group(2)
+            # Remove quotes if present
+            if name.startswith('"') and name.endswith('"'):
+                name = name[1:-1]
+            return name
         return ""
 
     # ---------- Include inlining ----------

@@ -72,7 +72,6 @@ def _check_duplicates(doc: A2LDocument) -> List[str]:
     
     modules = doc._find_modules()
     for module in modules:
-        module_text = doc.to_text()[module.start:module.end]
         inner_blocks = doc._scan_blocks(text=doc.to_text(), region=(module.header_end, module.end))
         
         seen_objects = {}
