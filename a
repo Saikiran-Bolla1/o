@@ -36,16 +36,18 @@ def get_array_bounds(array_die):
     return bounds
 
 def build_symbol_map(elffile):
-    """Build map of symbol name -> address from ELF symbol table."""
+    """
+    Build map of symbol name -> address from both .symtab and .dynsym sections.
+    Later symbols with the same name override earlier ones.
+    """
     symmap = {}
     for section in elffile.iter_sections():
-        if not hasattr(section, "iter_symbols"):
-            continue
-        for symbol in section.iter_symbols():
-            if symbol.name:
-                # symbol["st_value"] is not supported in pyelftools, use symbol.entry
-                addr = symbol.entry.get("st_value", None)
-                symmap[symbol.name] = addr
+        sh_type = section.header['sh_type']
+        if sh_type in ('SHT_SYMTAB', 'SHT_DYNSYM'):
+            for symbol in section.iter_symbols():
+                if symbol.name:
+                    addr = symbol.entry.get("st_value", None)
+                    symmap[symbol.name] = addr
     return symmap
 
 def parse_variables(dwarfinfo, elffile):
