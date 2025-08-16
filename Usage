@@ -1,0 +1,25 @@
+import subprocess
+import pathlib
+
+def update_a2l(a2lfile, elffile, outfile=None, tool_path="C:/Tools/a2ltool.exe"):
+    if outfile is None:
+        outfile = str(pathlib.Path(a2lfile).with_suffix(".updated.a2l"))
+
+    cmd = [
+        tool_path,
+        "update",
+        "--elffile", elffile,
+        "--a2lfile", a2lfile,
+        "--outfile", outfile
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"a2ltool failed:\n{result.stderr}")
+    return outfile
+
+
+
+new_a2l = update_a2l("old.a2l", "firmware.elf")
+print("Updated A2L saved to:", new_a2l)
+
