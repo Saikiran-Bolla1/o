@@ -28,37 +28,37 @@ def get_symbols(filename):
         return symbols
 
 def expand_arrays(symbols):
-    """Expand arrays correctly, respecting element size"""
+    """Expand arrays correctly with true element size (default 1 if unknown)."""
     expanded = []
+
     for i, (name, addr, size) in enumerate(symbols):
         next_addr = symbols[i+1][1] if i+1 < len(symbols) else None
 
-        # Use the declared size to guess element size
-        elem_size = 1
-        if size in (1, 2, 4, 8):   # typical scalar sizes
-            elem_size = size
-        elif size > 4 and size % 4 == 0:
-            elem_size = 4
-        elif size > 2 and size % 2 == 0:
-            elem_size = 2
+        # Assume scalar element by default
+        elem_size = size if size in (1, 2, 4, 8) else 1
 
-        if size > elem_size:
-            # Declared array
+        # Case 1: symbol itself is an array
+        if size > elem_size and size % elem_size == 0:
             count = min(size // elem_size, MAX_ARRAY)
             for j in range(count):
                 expanded.append((f"{name}._{j}_", addr + j*elem_size, elem_size))
 
-        elif next_addr and (next_addr - addr) >= elem_size*2 and (next_addr - addr) <= elem_size*MAX_ARRAY:
-            # Hidden array from address gap
-            count = min((next_addr - addr)//elem_size, MAX_ARRAY)
-            for j in range(count):
-                expanded.append((f"{name}._{j}_", addr + j*elem_size, elem_size))
+        # Case 2: implicit array from address gap
+        elif next_addr:
+            gap = next_addr - addr
+            if gap > size and gap % size == 0:
+                count = min(gap // size, MAX_ARRAY)
+                for j in range(count):
+                    expanded.append((f"{name}._{j}_", addr + j*size, size))
+            else:
+                expanded.append((name, addr, size))
 
+        # Case 3: plain scalar
         else:
-            # Plain scalar
             expanded.append((name, addr, size))
 
     return expanded
+
 
 
 if __name__ == "__main__":
