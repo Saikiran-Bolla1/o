@@ -1,378 +1,61 @@
-#!/usr/bin/env python3
-"""
-Merge/refresh ECU addresses in an A2L using symbols from an ELF file.
-
-Strategy:
-- Prefer SYMBOL_LINK if present inside CHARACTERISTIC/AXIS_PTS/MEASUREMENT blocks:
-  ECU address = ELF(symbol) + offset
-- Otherwise, optionally match by object name (exact match or with stripped prefixes).
-- Update:
-  - CHARACTERISTIC: replace the positional address in the header line.
-  - AXIS_PTS: replace the positional address in the header line.
-  - MEASUREMENT: replace (or insert) ECU_ADDRESS inside the block.
-
-Notes and caveats:
-- A2L files vary. This script covers common patterns and assumes CHARACTERISTIC/AXIS_PTS headers are single-line.
-- For complex multi-line headers or vendor-specific variants, prefer a full ASAP2 parser library.
-- ELF addresses are used as-is; if your runtime/flash layout differs, use --addr-adjust.
-- For 64-bit addresses, the script keeps a hex literal (0x...) in full width. If your tool requires ADDRESS_EXTENSION,
-  you may need to post-process or extend the script.
-
-Dependencies:
-  pip install pyelftools
-
-Usage:
-  python scripts/merge_a2l_with_elf.py --a2l-in input.a2l --elf app.elf --a2l-out output.a2l \
-      [--strategy symbol-link,name] [--strip-prefix foo_ --addr-adjust 0]
-"""
-
-import argparse
-import re
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
 from elftools.elf.elffile import ELFFile
+from elftools.dwarf.descriptions import describe_form_class
+from elftools.dwarf.locationlists import LocationParser
+import sys
+
+MAX_ARRAY_SIZE = 32  # Restrict max array size
+
+def parse_dwarf_arrays(dwarfinfo):
+    """Parse DWARF arrays and restrict size to MAX_ARRAY_SIZE."""
+    for CU in dwarfinfo.iter_CUs():
+        top_die = CU.get_top_DIE()
+        for DIE in CU.iter_DIEs():
+            if DIE.tag == 'DW_TAG_array_type':
+                # Get array bounds
+                bounds = []
+                for child in DIE.iter_children():
+                    if child.tag == 'DW_TAG_subrange_type':
+                        count_attr = child.attributes.get('DW_AT_count')
+                        upper_attr = child.attributes.get('DW_AT_upper_bound')
+
+                        if count_attr:
+                            count = count_attr.value
+                        elif upper_attr:
+                            count = upper_attr.value + 1
+                        else:
+                            count = None
+
+                        if count is not None:
+                            if count > MAX_ARRAY_SIZE:
+                                count = MAX_ARRAY_SIZE
+                            bounds.append(count)
+
+                print_array_info(DIE, bounds)
 
 
-# ------------------------------
-# ELF symbol loading
-# ------------------------------
-def load_elf_symbols(
-    elf_path: Path,
-    include_funcs: bool = True,
-    include_objects: bool = True,
-) -> Dict[str, int]:
-    """Return symbol -> address dictionary."""
-    symbols: Dict[str, int] = {}
+def print_array_info(die, bounds):
+    """Print array details."""
+    print("Array DIE offset: 0x%x" % die.offset)
+    print(f"Dimensions: {bounds}")
+    print("-" * 40)
 
-    with elf_path.open("rb") as f:
+
+def read_elf(filename):
+    with open(filename, 'rb') as f:
         elffile = ELFFile(f)
 
-        # Try both .symtab (full) and .dynsym (if stripped)
-        for sec_name in (".symtab", ".dynsym"):
-            sec = elffile.get_section_by_name(sec_name)
-            if not sec:
-                continue
-            for sym in sec.iter_symbols():
-                st_type = sym["st_info"]["type"]
-                name = sym.name
-                if not name:
-                    continue
-                if st_type == "STT_FUNC" and not include_funcs:
-                    continue
-                if st_type == "STT_OBJECT" and not include_objects:
-                    continue
-                if st_type not in ("STT_FUNC", "STT_OBJECT"):
-                    continue
-                addr = int(sym["st_value"])
-                # Prefer first non-zero address; overwrite only if later value is non-zero and earlier was zero.
-                if name not in symbols or (symbols[name] == 0 and addr != 0):
-                    symbols[name] = addr
+        if not elffile.has_dwarf_info():
+            print("No DWARF info found in ELF file.")
+            return
 
-    return symbols
-
-
-# ------------------------------
-# A2L parsing helpers (lightweight)
-# ------------------------------
-
-BlockType = str  # "CHARACTERISTIC" | "AXIS_PTS" | "MEASUREMENT"
-
-HEADER_RE = re.compile(r"^\s*(CHARACTERISTIC|AXIS_PTS)\s+(\S+)\s+\"")  # captures block type and identifier
-MEAS_START_RE = re.compile(r"^\s*MEASUREMENT\s+(\S+)\s+\"")  # captures identifier
-END_RE = re.compile(r"^\s*END\s+(CHARACTERISTIC|AXIS_PTS|MEASUREMENT)\s*$", re.IGNORECASE)
-
-# SYMBOL_LINK examples:
-#   SYMBOL_LINK "MySymbol" 0x10
-#   SYMBOL_LINK MySymbol 16
-SYMBOL_LINK_RE = re.compile(
-    r'^\s*SYMBOL_LINK\s+("?)([A-Za-z0-9_.$@?]+)\1(?:\s+([\-+]?(?:0x[0-9A-Fa-f]+|\d+)))?',
-)
-
-# ECU_ADDRESS example:
-#   ECU_ADDRESS 0x1234
-ECU_ADDRESS_RE = re.compile(r"^\s*ECU_ADDRESS\s+([\-+]?(?:0x[0-9A-Fa-f]+|\d+))\s*$", re.IGNORECASE)
-
-# Parse a CHARACTERISTIC/AXIS_PTS header line and return:
-# - prefix up to the address (exclusive)
-# - the address literal
-# - suffix after the address (starting after optional whitespace)
-def split_header_address_line(line: str) -> Optional[Tuple[str, str, str]]:
-    """
-    Attempt to split a header line for CHARACTERISTIC or AXIS_PTS into (prefix, address_literal, suffix).
-    Assumes longIdentifier is quoted and single-line. Returns None if cannot parse.
-    """
-    # Find the first quoted string (longIdentifier) end
-    try:
-        kw_end = line.index('"')  # first quote
-        # find closing quote
-        closing = line.index('"', kw_end + 1)
-    except ValueError:
-        return None
-
-    # After closing quote, we expect: whitespace + TYPE + whitespace + ADDRESS + ...
-    rest = line[closing + 1 :]
-    # Skip whitespace then TYPE token
-    m = re.match(r"\s*(\S+)\s+(\S+)(.*)$", rest)
-    if not m:
-        return None
-    _type_token = m.group(1)
-    addr_literal = m.group(2)
-    suffix = m.group(3)
-
-    # prefix is everything up to addr_literal
-    prefix = line[: closing + 1] + rest[: m.start(2)]
-
-    return prefix, addr_literal, suffix
-
-
-def parse_int_literal(s: str) -> int:
-    s = s.strip()
-    if s.lower().startswith("0x"):
-        return int(s, 16)
-    return int(s, 10)
-
-
-def format_addr(addr: int, hex_lowercase: bool = False) -> str:
-    # Keep consistent 0x uppercase by default
-    if hex_lowercase:
-        return f"0x{addr:x}"
-    return f"0x{addr:X}"
-
-
-def find_symbol_link(lines: List[str], start_idx: int, end_idx: int) -> Optional[Tuple[str, int, int]]:
-    """
-    Search for SYMBOL_LINK between [start_idx, end_idx) and return (symbol, offset, line_index) if found.
-    offset may be 0 if omitted.
-    """
-    for i in range(start_idx, end_idx):
-        m = SYMBOL_LINK_RE.match(lines[i])
-        if m:
-            sym = m.group(2)
-            off = m.group(3)
-            offset = parse_int_literal(off) if off else 0
-            return sym, offset, i
-    return None
-
-
-def find_ecu_address_line(lines: List[str], start_idx: int, end_idx: int) -> Optional[int]:
-    for i in range(start_idx, end_idx):
-        if ECU_ADDRESS_RE.match(lines[i]):
-            return i
-    return None
-
-
-def compute_address_from_strategy(
-    name: str,
-    lines: List[str],
-    blk_start: int,
-    blk_end: int,
-    symbols: Dict[str, int],
-    strategy: List[str],
-    strip_prefixes: List[str],
-    addr_adjust: int,
-) -> Optional[int]:
-    """
-    Try strategies in order: 'symbol-link', 'name'.
-    Returns computed absolute address or None.
-    """
-    for strat in strategy:
-        if strat == "symbol-link":
-            sl = find_symbol_link(lines, blk_start, blk_end)
-            if sl:
-                sym, offset, _ = sl
-                addr = symbols.get(sym)
-                if addr is not None:
-                    return int(addr) + int(offset) + int(addr_adjust)
-        elif strat == "name":
-            # try exact
-            addr = symbols.get(name)
-            if addr is None and strip_prefixes:
-                for p in strip_prefixes:
-                    if name.startswith(p):
-                        addr = symbols.get(name[len(p) :])
-                        if addr is not None:
-                            break
-            if addr is not None:
-                return int(addr) + int(addr_adjust)
-        else:
-            # Unknown strategy entry, ignore
-            continue
-    return None
-
-
-def merge_a2l_with_elf(
-    a2l_in: Path,
-    elf: Path,
-    a2l_out: Path,
-    strategy: List[str],
-    strip_prefixes: List[str],
-    addr_adjust: int,
-    only: Optional[List[str]],
-    dry_run: bool = False,
-) -> Dict[str, int]:
-    """
-    Perform in-place modifications on the A2L content according to ELF symbols.
-    Returns stats: dict of counts per block type.
-    """
-    symbols = load_elf_symbols(elf)
-    content = a2l_in.read_text(encoding="latin-1", errors="ignore").splitlines(keepends=False)
-    lines = content  # alias
-
-    updated_counts = {"CHARACTERISTIC": 0, "AXIS_PTS": 0, "MEASUREMENT": 0}
-    i = 0
-    total_lines = len(lines)
-
-    def skip_type(t: BlockType) -> bool:
-        return only is not None and t.lower() not in {x.lower() for x in only}
-
-    while i < total_lines:
-        line = lines[i]
-
-        # CHARACTERISTIC / AXIS_PTS header match (single-line assumption)
-        m_hdr = HEADER_RE.match(line)
-        if m_hdr:
-            blk_type, ident = m_hdr.group(1), m_hdr.group(2)
-            if skip_type(blk_type):
-                i += 1
-                continue
-
-            # Find end of block
-            j = i + 1
-            while j < total_lines:
-                if END_RE.match(lines[j]):
-                    break
-                j += 1
-            blk_end = j if j < total_lines else total_lines
-
-            # Compute address using strategy
-            new_addr = compute_address_from_strategy(
-                name=ident,
-                lines=lines,
-                blk_start=i + 1,
-                blk_end=blk_end,
-                symbols=symbols,
-                strategy=strategy,
-                strip_prefixes=strip_prefixes,
-                addr_adjust=addr_adjust,
-            )
-
-            if new_addr is not None:
-                split = split_header_address_line(line)
-                if split is not None:
-                    prefix, _old_addr_lit, suffix = split
-                    new_line = f"{prefix}{format_addr(new_addr)}{suffix}"
-                    if not dry_run:
-                        lines[i] = new_line
-                    updated_counts[blk_type] += 1
-
-            i = blk_end + 1
-            continue
-
-        # MEASUREMENT block start
-        m_meas = MEAS_START_RE.match(line)
-        if m_meas:
-            blk_type = "MEASUREMENT"
-            ident = m_meas.group(1)
-            if skip_type(blk_type):
-                # skip to end
-                j = i + 1
-                while j < total_lines and not END_RE.match(lines[j]):
-                    j += 1
-                i = j + 1
-                continue
-
-            # Find end and compute address
-            j = i + 1
-            while j < total_lines and not END_RE.match(lines[j]):
-                j += 1
-            blk_end = j if j < total_lines else total_lines
-
-            new_addr = compute_address_from_strategy(
-                name=ident,
-                lines=lines,
-                blk_start=i + 1,
-                blk_end=blk_end,
-                symbols=symbols,
-                strategy=strategy,
-                strip_prefixes=strip_prefixes,
-                addr_adjust=addr_adjust,
-            )
-
-            if new_addr is not None:
-                ecu_line_idx = find_ecu_address_line(lines, i + 1, blk_end)
-                ecu_line_text = f"  ECU_ADDRESS {format_addr(new_addr)}"
-                if ecu_line_idx is not None:
-                    if not dry_run:
-                        lines[ecu_line_idx] = ecu_line_text
-                else:
-                    # Insert before END MEASUREMENT
-                    if not dry_run:
-                        lines.insert(blk_end, ecu_line_text)
-                        total_lines += 1
-                        blk_end += 1
-                updated_counts[blk_type] += 1
-
-            i = blk_end + 1
-            continue
-
-        # No relevant block start; move on
-        i += 1
-
-    if not dry_run:
-        a2l_out.write_text("\n".join(lines) + "\n", encoding="latin-1", errors="ignore")
-
-    return updated_counts
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Merge/refresh A2L addresses from ELF symbols.")
-    parser.add_argument("--a2l-in", required=True, type=Path, help="Input A2L path")
-    parser.add_argument("--elf", required=True, type=Path, help="ELF file path")
-    parser.add_argument("--a2l-out", required=True, type=Path, help="Output A2L path")
-    parser.add_argument(
-        "--strategy",
-        default="symbol-link,name",
-        help="Comma-separated strategies in priority order: symbol-link,name",
-    )
-    parser.add_argument(
-        "--strip-prefix",
-        action="append",
-        default=[],
-        help="Strip this prefix from A2L object name when matching by name (can be given multiple times)",
-    )
-    parser.add_argument(
-        "--addr-adjust",
-        type=lambda x: int(x, 0),
-        default=0,
-        help="Add this constant to all resolved ELF addresses (e.g., --addr-adjust 0x8000000)",
-    )
-    parser.add_argument(
-        "--only",
-        choices=["characteristic", "axis_pts", "measurement"],
-        action="append",
-        help="Restrict to one or more block types. Can be specified multiple times.",
-    )
-    parser.add_argument("--dry-run", action="store_true", help="Do not write output, just report changes.")
-    args = parser.parse_args()
-
-    strategies = [s.strip() for s in args.strategy.split(",") if s.strip()]
-    stats = merge_a2l_with_elf(
-        a2l_in=args.a2l_in,
-        elf=args.elf,
-        a2l_out=args.a2l_out,
-        strategy=strategies,
-        strip_prefixes=args.strip_prefix,
-        addr_adjust=args.addr_adjust,
-        only=args.only,
-        dry_run=args.dry_run,
-    )
-    print("Updates applied:", stats)
-    if args.dry_run:
-        print("Dry run: no output written.")
-    else:
-        print(f"Wrote merged A2L to: {args.a2l_out}")
+        dwarfinfo = elffile.get_dwarf_info()
+        parse_dwarf_arrays(dwarfinfo)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <elf-file>")
+        sys.exit(1)
+
+    elf_path = sys.argv[1]
+    read_elf(elf_path)
