@@ -9,20 +9,18 @@ def get_symbols(filename):
         elffile = ELFFile(f)
 
         symbols = []
-        for section_name in ['.symtab', '.dynsym']:
-            section = elffile.get_section_by_name(section_name)
-            if not section:
-                continue
-
-            for sym in section.iter_symbols():
-                # Only take object (variable) symbols
-                if sym['st_info']['type'] == 'STT_OBJECT':
-                    name = sym.name
-                    addr = sym['st_value']
-                    size = sym['st_size']
-                    if size > 0:
-                        symbols.append((name, addr, size))
-
+        # Parse both symbol tables
+        for section_type in ['SHT_SYMTAB', 'SHT_DYNSYM']:
+            for section in elffile.iter_sections():
+                if section.header['sh_type'] == section_type:
+                    for sym in section.iter_symbols():
+                        # Only take object (variable) symbols
+                        if sym['st_info']['type'] == 'STT_OBJECT':
+                            name = sym.name
+                            addr = sym['st_value']
+                            size = sym['st_size']
+                            if size > 0:
+                                symbols.append((name, addr, size))
         # Sort by address
         symbols.sort(key=lambda x: x[1])
         return symbols
@@ -58,8 +56,6 @@ def expand_arrays(symbols):
             expanded.append((name, addr, size))
 
     return expanded
-
-
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
