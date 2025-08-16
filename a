@@ -27,14 +27,20 @@ def get_symbols(filename):
         symbols.sort(key=lambda x: x[1])
         return symbols
 
-def expand_arrays(symbols, word_size=4):
-    """Expand arrays explicitly, detect hidden arrays using address gap"""
+def expand_arrays(symbols):
+    """Expand arrays correctly, respecting element size"""
     expanded = []
     for i, (name, addr, size) in enumerate(symbols):
         next_addr = symbols[i+1][1] if i+1 < len(symbols) else None
 
-        # Assume default element size (can be refined with DWARF)
-        elem_size = word_size
+        # Use the declared size to guess element size
+        elem_size = 1
+        if size in (1, 2, 4, 8):   # typical scalar sizes
+            elem_size = size
+        elif size > 4 and size % 4 == 0:
+            elem_size = 4
+        elif size > 2 and size % 2 == 0:
+            elem_size = 2
 
         if size > elem_size:
             # Declared array
@@ -43,16 +49,17 @@ def expand_arrays(symbols, word_size=4):
                 expanded.append((f"{name}._{j}_", addr + j*elem_size, elem_size))
 
         elif next_addr and (next_addr - addr) >= elem_size*2 and (next_addr - addr) <= elem_size*MAX_ARRAY:
-            # Hidden array (next symbol far enough to assume array elements)
+            # Hidden array from address gap
             count = min((next_addr - addr)//elem_size, MAX_ARRAY)
             for j in range(count):
                 expanded.append((f"{name}._{j}_", addr + j*elem_size, elem_size))
 
         else:
-            # Normal scalar
+            # Plain scalar
             expanded.append((name, addr, size))
 
     return expanded
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
