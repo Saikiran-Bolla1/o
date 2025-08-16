@@ -3,20 +3,20 @@ import sys
 
 MAX_ARRAY_SIZE = 32
 
-
 def resolve_type(dwarfinfo, die):
     """Resolve down to the base type, return name and size if available."""
     while die:
         if die.tag == "DW_TAG_base_type":
-            name = die.attributes["DW_AT_name"].value.decode("utf-8", errors="ignore")
+            name = die.attributes.get("DW_AT_name", None)
+            name = name.value.decode("utf-8", errors="ignore") if name else "unknown"
             byte_size = die.attributes.get("DW_AT_byte_size", None)
             return name, byte_size.value if byte_size else None
         elif "DW_AT_type" in die.attributes:
-            die = dwarfinfo.get_DIE_from_refaddr(die.attributes["DW_AT_type"].value)
+            die_ref = die.attributes["DW_AT_type"].value
+            die = dwarfinfo.get_DIE_from_refaddr(die_ref)
         else:
             break
     return "unknown", None
-
 
 def get_array_bounds(array_die):
     """Extract array dimension sizes."""
@@ -35,7 +35,6 @@ def get_array_bounds(array_die):
                 bounds.append(count)
     return bounds
 
-
 def build_symbol_map(elffile):
     """Build map of symbol name -> address from ELF symbol table."""
     symmap = {}
@@ -44,9 +43,10 @@ def build_symbol_map(elffile):
             continue
         for symbol in section.iter_symbols():
             if symbol.name:
-                symmap[symbol.name] = symbol["st_value"]
+                # symbol["st_value"] is not supported in pyelftools, use symbol.entry
+                addr = symbol.entry.get("st_value", None)
+                symmap[symbol.name] = addr
     return symmap
-
 
 def parse_variables(dwarfinfo, elffile):
     symmap = build_symbol_map(elffile)
@@ -61,7 +61,8 @@ def parse_variables(dwarfinfo, elffile):
                     continue
 
                 var_name = name_attr.value.decode("utf-8", errors="ignore")
-                type_die = dwarfinfo.get_DIE_from_refaddr(type_attr.value)
+                type_ref = type_attr.value
+                type_die = dwarfinfo.get_DIE_from_refaddr(type_ref)
 
                 base_type, size = resolve_type(dwarfinfo, type_die)
 
@@ -70,30 +71,39 @@ def parse_variables(dwarfinfo, elffile):
 
                 # If array → expand with ._0_, ._1_ ...
                 if type_die.tag == "DW_TAG_array_type":
-                    element_type, elem_size = resolve_type(
-                        dwarfinfo,
-                        dwarfinfo.get_DIE_from_refaddr(type_die.attributes["DW_AT_type"].value),
-                    )
+                    # Safely get element type DIE
+                    elem_type_die = None
+                    if "DW_AT_type" in type_die.attributes:
+                        elem_type_ref = type_die.attributes["DW_AT_type"].value
+                        elem_type_die = dwarfinfo.get_DIE_from_refaddr(elem_type_ref)
+                    if elem_type_die:
+                        element_type, elem_size = resolve_type(dwarfinfo, elem_type_die)
+                    else:
+                        element_type, elem_size = "unknown", None
+
                     bounds = get_array_bounds(type_die)
                     if bounds:
                         dim_size = min(bounds[0], MAX_ARRAY_SIZE)
                         for i in range(dim_size):
+                            addr_val = address + i * (elem_size or 1) if address is not None and elem_size else None
+                            addr_str = hex(addr_val) if addr_val is not None else 'N/A'
                             print(
                                 f"{var_name}._{i}_  "
                                 f"type={element_type} "
-                                f"addr={hex(address + i * (elem_size or 1)) if address else 'N/A'} "
+                                f"addr={addr_str} "
                                 f"size={elem_size}"
                             )
-                    # also print the root symbol (summary)
-                    print(f"{var_name}  type=array[{bounds[0]}] of {element_type}")
+                        print(f"{var_name}  type=array[{bounds[0]}] of {element_type}")
+                    else:
+                        print(f"{var_name}  type=array[?] of {element_type}")
                 else:
+                    addr_str = hex(address) if address is not None else 'N/A'
                     print(
                         f"{var_name}  "
                         f"type={base_type} "
-                        f"addr={hex(address) if address else 'N/A'} "
+                        f"addr={addr_str} "
                         f"size={size}"
                     )
-
 
 def read_elf(filename):
     with open(filename, "rb") as f:
@@ -105,7 +115,6 @@ def read_elf(filename):
 
         dwarfinfo = elffile.get_dwarf_info()
         parse_variables(dwarfinfo, elffile)
-
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
