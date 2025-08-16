@@ -1,17 +1,14 @@
 from elftools.elf.elffile import ELFFile
-from elftools.dwarf.descriptions import describe_form_class
-from elftools.dwarf.locationlists import LocationParser
 import sys
 
 MAX_ARRAY_SIZE = 32  # Restrict max array size
 
+
 def parse_dwarf_arrays(dwarfinfo):
     """Parse DWARF arrays and restrict size to MAX_ARRAY_SIZE."""
     for CU in dwarfinfo.iter_CUs():
-        top_die = CU.get_top_DIE()
         for DIE in CU.iter_DIEs():
             if DIE.tag == 'DW_TAG_array_type':
-                # Get array bounds
                 bounds = []
                 for child in DIE.iter_children():
                     if child.tag == 'DW_TAG_subrange_type':
@@ -35,15 +32,39 @@ def parse_dwarf_arrays(dwarfinfo):
 
 def print_array_info(die, bounds):
     """Print array details."""
-    print("Array DIE offset: 0x%x" % die.offset)
-    print(f"Dimensions: {bounds}")
+    print("DWARF Array:")
+    print(f"  DIE offset: 0x{die.offset:x}")
+    print(f"  Dimensions: {bounds}")
     print("-" * 40)
+
+
+def print_symbols(elffile):
+    """Print ELF symbols from .symtab and .dynsym."""
+    for section in elffile.iter_sections():
+        if not isinstance(section, type(elffile.get_section_by_name('.symtab'))):
+            continue
+        if section['sh_entsize'] == 0:
+            continue
+
+        print(f"Symbols from section {section.name}:")
+        for symbol in section.iter_symbols():
+            name = symbol.name
+            addr = symbol['st_value']
+            size = symbol['st_size']
+            info = symbol['st_info']['type']
+            bind = symbol['st_info']['bind']
+            print(f"  {name:30} addr=0x{addr:x} size={size} type={info} bind={bind}")
+        print("=" * 60)
 
 
 def read_elf(filename):
     with open(filename, 'rb') as f:
         elffile = ELFFile(f)
 
+        # --- Symbols ---
+        print_symbols(elffile)
+
+        # --- DWARF ---
         if not elffile.has_dwarf_info():
             print("No DWARF info found in ELF file.")
             return
