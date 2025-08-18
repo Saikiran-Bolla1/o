@@ -1,0 +1,669 @@
+import win32com.client
+import winreg
+import platform
+import time
+import random
+import string
+import array
+import json
+import xlrd
+from contextlib import contextmanager
+from typing import Iterable, Optional, Union, Sequence
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def dispatch_canape():
+    """
+    Robustly dispatch the CANape/CAMape COM application object.
+    Returns the COM application object.
+    """
+    try:
+        return win32com.client.Dispatch('CANape.Application')
+    except Exception:
+        return win32com.client.Dispatch('CAMape.Application')
+
+def print_platform():
+    arch = platform.architecture()[0]
+    print("Python x32 environment is used" if arch == '32bit' else "Python x64 environment is used")
+
+# ---------------------------
+# Registry / Example path
+# ---------------------------
+
+class CanapeRegistry:
+    @staticmethod
+    def get_example_path() -> str:
+        """
+        Get CANape/CAMape base path and online examples path from registry/config.
+        Fallbacks to public example path if not resolvable.
+        """
+        basePath = r"C:\Users\Public\Documents\Vector\CANape Examples 21.0"
+        reg_paths = ["SOFTWARE\\VECTOR\\CAMape", "SOFTWARE\\VECTOR\\CANape"]
+        for reg_path in reg_paths:
+            try:
+                hkey = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_READ | 0x100)
+                basePath = winreg.QueryValueEx(hkey, "Path")[0]
+                winreg.CloseKey(hkey)
+                break
+            except Exception:
+                continue
+
+        # Read possible examples key from vcustom.ini
+        vectorini_path = basePath.rstrip("\\/") + r'\vcustom.ini'
+        regKeyExamples = None
+        try:
+            with open(vectorini_path, 'r', encoding='utf-8', errors='ignore') as vectorini:
+                for line in vectorini:
+                    if 'CAMapeOnlineExamplesRegKey' in line or 'CAMapeOnlineExampleResolver' in line:
+                        regKeyExamples = line.split("=")[1].strip().replace("HKEY_LOCAL_MACHINE\\", "").replace("Path", "").strip()
+                        break
+        except Exception:
+            pass
+
+        if regKeyExamples:
+            try:
+                hKey = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, regKeyExamples, 0, winreg.KEY_READ | 0x100)
+                examplePath = winreg.QueryValueEx(hKey, "Path")[0]
+                winreg.CloseKey(hKey)
+                return examplePath.strip()
+            except Exception:
+                pass
+
+        return basePath
+
+# ---------------------------
+# Variable name mapper
+# ---------------------------
+
+class CanapeVariableMapper:
+    """
+    Maps short/long names to a canonical long name. If not mapped, returns the input.
+    JSON format: [ {"shortname":"RPM","longname":"EngineSpeed"}, ... ]
+    XLSX format: first sheet, col0=shortname, col1=longname (with header row).
+    """
+    def __init__(self, mapping_file: Optional[str] = None, file_type: str = 'json'):
+        self.mapping = {}
+        if mapping_file:
+            if file_type.lower() == 'json':
+                self._load_json(mapping_file)
+            elif file_type.lower() == 'xlsx':
+                self._load_xlsx(mapping_file)
+            else:
+                raise ValueError("Unsupported file_type. Use 'json' or 'xlsx'.")
+
+    def _load_json(self, filepath: str):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            for entry in data:
+                short = str(entry['shortname'])
+                long = str(entry['longname'])
+                self.mapping[short] = long
+                self.mapping[long] = long
+
+    def _load_xlsx(self, filepath: str):
+        wb = xlrd.open_workbook(filepath)
+        sheet = wb.sheet_by_index(0)
+        for row_idx in range(1, sheet.nrows):
+            short = str(sheet.cell(row_idx, 0).value)
+            long = str(sheet.cell(row_idx, 1).value)
+            self.mapping[short] = long
+            self.mapping[long] = long
+
+    def get_varname(self, name: str) -> str:
+        return self.mapping.get(name, name)
+
+# ---------------------------
+# Variable wrapper (attribute + recorder)
+# ---------------------------
+
+class CanapeVariable:
+    """
+    Attribute-style calibration object:
+      - read:  device.EngineSpeed.value  or device["EngineSpeed"].value
+      - write: device.EngineSpeed.value = 2  or device["EngineSpeed"].value = 2
+    Also provides:
+      - Value (CANape-idiomatic property)
+      - Read(), Write()
+      - recorder(...): context manager to record specified signals on a DAQ task
+    """
+    def __init__(self, app, canape_dev, mapper: CanapeVariableMapper, longname: str):
+        self._app = app
+        self._canape_dev = canape_dev
+        self._mapper = mapper
+        self._longname = longname
+
+    # Pythonic access
+    @property
+    def value(self):
+        self._canape_dev.CalibrationObjects.Add(self._longname)
+        calibObj = self._canape_dev.CalibrationObjects.Item(self._longname)
+        calibObj.Read()
+        return calibObj.Value
+
+    @value.setter
+    def value(self, val):
+        self._canape_dev.CalibrationObjects.Add(self._longname)
+        calibObj = self._canape_dev.CalibrationObjects.Item(self._longname)
+        calibObj.Value = val
+        calibObj.Write()
+
+    # CANape-like access
+    @property
+    def Value(self):
+        self._canape_dev.CalibrationObjects.Add(self._longname)
+        calibObj = self._canape_dev.CalibrationObjects.Item(self._longname)
+        return calibObj.Value
+
+    @Value.setter
+    def Value(self, val):
+        self._canape_dev.CalibrationObjects.Add(self._longname)
+        calibObj = self._canape_dev.CalibrationObjects.Item(self._longname)
+        calibObj.Value = val
+        calibObj.Write()
+
+    def Read(self):
+        self._canape_dev.CalibrationObjects.Add(self._longname)
+        calibObj = self._canape_dev.CalibrationObjects.Item(self._longname)
+        calibObj.Read()
+        return calibObj.Value
+
+    def Write(self):
+        self._canape_dev.CalibrationObjects.Add(self._longname)
+        calibObj = self._canape_dev.CalibrationObjects.Item(self._longname)
+        calibObj.Write()
+
+    @contextmanager
+    def recorder(
+        self,
+        *variables: Union[str, 'CanapeVariable'],
+        task_name: str = "100ms",
+        sampling_time: Optional[int] = None,
+        save2mdf: bool = True
+    ):
+        """
+        Record signals within a with-block:
+          with device["ampl"].recorder("ampl","channel1", task_name="100ms", sampling_time=100) as task:
+              ... # code while recording
+        On exit: stops measurement and removes added channels (best effort).
+        """
+        dev = self._canape_dev
+        task = dev.Tasks(task_name)
+        added = []
+
+        # Optionally adjust sampling time
+        if sampling_time is not None:
+            try:
+                task.SamplingTime = int(sampling_time)
+            except Exception:
+                pass
+
+        # Resolve and add channels
+        def _to_name(v):
+            if isinstance(v, CanapeVariable):
+                return v._longname
+            return self._mapper.get_varname(str(v))
+
+        for v in variables:
+            name = _to_name(v)
+            try:
+                dev.CalibrationObjects.Add(name)
+            except Exception:
+                pass
+            try:
+                task.Channels.Add(name)
+                if save2mdf:
+                    task.Channels(name).Save2MDF = True
+                added.append(name)
+            except Exception:
+                # Ignore if already exists
+                pass
+
+        # Start measurement
+        self._app.Measurement.Start()
+        try:
+            yield task
+        finally:
+            # Stop measurement
+            try:
+                self._app.Measurement.Stop()
+            except Exception:
+                pass
+            # Best-effort cleanup of added channels
+            for name in added:
+                try:
+                    task.Channels.Remove(name)
+                except Exception:
+                    # Fall back to ignore if API doesn't support Remove; user can Clear() task manually if needed
+                    pass
+
+# ---------------------------
+# Device wrapper
+# ---------------------------
+
+class CanapeDevice:
+    """
+    Wraps a CANape device with:
+      - short/long name mapping
+      - attribute/key variable access
+      - scalar/array/map read/write
+      - memory read/write
+      - task/channel helper
+      - recorder context manager at device level
+    """
+    def __init__(self, app, com_device, mapper: CanapeVariableMapper):
+        self.app = app
+        self.dev = com_device
+        self.mapper = mapper
+        self._var_cache = {}
+
+    # Classic scalar/array/map access
+    def read_value(self, objName: str):
+        name = self.mapper.get_varname(objName)
+        self.dev.CalibrationObjects.Clear()
+        self.dev.CalibrationObjects.Add(name)
+        calibObj = self.dev.CalibrationObjects(name)
+        calibObj.Read()
+        caltype = getattr(calibObj, "Caltype", 0)
+        print(f"{objName} -> type {caltype} -> {calibObj.Value}")
+        return calibObj.Value
+
+    def write_value(self, objName: str, newValue):
+        name = self.mapper.get_varname(objName)
+        self.dev.CalibrationObjects.Clear()
+        self.dev.CalibrationObjects.Add(name)
+        calibObj = self.dev.CalibrationObjects(name)
+        calibObj.Value = newValue
+        calibObj.Write()
+
+    # Variable object cache
+    def __getitem__(self, key: str) -> CanapeVariable:
+        longname = self.mapper.get_varname(key)
+        if longname not in self._var_cache:
+            self._var_cache[longname] = CanapeVariable(self.app, self.dev, self.mapper, longname)
+        return self._var_cache[longname]
+
+    def __getattr__(self, item: str) -> CanapeVariable:
+        try:
+            return self.__getitem__(item)
+        except Exception:
+            raise AttributeError(f"No CANape variable named '{item}'")
+
+    # Memory helpers
+    def read_memory(self, objAddr: int, objSize: int):
+        val = self.dev.ReadMemory(objAddr, objSize)
+        strbytes = "".join("%02x" % b for b in val)
+        print(f"[READ] Memory at {objAddr}: {strbytes}")
+        return val
+
+    def write_memory(self, objAddr: int, objData: Sequence[int]):
+        self.dev.WriteMemory(objAddr, array.array('B', objData))
+        strbytes = "".join("%02x" % b for b in objData)
+        print(f"[WRITE] Memory at {objAddr}: {strbytes}")
+
+    # Task/channel helpers
+    def add_task_channel(self, task_name: str, channel_name: str, sampling_time: Optional[int] = None, save2mdf: bool = False):
+        task = self.dev.Tasks(task_name)
+        if sampling_time is not None:
+            try:
+                task.SamplingTime = int(sampling_time)
+            except Exception:
+                pass
+        try:
+            task.Channels.Add(channel_name)
+        except Exception:
+            pass
+        if save2mdf:
+            try:
+                task.Channels(channel_name).Save2MDF = True
+            except Exception:
+                pass
+        return task
+
+    @contextmanager
+    def recorder(
+        self,
+        *variables: Union[str, CanapeVariable],
+        task_name: str = "100ms",
+        sampling_time: Optional[int] = None,
+        save2mdf: bool = True
+    ):
+        """
+        Device-level recorder (uses device's mapper).
+        Usage:
+          with device.recorder("channel1","ampl", task_name="100ms", sampling_time=100) as task:
+              ...
+        """
+        task = self.dev.Tasks(task_name)
+        added = []
+
+        if sampling_time is not None:
+            try:
+                task.SamplingTime = int(sampling_time)
+            except Exception:
+                pass
+
+        def _to_name(v):
+            if isinstance(v, CanapeVariable):
+                return v._longname
+            return self.mapper.get_varname(str(v))
+
+        for v in variables:
+            name = _to_name(v)
+            try:
+                self.dev.CalibrationObjects.Add(name)
+            except Exception:
+                pass
+            try:
+                task.Channels.Add(name)
+                if save2mdf:
+                    task.Channels(name).Save2MDF = True
+                added.append(name)
+            except Exception:
+                pass
+
+        self.app.Measurement.Start()
+        try:
+            yield task
+        finally:
+            try:
+                self.app.Measurement.Stop()
+            except Exception:
+                pass
+            for name in added:
+                try:
+                    task.Channels.Remove(name)
+                except Exception:
+                    pass
+
+# ---------------------------
+# Automation session
+# ---------------------------
+
+class CanapeAutomation:
+    """
+    Full-feature CANape automation:
+      - Robust COM dispatch (CANape/CAMape)
+      - Registry-based example path detection
+      - Measurement FIFO/Sample size pre-config
+      - Multi-device management + go online/offline
+      - Short/long variable name mapping (JSON/XLSX)
+      - Attribute/bracket variable access + read/write
+      - Memory read/write
+      - Measurement task/channel utilities
+      - DAQ events listing, measurement listing, run loop
+      - Recorder context managers at device and variable level
+    """
+    def __init__(self, project_path: Optional[str] = None, mapping_file: Optional[str] = None, mapping_type: str = 'json'):
+        self.app = dispatch_canape()
+        self.devices = {}
+        self.mapper = CanapeVariableMapper(mapping_file, mapping_type)
+
+        # Configure measurement settings before opening project
+        try:
+            self.app.Measurement.FifoSize = 2048
+            self.app.Measurement.SampleSize = 1024
+        except Exception:
+            pass
+
+        if project_path is None:
+            example_path = CanapeRegistry.get_example_path()
+            project_path = example_path.rstrip("\\/") + r'\XCPDemo'
+        self.open_project(project_path)
+        print_platform()
+
+    def open_project(self, cmpWorkingDir: str, debugMode: int = 1, COMTimeout: int = 100000, clearDevList: int = 0, modalNode: int = 0):
+        # Open2(cmpWorkingDir, debugMode, COMTimeout, clearDevList, modalNode, 1)
+        self.app.Open2(cmpWorkingDir, debugMode, COMTimeout, clearDevList, modalNode, 1)
+        time.sleep(3)
+
+    def add_device(self, devName: str, a2lFile: str, devType: str, channel: int) -> CanapeDevice:
+        dev = self.app.Devices.Add(devName, a2lFile, devType, channel)
+        device = CanapeDevice(self.app, dev, self.mapper)
+        self.devices[devName] = device
+        return device
+
+    def get_device(self, devName: str) -> CanapeDevice:
+        return self.devices[devName]
+
+    # Online/offline controls
+    def go_online_all(self, reconnect: bool = False):
+        for dev in self.devices.values():
+            try:
+                dev.dev.GoOnline(reconnect)
+                print(f"Device {dev.dev.Name} went online.")
+            except Exception as e:
+                print(f"Failed to go online: {getattr(dev.dev, 'Name', '<unknown>')} -> {e}")
+
+    def go_offline_all(self):
+        for dev in self.devices.values():
+            try:
+                dev.dev.GoOffline()
+                print(f"Device {dev.dev.Name} went offline.")
+            except Exception as e:
+                print(f"Failed to go offline: {getattr(dev.dev, 'Name', '<unknown>')} -> {e}")
+
+    # Measurement utilities
+    def print_daq_events(self, device_name: str):
+        dev = self.devices[device_name].dev
+        print("{:<20}{:^2}{:^5}{:^2}{:^14}".format("Description", "|", "ID", "|", "SamplingTime"))
+        print("---")
+        for singleTask in dev.Tasks:
+            print("{:<20}{:^7d}{:^14d}".format(singleTask.Name, singleTask.ID, singleTask.SamplingTime))
+        print("---")
+
+    def clear_all_measurement_lists(self):
+        for dev in self.app.Devices:
+            for task in dev.Tasks:
+                try:
+                    if task.Channels.Count > 0:
+                        task.Channels.Clear()
+                except Exception:
+                    pass
+
+    def print_measurement_list(self):
+        print("===============")
+        print("MEASUREMENT LIST")
+        print("===============")
+        print("{:<10}{:<25}{:<9}{:<8}{:<7}".format("Device", "ObjectName", "taskId", "rate", "Save2MDF"))
+        print("---")
+        for dev in self.app.Devices:
+            empty = True
+            for task in dev.Tasks:
+                if task.Channels.Count > 0:
+                    empty = False
+                    for channel in task.Channels:
+                        try:
+                            save = channel.Save2MDF
+                        except Exception:
+                            save = 0
+                        print("[{:<8}]{:<25}{:<9d}{:<8d}{:<7d}".format(dev.Name, channel.Name, task.ID, task.SamplingTime, save))
+            if empty:
+                print("[{:<8}] {:<25}".format(dev.Name, "No signals configured"))
+
+    def configure_measurement(self, device_name: str, measObjects: Iterable[str], task_name: str = "100ms", save2mdf: bool = True):
+        dev = self.devices[device_name].dev
+        task = dev.Tasks(task_name)
+        for signal in measObjects:
+            sig = self.mapper.get_varname(signal)
+            try:
+                task.Channels.Add(sig)
+                if save2mdf:
+                    task.Channels(sig).Save2MDF = True
+            except Exception:
+                pass
+        return task
+
+    def run_measurement(self, device_name: str, task_id: int = 0, loops: int = 20):
+        dev = self.devices[device_name].dev
+        if dev.Tasks.Count == 0:
+            print("No tasks found for device", device_name)
+            return
+        taskSel = dev.Tasks[task_id]
+        self.app.Measurement.Start()
+        while getattr(taskSel, "Fifolevel", 0) < 1:
+            time.sleep(0.01)
+        print("---\n---Measurement VALUES---\n---")
+        for _ in range(loops):
+            try:
+                currentValue = taskSel.CurrentValues()
+                txt = f"[Fifo: {taskSel.Fifolevel}, TS: {currentValue[1]}] @{taskSel.SamplingTime}ms: "
+                for g in range(0, taskSel.Channels.Count):
+                    txt += f"({currentValue[0][g]})"
+                print(txt)
+            except Exception as e:
+                print(f"CurrentValues error: {e}")
+
+            try:
+                oNextSample = taskSel.NextSample()
+                if oNextSample:
+                    txt = f"[Fifo: {taskSel.Fifolevel}, TS: {oNextSample[1]}] @{taskSel.SamplingTime}ms: "
+                    for g in range(0, taskSel.Channels.Count):
+                        txt += f"({oNextSample[0][g]})"
+                    print(txt)
+            except Exception as e:
+                print(f"NextSample error: {e}")
+
+            time.sleep(float(taskSel.SamplingTime) / 1000.0)
+            print("---")
+        self.app.Measurement.Stop()
+
+    # Start/stop and teardown
+    def start_measurement(self):
+        self.app.Measurement.Start()
+
+    def stop_measurement(self):
+        self.app.Measurement.Stop()
+
+    def close(self):
+        print("Closing CANape...")
+        try:
+            self.go_offline_all()
+        except Exception:
+            pass
+        try:
+            self.app.Quit()
+        except Exception:
+            pass
+
+    # Convenience access
+    def __getitem__(self, key: str) -> CanapeDevice:
+        return self.get_device(key)
+
+    def __getattr__(self, item: str) -> CanapeDevice:
+        try:
+            return self.get_device(item)
+        except Exception:
+            raise AttributeError(f"No CANape device named '{item}'")
+
+# ---------------------------
+# Example/main
+# ---------------------------
+
+if __name__ == "__main__":
+    # Optional mapping: short/long name resolution
+    mapping_file = None  # e.g., "canape_vars.json" or "canape_vars.xlsx"
+    mapping_type = "json"
+
+    session = CanapeAutomation(mapping_file=mapping_file, mapping_type=mapping_type)
+
+    # Add devices (examples)
+    dev1 = session.add_device("XCPsim", "XCPsim.a2l", "XCP", 1)
+    # Add a second device if needed:
+    # dev2 = session.add_device("XCPsim2", "XCPsim.a2l", "XCP", 2)
+
+    # Devices online
+    session.go_online_all()
+
+    # List DAQ events for dev1
+    session.print_daq_events("XCPsim")
+
+    # Clear all measurement lists across devices
+    session.clear_all_measurement_lists()
+
+    # Configure measurement for dev1 on "100ms" task
+    taskSel = session.configure_measurement("XCPsim", ["channel1", "channel2", "channel3"], task_name="100ms", save2mdf=True)
+    session.print_measurement_list()
+
+    # Run a short measurement loop (prints CurrentValues/NextSample)
+    session.run_measurement("XCPsim", task_id=0, loops=10)
+
+    # Scalar read/write via classic and attribute style
+    print("---Scalar---")
+    dev1.read_value("ampl")
+    dev1.write_value("ampl", random.randrange(0, 255))
+    print(dev1.ampl.value)
+    dev1.ampl.value = 42
+    print(dev1["ampl"].value)
+    dev1["ampl"].value = 43
+
+    # Array/curve/map examples (if present in your A2L)
+    print("---Array element---")
+    try:
+        dev1.read_value("map1_8_8_uc[3][6]")
+        dev1.write_value("map1_8_8_uc[3][6]", random.randrange(0, 255))
+        dev1.read_value("map1_8_8_uc[3][6]")
+    except Exception:
+        print("map1_8_8_uc[3][6] not available in this project.")
+
+    print("---Curve---")
+    try:
+        dev1.read_value("Curve1")
+        dev1.write_value("Curve1", [random.randrange(0, 255) for _ in range(8)])
+        dev1.read_value("Curve1")
+    except Exception:
+        print("Curve1 not available in this project.")
+
+    print("---Map---")
+    try:
+        dev1.read_value("map1_8_8_uc")
+        dev1.write_value("map1_8_8_uc", [[random.randrange(0, 255) for _ in range(8)] for _ in range(8)])
+        dev1.read_value("map1_8_8_uc")
+    except Exception:
+        print("map1_8_8_uc not available in this project.")
+
+    # String example
+    print("---String---")
+    try:
+        dev1.read_value("testString")
+        newRandom_testString = ''.join(random.choice(string.ascii_lowercase) for _ in range(10))
+        dev1.write_value("testString", newRandom_testString)
+        dev1.read_value("testString")
+    except Exception:
+        print("testString not available in this project.")
+
+    # Memory example
+    print("---Memory---")
+    try:
+        objAddr = 1835052
+        objSize = 4
+        dev1.read_memory(objAddr, objSize)
+        dev1.write_memory(objAddr, [255, 254, 253, 252])
+        dev1.read_memory(objAddr, objSize)
+    except Exception:
+        print("Memory access not supported by this device.")
+
+    # Recorder examples:
+    # 1) Device-level recorder
+    try:
+        with dev1.recorder("channel1", "ampl", task_name="100ms", sampling_time=100) as task:
+            print("Recording: channel1, ampl")
+            for _ in range(5):
+                print("ampl:", dev1.ampl.value)
+                time.sleep(0.2)
+    except Exception as e:
+        print(f"Device-level recorder failed: {e}")
+
+    # 2) Variable-level recorder
+    try:
+        with dev1["ampl"].recorder("ampl", "channel1", task_name="100ms", sampling_time=100) as task:
+            print("Recording via variable: ampl, channel1")
+            for _ in range(5):
+                print("ampl:", dev1["ampl"].value)
+                time.sleep(0.2)
+    except Exception as e:
+        print(f"Variable-level recorder failed: {e}")
+
+    # Teardown
+    session.close()
