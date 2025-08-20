@@ -1,52 +1,65 @@
-import win32com.client
+# Requires:
+#   pip install pywin32 asammdf
+#
+# Features:
+# - Direct longname access: var = session["Device:Variable"]
+# - Recording uses CANape's own MF4 output (no background threads).
+# - Set output path with CANape.Measurement.MDFFilename; the same path is used for reading.
+# - After the with-block, access data via:
+#     V = rec[var]  or  V = rec["Device:Variable"]
+#     V.x -> timestamps (numpy array from asammdf)
+#     V.y -> values (numpy array from asammdf)
+#     V.name -> signal name ("Device:Variable" when resolvable)
+#     V.data -> ((x0,y0), ..., (xn,yn))
+
+import os
 import time
-import array
-import threading
+import win32com.client
+from datetime import datetime
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Union, Any
 
-# ---------------------------
-# Helpers
-# ---------------------------
+from asammdf import MDF, Signal
 
-def dispatch_canape():
+
+def _dispatch_canape():
     try:
-        return win32com.client.Dispatch('CANape.Application')
+        return win32com.client.Dispatch("CANape.Application")
     except Exception:
-        return win32com.client.Dispatch('CAMape.Application')
+        return win32com.client.Dispatch("CAMape.Application")
 
 
-# ---------------------------
-# Core variable object (bound to a specific device)
-# ---------------------------
+def _ensure_parent_dir(path: str):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+
+
+def _wait_for_file_stable(path: str, timeout_s: float = 20.0, poll_s: float = 0.25) -> bool:
+    end = time.time() + timeout_s
+    last = -1
+    seen = False
+    while time.time() < end:
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            if seen and size == last and size > 0:
+                return True
+            last = size
+            seen = True
+        time.sleep(poll_s)
+    return os.path.exists(path)
+
 
 class CanapeVariable:
-    """
-    Represents a calibration/measurement object on a specific CANape device.
-
-    Create directly from the session using longname "Device:Var":
-      var1 = session["DeviceA:VarX"]
-
-    Then use only the variable:
-      print(var1.value)
-      var1.value = 42
-
-    Note: COM access is device-specific:
-      self._dev.CalibrationObjects(Var)  # we do NOT use "Device:Var" here
-    """
     def __init__(self, app, device_com, device_name: str, varname: str):
         self._app = app
         self._dev = device_com
         self.device_name = device_name
-        self.varname = varname  # name in the device's A2L (no "Device:" prefix)
+        self.varname = varname
         self.longname = f"{device_name}:{varname}"
-
-    def __repr__(self):
-        return f"<CanapeVariable {self.longname}>"
 
     @property
     def value(self):
-        # Access via device-specific CalibrationObjects, not "Device:Var"
         self._dev.CalibrationObjects.Add(self.varname)
         obj = self._dev.CalibrationObjects.Item(self.varname)
         obj.Read()
@@ -59,137 +72,155 @@ class CanapeVariable:
         obj.Value = val
         obj.Write()
 
+    def __repr__(self):
+        return f"<CanapeVariable {self.longname}>"
 
-# ---------------------------
-# Multi-device recorder implementation
-# ---------------------------
 
-class _DeviceRecorderWorker:
+class _SignalView:
+    def __init__(self, signal: Signal, display_name: Optional[str] = None):
+        self._sig = signal
+        self._name = display_name or signal.name
+
+    @property
+    def x(self):
+        return self._sig.timestamps
+
+    @property
+    def y(self):
+        return self._sig.samples
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def data(self):
+        xs = self._sig.timestamps
+        ys = self._sig.samples
+        n = min(len(xs), len(ys))
+        return tuple((float(xs[i]), float(ys[i])) for i in range(n))
+
+
+class RecorderResult:
     """
-    Background collector for one device/task. Collects values per CanapeVariable.
+    Created by session.recorder(...). Finalized AFTER the with-block.
+    Data source: the MF4 file written by CANape.
     """
-    def __init__(self, task, vars_for_device: List[CanapeVariable], values_store: Dict[CanapeVariable, List], ts_store: Dict[CanapeVariable, List]):
-        self._task = task
-        self._vars = vars_for_device
-        self._values_store = values_store
-        self._ts_store = ts_store
-        self._stop_evt = threading.Event()
-        name = vars_for_device[0].device_name if vars_for_device else 'dev'
-        self._thread = threading.Thread(target=self._run, name=f"CANapeRecorder-{name}", daemon=True)
-
-        # Build index map from task channel order to variables
-        try:
-            channel_names = [ch.Name for ch in task.Channels]
-        except Exception:
-            channel_names = []
-        self._idx_map: List[Tuple[int, CanapeVariable]] = []
-        for v in self._vars:
-            idx = -1
-            try:
-                idx = channel_names.index(v.varname)
-            except ValueError:
-                pass
-            if idx >= 0:
-                self._idx_map.append((idx, v))
-
-    def start(self):
-        self._thread.start()
-
-    def stop_and_drain(self, timeout: float = 5.0):
-        self._stop_evt.set()
-        self._thread.join(timeout=timeout)
-        self._drain_remaining()
-
-    def _run(self):
-        # Pull samples until stopped
-        while not self._stop_evt.is_set():
-            if not self._pull_one():
-                time.sleep(0.001)
-
-    def _pull_one(self) -> bool:
-        try:
-            sample = self._task.NextSample()
-        except Exception:
-            sample = None
-        if not sample:
-            return False
-        y_vals, ts = sample[0], sample[1]
-        for idx, var in self._idx_map:
-            if idx < len(y_vals):
-                self._values_store[var].append(y_vals[idx])
-                self._ts_store[var].append(ts)
-        return True
-
-    def _drain_remaining(self):
-        while self._pull_one():
-            pass
-
-
-class GlobalRecorderContext:
-    """
-    Context returned by session.recorder(...).
-    Data is only available AFTER the 'with' block ends.
-
-    Access:
-      vals = rec[var_obj]
-      ts_list = rec.get_timestamps(var_obj)
-    """
-    def __init__(self, workers: List[_DeviceRecorderWorker], added_per_device: Dict[str, List[str]], task_per_device: Dict[str, Any], app):
-        self._workers = workers
-        self._added_per_device = added_per_device
-        self._task_per_device = task_per_device
+    def __init__(self, app, task_per_device: Dict[str, Any], added_per_device: Dict[str, List[str]], vars_list: List[CanapeVariable], mdf_path: str):
         self._app = app
+        self._tasks = task_per_device
+        self._added = added_per_device
+        self._vars = vars_list
+        self.filepath = os.path.abspath(mdf_path)
 
-        self._closed = False
-        self._values: Dict[CanapeVariable, List] = {}
-        self._timestamps: Dict[CanapeVariable, List] = {}
+        self._mdf: Optional[MDF] = None
+        self._views_by_var: Dict[CanapeVariable, _SignalView] = {}
+        self._views_by_name: Dict[str, _SignalView] = {}
 
-    def _attach_stores(self, values_store: Dict[CanapeVariable, List], ts_store: Dict[CanapeVariable, List]):
-        # Called by the recorder to give us the shared stores
-        self._values = values_store
-        self._timestamps = ts_store
+    def _resolve_signal(self, mdf: MDF, expected_long: str, tail: str, names: List[str]) -> Optional[Signal]:
+        # Try exact "Device:Var"
+        try:
+            return mdf.get(expected_long)
+        except Exception:
+            pass
+        # Try exact "Var"
+        try:
+            return mdf.get(tail)
+        except Exception:
+            pass
+        # Case-insensitive exact match
+        lower = {n.lower(): n for n in names}
+        for candidate in (expected_long, tail):
+            n = lower.get(candidate.lower())
+            if n:
+                try:
+                    return mdf.get(n)
+                except Exception:
+                    pass
+        # Unique suffix ":Var"
+        suff = f":{tail}"
+        cand = [n for n in names if n.endswith(suff)]
+        if len(cand) == 1:
+            try:
+                return mdf.get(cand[0])
+            except Exception:
+                pass
+        # Unique suffix ".Var"
+        suff = f".{tail}"
+        cand = [n for n in names if n.endswith(suff)]
+        if len(cand) == 1:
+            try:
+                return mdf.get(cand[0])
+            except Exception:
+                pass
+        return None
 
-    def start(self):
-        for w in self._workers:
-            w.start()
+    def _load_views(self):
+        self._mdf = MDF(self.filepath)
+        try:
+            names = list(self._mdf.get_channel_names())
+        except Exception:
+            names = []
+
+        # Map recorded variables first
+        for v in self._vars:
+            sig = self._resolve_signal(self._mdf, v.longname, v.varname, names)
+            if sig is not None:
+                view = _SignalView(sig, display_name=v.longname)
+                self._views_by_var[v] = view
+                self._views_by_name[v.longname] = view
+
+        # Also expose raw MDF channel names
+        for n in names:
+            if n not in self._views_by_name:
+                try:
+                    self._views_by_name[n] = _SignalView(self._mdf.get(n), display_name=n)
+                except Exception:
+                    continue
 
     def finalize(self):
-        # Stop measurement first so no more data comes in
+        # Stop CANape measurement and cleanup channels
         try:
             self._app.Measurement.Stop()
         except Exception:
             pass
 
-        # Finalize workers
-        for w in self._workers:
-            w.stop_and_drain()
-
-        # Cleanup channels
-        for devname, task in self._task_per_device.items():
-            for ch_name in self._added_per_device.get(devname, []):
+        for dev, task in self._tasks.items():
+            for ch in self._added.get(dev, []):
                 try:
-                    task.Channels.Remove(ch_name)
+                    task.Channels.Remove(ch)
                 except Exception:
                     pass
 
-        self._closed = True
+        # Wait until MF4 appears and stops growing, then load and index
+        _wait_for_file_stable(self.filepath, timeout_s=30.0, poll_s=0.25)
+        self._load_views()
 
-    def __getitem__(self, var: CanapeVariable):
-        if not isinstance(var, CanapeVariable):
-            raise TypeError("Use the declared CanapeVariable object as key, e.g., rec[var_obj].")
-        if not self._closed:
-            raise RuntimeError("Recorded values are available only after recording has stopped.")
-        return self._values.get(var, [])
+    def __getitem__(self, key: Union[CanapeVariable, str]) -> _SignalView:
+        if isinstance(key, CanapeVariable):
+            view = self._views_by_var.get(key)
+            if view is None:
+                raise KeyError(f"No recorded data for {key.longname} in '{self.filepath}'")
+            return view
+        elif isinstance(key, str):
+            if key in self._views_by_name:
+                return self._views_by_name[key]
+            # Tail-only lookup if unique
+            tail = key.split(":", 1)[-1]
+            matches = [n for n in self._views_by_name.keys() if n.endswith(":" + tail) or n.endswith("." + tail) or n == tail]
+            if len(matches) == 1:
+                return self._views_by_name[matches[0]]
+            raise KeyError(f"No recorded data for '{key}' in '{self.filepath}'")
+        else:
+            raise TypeError("Key must be a CanapeVariable or 'Device:Variable' string.")
 
-    def get_timestamps(self, var: CanapeVariable) -> List[float]:
-        if not self._closed:
-            raise RuntimeError("Timestamps are available only after recording has stopped.")
-        return self._timestamps.get(var, [])
+    def close(self):
+        try:
+            if self._mdf is not None:
+                self._mdf.close()
+        except Exception:
+            pass
 
-
-# ---------------------------
-# Device wrapper and Session
-# ---------------------------
 
 class CanapeDevice:
     def __init__(self, app, device_com, name: str):
@@ -197,27 +228,21 @@ class CanapeDevice:
         self.dev = device_com
         self.name = name
 
-    # Optional low-level helpers
-    def read_memory(self, addr: int, size: int):
-        val = self.dev.ReadMemory(addr, size)
-        print(f"[READ] Memory {addr}: {''.join('%02x' % b for b in val)}")
-        return val
-
-    def write_memory(self, addr: int, data):
-        self.dev.WriteMemory(addr, array.array('B', data))
-        print(f"[WRITE] Memory {addr}: {''.join('%02x' % b for b in data)}")
-
 
 class CanapeAutomation:
     """
-    Session manager with DIRECT longname access:
-      var = session["Device:Var"]
-      with session.recorder(var, "OtherDevice:OtherVar"): ...
-
-    No per-device or session.canapevariable accessor required.
+    Usage:
+      session = CanapeAutomation()
+      session.add_device("XCPsim", "XCPsim.a2l", "XCP", 1)
+      var = session["XCPsim:ampl"]
+      with session.recorder(var, "XCPsim:channel1", mdf_path="out.mf4") as rec:
+          # do actions...
+          pass
+      V = rec[var]
+      print(V.x, V.y, V.name, V.data)
     """
     def __init__(self, project_path: Optional[str] = None):
-        self.app = dispatch_canape()
+        self.app = _dispatch_canape()
         try:
             self.app.Measurement.FifoSize = 2048
             self.app.Measurement.SampleSize = 1024
@@ -246,46 +271,44 @@ class CanapeAutomation:
             except Exception:
                 pass
 
-    def go_offline_all(self):
-        for dev in self.devices.values():
+    def close(self):
+        try:
+            for dev in self.devices.values():
+                try:
+                    dev.dev.GoOffline()
+                except Exception:
+                    pass
+        finally:
             try:
-                dev.dev.GoOffline()
+                self.app.Quit()
             except Exception:
                 pass
 
-    def close(self):
-        try:
-            self.go_offline_all()
-        except Exception:
-            pass
-        try:
-            self.app.Quit()
-        except Exception:
-            pass
-
-    # ------------- Direct variable access on the session -------------
-
     def __getitem__(self, longname: str) -> CanapeVariable:
-        # Require "Device:Var"
         if ":" not in longname:
-            raise ValueError('Use long name format "Device:Variable", e.g., "XCPsim:ampl".')
+            raise ValueError('Use "Device:Variable", e.g., "XCPsim:ampl"')
         devname, varname = longname.split(":", 1)
         if devname not in self.devices:
-            raise KeyError(f"Device '{devname}' is not added to the session.")
-        cache_key = f"{devname}:{varname}"
-        if cache_key in self._var_cache:
-            return self._var_cache[cache_key]
-        dev_com = self.devices[devname].dev
-        var = CanapeVariable(self.app, dev_com, devname, varname)
-        self._var_cache[cache_key] = var
+            raise KeyError(f"Device '{devname}' is not added.")
+        key = f"{devname}:{varname}"
+        if key in self._var_cache:
+            return self._var_cache[key]
+        var = CanapeVariable(self.app, self.devices[devname].dev, devname, varname)
+        self._var_cache[key] = var
         return var
 
     @contextmanager
-    def recorder(self, *vars_or_longnames: Union[CanapeVariable, str], task_name: str = "100ms", sampling_time: Optional[int] = 100):
+    def recorder(
+        self,
+        *vars_or_longnames: Union[CanapeVariable, str],
+        task_name: str = "100ms",
+        sampling_time: Optional[int] = 100,
+        mdf_path: Optional[str] = None
+    ):
         if not vars_or_longnames:
-            raise TypeError("Provide at least one variable (CanapeVariable) or longname 'Device:Var'.")
+            raise TypeError("Provide at least one variable or 'Device:Variable'.")
 
-        # Normalize to CanapeVariable objects
+        # Normalize to CanapeVariable
         vars_list: List[CanapeVariable] = []
         for item in vars_or_longnames:
             if isinstance(item, CanapeVariable):
@@ -293,21 +316,20 @@ class CanapeAutomation:
             elif isinstance(item, str):
                 vars_list.append(self[item])
             else:
-                raise TypeError("Items must be CanapeVariable or 'Device:Var' strings.")
+                raise TypeError("Items must be CanapeVariable or 'Device:Variable'.")
 
-        # Group variables by device
-        by_device: Dict[str, List[CanapeVariable]] = {}
+        # Group by device and configure tasks/channels
+        by_dev: Dict[str, List[CanapeVariable]] = {}
         for v in vars_list:
-            by_device.setdefault(v.device_name, []).append(v)
+            by_dev.setdefault(v.device_name, []).append(v)
 
-        # Prepare tasks and channels per device
-        added_per_device: Dict[str, List[str]] = {}
-        task_per_device: Dict[str, Any] = {}
+        tasks: Dict[str, Any] = {}
+        added: Dict[str, List[str]] = {}
 
-        for devname, dev_vars in by_device.items():
+        for devname, dev_vars in by_dev.items():
             dev_com = self.devices[devname].dev
             task = dev_com.Tasks(task_name)
-            task_per_device[devname] = task
+            tasks[devname] = task
 
             if sampling_time is not None:
                 try:
@@ -317,85 +339,39 @@ class CanapeAutomation:
 
             added_names: List[str] = []
             for v in dev_vars:
-                # Ensure calibration object exists
                 try:
                     dev_com.CalibrationObjects.Add(v.varname)
                 except Exception:
                     pass
-                # Add channel by var name
                 try:
                     task.Channels.Add(v.varname)
-                    # Save to MDF if supported
                     try:
                         task.Channels(v.varname).Save2MDF = True
                     except Exception:
                         pass
                     added_names.append(v.varname)
                 except Exception:
-                    # Already present or failed; continue
                     pass
+            added[devname] = added_names
 
-            added_per_device[devname] = added_names
+        # Select MF4 path and set CANape to write it
+        if mdf_path is None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            mdf_path = os.path.abspath(f"canape_recording_{stamp}.mf4")
+        _ensure_parent_dir(mdf_path)
+        try:
+            self.app.Measurement.MDFFilename = mdf_path
+        except Exception:
+            pass
 
-        # Shared stores for all workers
-        values_store: Dict[CanapeVariable, List] = {v: [] for v in vars_list}
-        ts_store: Dict[CanapeVariable, List] = {v: [] for v in vars_list}
-
-        # Build workers per device
-        workers: List[_DeviceRecorderWorker] = []
-        for devname, dev_vars in by_device.items():
-            workers.append(_DeviceRecorderWorker(task_per_device[devname], dev_vars, values_store, ts_store))
-
-        # Start measurement and workers
+        # Start measurement
         try:
             self.app.Measurement.Start()
         except Exception:
             pass
 
-        ctx = GlobalRecorderContext(workers, added_per_device, task_per_device, self.app)
-        ctx._attach_stores(values_store, ts_store)
-        ctx.start()
-
+        rec = RecorderResult(self.app, tasks, added, vars_list, mdf_path)
         try:
-            yield ctx
+            yield rec
         finally:
-            # Finalize stops measurement, drains, and cleans channels
-            ctx.finalize()
-
-
-# ---------------------------
-# Example usage (no session.canapevariable accessor)
-# ---------------------------
-
-if __name__ == "__main__":
-    session = CanapeAutomation()
-    session.add_device("XCPsim", "XCPsim.a2l", "XCP", 1)
-    # Add more devices if needed:
-    # session.add_device("XCPsim2", "XCPsim.a2l", "XCP", 2)
-
-    session.go_online_all()
-
-    # Declare variables directly from the session using longnames
-    var_ampl = session["XCPsim:ampl"]
-    var_ch1  = session["XCPsim:channel1"]
-
-    # During recording, interact as needed
-    with session.recorder(var_ampl, "XCPsim:channel1", task_name="100ms", sampling_time=100) as rec:
-        print("Recording...")
-        for _ in range(10):
-            _ = var_ampl.value  # optional interaction
-            time.sleep(0.1)
-
-    # After recording stops, access finalized data
-    ampl_values = rec[var_ampl]
-    ch1_values  = rec[var_ch1]
-    ampl_ts     = rec.get_timestamps(var_ampl)
-    ch1_ts      = rec.get_timestamps(var_ch1)
-
-    print(f"ampl samples: {len(ampl_values)}, channel1 samples: {len(ch1_values)}")
-    if ampl_values:
-        print(f"ampl first/last: {ampl_values[0]} -> {ampl_values[-1]}")
-    if ch1_values:
-        print(f"channel1 first/last: {ch1_values[0]} -> {ch1_values[-1]}")
-
-    session.close()
+            rec.finalize()
