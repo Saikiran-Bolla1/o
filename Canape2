@@ -1,23 +1,27 @@
 # Requires:
-#   pip install pywin32 asammdf
+#   pip install pywin32 asammdf numpy
 #
-# Features:
+# Features kept minimal and aligned to your asks:
 # - Direct longname access: var = session["Device:Variable"]
-# - Recording uses CANape's own MF4 output (no background threads).
-# - Set output path with CANape.Measurement.MDFFilename; the same path is used for reading.
-# - After the with-block, access data via:
+# - Recording uses CANape's MF4 only (no background threads).
+# - session.recorder(...) sets CANape.Measurement.MDFFilename to your path and reads the same file.
+# - After the with-block:
 #     V = rec[var]  or  V = rec["Device:Variable"]
-#     V.x -> timestamps (numpy array from asammdf)
-#     V.y -> values (numpy array from asammdf)
-#     V.name -> signal name ("Device:Variable" when resolvable)
+#     V.x -> timestamps (numpy array)
+#     V.y -> values (numpy array)
+#     V.name -> "Device:Variable" when resolvable (else raw MF4 name)
 #     V.data -> ((x0,y0), ..., (xn,yn))
+# - rec.signals -> list of all recorded signal names (as in the recorder)
+# - rec.values  -> list of (name, values) for all recorded signals
+# - Enum/text signals are converted to RAW (numeric) values whenever possible.
 
 import os
 import time
 import win32com.client
+import numpy as np
 from datetime import datetime
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, Tuple
 
 from asammdf import MDF, Signal
 
@@ -76,35 +80,98 @@ class CanapeVariable:
         return f"<CanapeVariable {self.longname}>"
 
 
+def _get_signal_raw_preferred(mdf: MDF, name: str) -> Signal:
+    # Try to get RAW samples (no conversion applied)
+    try:
+        return mdf.get(name, raw=True)  # asammdf supports raw=True
+    except TypeError:
+        # Older asammdf: fall back to normal get
+        return mdf.get(name)
+    except Exception:
+        return mdf.get(name)
+
+
+def _maybe_text_to_raw(samples: np.ndarray, signal: Signal) -> np.ndarray:
+    # If already numeric, return as-is
+    if hasattr(samples, "dtype") and samples.dtype.kind in ("i", "u", "f", "b"):
+        return samples
+
+    # Try to invert enum/text mapping using conversion object
+    conv = getattr(signal, "conversion", None)
+    if conv is not None:
+        # Common attribute names across asammdf versions
+        for attr in ("text_2_value", "text2value", "text_to_value", "value_map", "val_map"):
+            mapping = getattr(conv, attr, None)
+            if mapping:
+                def map_one(s):
+                    # exact
+                    if s in mapping:
+                        return mapping[s]
+                    # bytes -> str
+                    if isinstance(s, (bytes, bytearray)):
+                        try:
+                            s2 = s.decode(errors="ignore")
+                            if s2 in mapping:
+                                return mapping[s2]
+                        except Exception:
+                            pass
+                    # fallback: try numeric cast
+                    try:
+                        return float(s)
+                    except Exception:
+                        return np.nan
+                return np.array([map_one(s) for s in samples], dtype=float)
+
+    # Last resort: try best-effort float conversion
+    try:
+        return samples.astype(float)
+    except Exception:
+        # keep as object; consumer can handle
+        return samples
+
+
 class _SignalView:
-    def __init__(self, signal: Signal, display_name: Optional[str] = None):
+    def __init__(self, signal: Signal, display_name: Optional[str] = None, force_raw: bool = False):
         self._sig = signal
         self._name = display_name or signal.name
 
+        xs = signal.timestamps
+        ys = signal.samples
+
+        # Convert enum/text to raw numeric if needed or if forced
+        if force_raw or (hasattr(ys, "dtype") and ys.dtype.kind in ("O", "U", "S")):
+            ys = _maybe_text_to_raw(ys, signal)
+
+        # Store the arrays we will expose
+        self._x = np.asarray(xs)
+        self._y = np.asarray(ys)
+
     @property
     def x(self):
-        return self._sig.timestamps
+        return self._x
 
     @property
     def y(self):
-        return self._sig.samples
+        return self._y
 
     @property
     def name(self) -> str:
         return self._name
 
     @property
-    def data(self):
-        xs = self._sig.timestamps
-        ys = self._sig.samples
-        n = min(len(xs), len(ys))
-        return tuple((float(xs[i]), float(ys[i])) for i in range(n))
+    def data(self) -> Tuple[Tuple[float, float], ...]:
+        n = min(len(self._x), len(self._y))
+        return tuple((float(self._x[i]), float(self._y[i])) for i in range(n))
 
 
 class RecorderResult:
     """
     Created by session.recorder(...). Finalized AFTER the with-block.
     Data source: the MF4 file written by CANape.
+
+    Additional shortcuts:
+    - rec.signals -> list of recorded signal names
+    - rec.values  -> list of (name, values_array) for recorded signals
     """
     def __init__(self, app, task_per_device: Dict[str, Any], added_per_device: Dict[str, List[str]], vars_list: List[CanapeVariable], mdf_path: str):
         self._app = app
@@ -116,43 +183,37 @@ class RecorderResult:
         self._mdf: Optional[MDF] = None
         self._views_by_var: Dict[CanapeVariable, _SignalView] = {}
         self._views_by_name: Dict[str, _SignalView] = {}
+        self._ordered_names: List[str] = []  # keep order consistent with vars_list
 
     def _resolve_signal(self, mdf: MDF, expected_long: str, tail: str, names: List[str]) -> Optional[Signal]:
-        # Try exact "Device:Var"
+        # 1) Try exact long name raw
         try:
-            return mdf.get(expected_long)
+            return _get_signal_raw_preferred(mdf, expected_long)
         except Exception:
             pass
-        # Try exact "Var"
+        # 2) Try exact tail raw
         try:
-            return mdf.get(tail)
+            return _get_signal_raw_preferred(mdf, tail)
         except Exception:
             pass
-        # Case-insensitive exact match
+        # 3) Case-insensitive exact match
         lower = {n.lower(): n for n in names}
-        for candidate in (expected_long, tail):
-            n = lower.get(candidate.lower())
+        for cand in (expected_long, tail):
+            n = lower.get(cand.lower())
             if n:
                 try:
-                    return mdf.get(n)
+                    return _get_signal_raw_preferred(mdf, n)
                 except Exception:
                     pass
-        # Unique suffix ":Var"
-        suff = f":{tail}"
-        cand = [n for n in names if n.endswith(suff)]
-        if len(cand) == 1:
-            try:
-                return mdf.get(cand[0])
-            except Exception:
-                pass
-        # Unique suffix ".Var"
-        suff = f".{tail}"
-        cand = [n for n in names if n.endswith(suff)]
-        if len(cand) == 1:
-            try:
-                return mdf.get(cand[0])
-            except Exception:
-                pass
+        # 4) Unique suffix ":Var" or ".Var"
+        for sep in (":", "."):
+            suffix = f"{sep}{tail}"
+            matches = [n for n in names if n.endswith(suffix)]
+            if len(matches) == 1:
+                try:
+                    return _get_signal_raw_preferred(mdf, matches[0])
+                except Exception:
+                    pass
         return None
 
     def _load_views(self):
@@ -162,24 +223,26 @@ class RecorderResult:
         except Exception:
             names = []
 
-        # Map recorded variables first
+        # Build views for the signals explicitly requested in the recorder
         for v in self._vars:
             sig = self._resolve_signal(self._mdf, v.longname, v.varname, names)
             if sig is not None:
                 view = _SignalView(sig, display_name=v.longname)
                 self._views_by_var[v] = view
                 self._views_by_name[v.longname] = view
+                self._ordered_names.append(v.longname)
 
-        # Also expose raw MDF channel names
+        # Also allow access by raw MDF names (in case user queries by that)
         for n in names:
             if n not in self._views_by_name:
                 try:
-                    self._views_by_name[n] = _SignalView(self._mdf.get(n), display_name=n)
+                    sig = _get_signal_raw_preferred(self._mdf, n)
+                    self._views_by_name[n] = _SignalView(sig, display_name=n)
                 except Exception:
                     continue
 
     def finalize(self):
-        # Stop CANape measurement and cleanup channels
+        # Stop CANape measurement and cleanup channels we added
         try:
             self._app.Measurement.Stop()
         except Exception:
@@ -192,7 +255,7 @@ class RecorderResult:
                 except Exception:
                     pass
 
-        # Wait until MF4 appears and stops growing, then load and index
+        # Wait until MF4 appears and is stable, then load
         _wait_for_file_stable(self.filepath, timeout_s=30.0, poll_s=0.25)
         self._load_views()
 
@@ -205,7 +268,7 @@ class RecorderResult:
         elif isinstance(key, str):
             if key in self._views_by_name:
                 return self._views_by_name[key]
-            # Tail-only lookup if unique
+            # Tail-only lookup if unique among the recorded names
             tail = key.split(":", 1)[-1]
             matches = [n for n in self._views_by_name.keys() if n.endswith(":" + tail) or n.endswith("." + tail) or n == tail]
             if len(matches) == 1:
@@ -213,6 +276,21 @@ class RecorderResult:
             raise KeyError(f"No recorded data for '{key}' in '{self.filepath}'")
         else:
             raise TypeError("Key must be a CanapeVariable or 'Device:Variable' string.")
+
+    @property
+    def signals(self) -> List[str]:
+        # Only the signals explicitly configured in this recorder (preserve order)
+        return list(self._ordered_names)
+
+    @property
+    def values(self) -> List[Tuple[str, np.ndarray]]:
+        # Names and values for the recorded signals (preserve order)
+        out: List[Tuple[str, np.ndarray]] = []
+        for name in self._ordered_names:
+            view = self._views_by_name.get(name)
+            if view is not None:
+                out.append((name, view.y))
+        return out
 
     def close(self):
         try:
@@ -230,17 +308,6 @@ class CanapeDevice:
 
 
 class CanapeAutomation:
-    """
-    Usage:
-      session = CanapeAutomation()
-      session.add_device("XCPsim", "XCPsim.a2l", "XCP", 1)
-      var = session["XCPsim:ampl"]
-      with session.recorder(var, "XCPsim:channel1", mdf_path="out.mf4") as rec:
-          # do actions...
-          pass
-      V = rec[var]
-      print(V.x, V.y, V.name, V.data)
-    """
     def __init__(self, project_path: Optional[str] = None):
         self.app = _dispatch_canape()
         try:
@@ -354,7 +421,7 @@ class CanapeAutomation:
                     pass
             added[devname] = added_names
 
-        # Select MF4 path and set CANape to write it
+        # MF4 path
         if mdf_path is None:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             mdf_path = os.path.abspath(f"canape_recording_{stamp}.mf4")
