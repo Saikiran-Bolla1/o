@@ -1,6 +1,7 @@
 from .status import get_case_status
 from datetime import datetime
 from contextlib import contextmanager
+from typing import Any, Dict, List, Tuple
 
 def get_group_status(children):
     priority = {"ERROR": 3, "FAIL": 2, "PASS": 1, "INFO": 0, "NONE": 0}
@@ -69,6 +70,65 @@ def get_table_status(table):
         return "NONE"
     return "NONE"
 
+def _normalize_chart_input(input_obj: Any) -> Dict[str, Any]:
+    """
+    Accept multiple input forms and convert to a chart dict compatible with the frontend:
+      - [rec["Sig1"], rec["Sig2"]] where each item has .name, .x, .y, .data
+      - rec.values() -> list of objects with .name, .x, .y, .data
+      - [[(x0,y0),...], [(x0,y0),...]] -> each inner list is one signal's samples
+    Output dict:
+      {
+        "name": "Signals",
+        "legend": [...],
+        "x": [...],
+        "y": { legend[i]: y_i, ... },
+        "xlabel": "Time (s)",
+        "ylabel": "Value"
+      }
+    """
+    # Case 1: list/tuple of views or sample-pairs
+    if isinstance(input_obj, (list, tuple)):
+        items = list(input_obj)
+        if not items:
+            return {"name": "Signals", "legend": [], "x": [], "y": {}}
+        # Duck-typing for view-like objects
+        if hasattr(items[0], "x") and hasattr(items[0], "y"):
+            # Use the first item's x as the common X axis
+            x = list(map(float, getattr(items[0], "x")))
+            legend = []
+            y_map: Dict[str, List[float]] = {}
+            for it in items:
+                name = getattr(it, "name", None) or f"Sig{len(legend)+1}"
+                legend.append(name)
+                y_map[name] = list(map(float, getattr(it, "y")))
+            return {
+                "name": "Signals",
+                "legend": legend,
+                "x": x,
+                "y": y_map,
+                "xlabel": "Time (s)",
+                "ylabel": "Value",
+            }
+        # Otherwise, assume list of list of (x,y) pairs
+        elif isinstance(items[0], (list, tuple)) and items and items[0] and isinstance(items[0][0], (list, tuple)):
+            sig_pairs: List[List[Tuple[float, float]]] = items  # type: ignore
+            x = [float(p[0]) for p in sig_pairs[0]]
+            legend = [f"Sig{i+1}" for i in range(len(sig_pairs))]
+            y_map = {legend[i]: [float(p[1]) for p in sig_pairs[i]] for i in range(len(sig_pairs))}
+            return {
+                "name": "Signals",
+                "legend": legend,
+                "x": x,
+                "y": y_map,
+                "xlabel": "Time (s)",
+                "ylabel": "Value",
+            }
+    # If already a dict in chart format, return as-is
+    if isinstance(input_obj, dict):
+        return input_obj
+    # Fallback empty chart
+    return {"name": "Signals", "legend": [], "x": [], "y": {}}
+
 class TestReport:
     project = None
 
@@ -87,6 +147,7 @@ class TestReport:
         self.project = TestReport.project
         self._group_stack = []
         self.dut = dut or {}
+        self.steps = []  # Optional: keep if other code references it
 
     @contextmanager
     def start_group(self, title, comment=None):
@@ -157,12 +218,20 @@ class TestReport:
         self.status = get_case_status(self.lines)
 
     def add_chart(self, chart):
+        """
+        Add a chart. Accepted inputs:
+          - A ready chart dict with keys: x, y (array or dict), legend (optional), name (optional)
+          - A list like [rec["Sig1"], rec["Sig2"]] where each item has .name, .x, .y, .data
+          - rec.values() from RecorderResult
+          - A list of signals as pairs: [[(x0,y0),...], [(x0,y0),...]]
+        """
+        normalized = _normalize_chart_input(chart)
         idx = len(self.charts)
-        self.charts.append(chart)
+        self.charts.append(normalized)
         chart_entry = {
             "category": "CHART",
             "status": "NONE",
-            "comment": f"Chart: {chart.get('name', f'Chart {idx+1}')}",
+            "comment": f"Chart: {normalized.get('name', f'Chart {idx+1}')}",
             "timestamp": datetime.now().strftime("%H:%M:%S"),
             "chart_idx": idx
         }
@@ -187,20 +256,20 @@ class TestReport:
             "tx": {"raw": tx_bytes},
             "rx": {"raw": rx_bytes},
             "expected": {"response": expected},
-            "status": status  # Added status line for diagnostic child
+            "status": status
         }
         group = {
             "category": "GROUP",
             "title": f"send diagnostic request {name}",
             "timestamp": now,
-            "status": status,  # The status is set for the group
+            "status": status,
             "children": [diagnostic]
         }
         if self._group_stack:
             self._group_stack[-1]["children"].append(group)
         else:
             self.lines.append(group)
-        self.status = get_case_status(self.lines)  # Ensure overall status is updated
+        self.status = get_case_status(self.lines)
 
     def to_dict(self):
         from .status import get_case_status
