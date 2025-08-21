@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys
+import csv
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
 
@@ -15,9 +16,22 @@ DW_ATE_SIGNED_CHAR    = 0x06
 DW_ATE_UNSIGNED       = 0x07
 DW_ATE_UNSIGNED_CHAR  = 0x08
 
+rows = []   # global list to collect CSV rows
+
+
+def add_row(name, addr, type_name, size=None, vmin=None, vmax=None, extra=""):
+    rows.append({
+        "name": name,
+        "address": f"0x{addr:x}",
+        "type": type_name,
+        "size": size if size is not None else "",
+        "min": vmin if vmin is not None else "",
+        "max": vmax if vmax is not None else "",
+        "extra": extra
+    })
+
 
 def get_object_symbols(elffile):
-    """Return {name: {'addr': int, 'size': int}} for variables from .symtab + .dynsym"""
     out = {}
     for secname in ('.symtab', '.dynsym'):
         sec = elffile.get_section_by_name(secname)
@@ -30,13 +44,12 @@ def get_object_symbols(elffile):
                 continue
             addr = int(s['st_value'] or 0)
             if addr == 0:
-                continue  # skip undef/ABS
+                continue
             out[s.name] = {'addr': addr, 'size': int(s['st_size'] or 0)}
     return out
 
 
 def iter_dwarf_variables(dwarfinfo):
-    """Map variable name -> DIE (only those with a type)."""
     out = {}
     for cu in dwarfinfo.iter_CUs():
         for die in cu.iter_DIEs():
@@ -53,7 +66,6 @@ def iter_dwarf_variables(dwarfinfo):
 
 
 def resolve_typedefs(die):
-    """Follow DW_AT_type until a concrete type tag."""
     seen = set()
     cur = die
     while cur and cur.offset not in seen:
@@ -70,7 +82,6 @@ def resolve_typedefs(die):
 
 
 def base_type_info(base_die):
-    """Return (type_name, byte_size, encoding) for a DW_TAG_base_type or pointer; else (unknown, size, None)."""
     if base_die is None:
         return ('unknown', None, None)
 
@@ -86,18 +97,15 @@ def base_type_info(base_die):
                 int(bs.value) if bs else None,
                 int(enc.value) if enc else None)
 
-    # enums: treat as signed int with its byte size
     if base_die.tag == 'DW_TAG_enumeration_type':
         bs = base_die.attributes.get('DW_AT_byte_size')
         return ('enum', int(bs.value) if bs else None, DW_ATE_SIGNED)
 
-    # unknown composite: no size known
     bs = base_die.attributes.get('DW_AT_byte_size')
     return ('unknown', int(bs.value) if bs else None, None)
 
 
 def array_len_first_dim(array_die):
-    """Get first dimension length from DW_TAG_array_type."""
     for child in array_die.iter_children():
         if child.tag != 'DW_TAG_subrange_type':
             continue
@@ -123,37 +131,32 @@ def int_min_max(encoding, byte_size):
         return (-(1 << (bits - 1)), (1 << (bits - 1)) - 1)
     if encoding == DW_ATE_BOOLEAN:
         return (0, 1)
-    return (None, None)  # floats/pointers/unknown
+    return (None, None)
 
 
 def member_offset(member_die):
-    """Return member byte offset if it is a constant; otherwise None (skip complex exprloc)."""
     loc = member_die.attributes.get('DW_AT_data_member_location')
     if not loc:
         return 0
-    # Many compilers encode this as a constant data form
     if describe_form_class(loc.form) == 'constant':
         return int(loc.value)
-    # exprloc often means base + const; we keep it simple and skip if not constant
     return None
 
 
 def emit_leaf(name, addr, base_die):
     tname, tsize, tenc = base_type_info(base_die)
     vmin, vmax = int_min_max(tenc, tsize)
-    print(f"{name}  type={tname} addr=0x{addr:x} size={tsize if tsize is not None else ''} min={vmin} max={vmax}")
+    add_row(name, addr, tname, tsize, vmin, vmax)
 
 
 def emit_type_recursive(prefix, base_addr, type_die):
-    """Recursively emit fields/elements for a given type."""
     type_die = resolve_typedefs(type_die)
     if not type_die:
-        print(f"{prefix}  type=unknown addr=0x{base_addr:x}")
+        add_row(prefix, base_addr, "unknown")
         return
 
     tag = type_die.tag
 
-    # 1) Array
     if tag == 'DW_TAG_array_type':
         elem_die = type_die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in type_die.attributes else None
         elem_die = resolve_typedefs(elem_die)
@@ -164,19 +167,15 @@ def emit_type_recursive(prefix, base_addr, type_die):
         n_print = min(n, MAX_ARRAY)
         for i in range(n_print):
             eaddr = base_addr + i * esize
-            # If the element itself is composite (struct/array), recurse; otherwise print leaf
             if elem_die and elem_die.tag in ('DW_TAG_structure_type', 'DW_TAG_array_type'):
                 emit_type_recursive(f"{prefix}._{i}_", eaddr, elem_die)
             else:
-                print(f"{prefix}._{i}_  type={etname} addr=0x{eaddr:x} size={esize}")
-        # Array summary line (like tools show the node)
-        print(f"{prefix}  type=array[{n}] of {etname} base_addr=0x{base_addr:x} elem_size={esize}")
+                add_row(f"{prefix}._{i}_", eaddr, etname, esize)
+        add_row(prefix, base_addr, f"array[{n}] of {etname}", esize, extra="array")
         return
 
-    # 2) Struct
     if tag == 'DW_TAG_structure_type':
-        # Optional: a struct summary line
-        print(f"{prefix}  type=struct base_addr=0x{base_addr:x}")
+        add_row(prefix, base_addr, "struct", extra="struct")
         for child in type_die.iter_children():
             if child.tag != 'DW_TAG_member':
                 continue
@@ -184,7 +183,6 @@ def emit_type_recursive(prefix, base_addr, type_die):
             mname = mname_attr.value.decode('utf-8', 'ignore') if mname_attr else '<anon>'
             off = member_offset(child)
             if off is None:
-                # Cannot resolve complex offset → skip safely
                 continue
             mt = child.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in child.attributes else None
             if not mt:
@@ -192,9 +190,8 @@ def emit_type_recursive(prefix, base_addr, type_die):
             emit_type_recursive(f"{prefix}.{mname}", base_addr + off, mt)
         return
 
-    # 3) Union — emit members at same address
     if tag == 'DW_TAG_union_type':
-        print(f"{prefix}  type=union base_addr=0x{base_addr:x}")
+        add_row(prefix, base_addr, "union", extra="union")
         for child in type_die.iter_children():
             if child.tag != 'DW_TAG_member':
                 continue
@@ -206,7 +203,6 @@ def emit_type_recursive(prefix, base_addr, type_die):
             emit_type_recursive(f"{prefix}.{mname}", base_addr, mt)
         return
 
-    # 4) Pointer / Base / Enum → leaf
     emit_leaf(prefix, base_addr, type_die)
 
 
@@ -217,25 +213,28 @@ def main(path):
 
         if not elf.has_dwarf_info():
             for name, meta in sorted(symmap.items(), key=lambda kv: kv[1]['addr']):
-                print(f"{name}  type=unknown addr=0x{meta['addr']:x} size={meta['size']}")
-            return
+                add_row(name, meta['addr'], "unknown", meta['size'])
+        else:
+            dwarfinfo = elf.get_dwarf_info()
+            dwarf_vars = iter_dwarf_variables(dwarfinfo)
+            for name, meta in sorted(symmap.items(), key=lambda kv: kv[1]['addr']):
+                die = dwarf_vars.get(name)
+                if not die:
+                    add_row(name, meta['addr'], "unknown", meta['size'])
+                    continue
+                tdie = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
+                if not tdie:
+                    add_row(name, meta['addr'], "unknown", meta['size'])
+                    continue
+                emit_type_recursive(name, meta['addr'], tdie)
 
-        dwarfinfo = elf.get_dwarf_info()
-        dwarf_vars = iter_dwarf_variables(dwarfinfo)
-
-        for name, meta in sorted(symmap.items(), key=lambda kv: kv[1]['addr']):
-            die = dwarf_vars.get(name)
-            if not die:
-                # No DWARF for symbol → show basic info
-                print(f"{name}  type=unknown addr=0x{meta['addr']:x} size={meta['size']}")
-                continue
-            tdie = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
-            if not tdie:
-                print(f"{name}  type=unknown addr=0x{meta['addr']:x} size={meta['size']}")
-                continue
-
-            # Expand recursively from the top-level variable
-            emit_type_recursive(name, meta['addr'], tdie)
+    # write CSV
+    csvfile = path + ".csv"
+    with open(csvfile, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["name", "address", "type", "size", "min", "max", "extra"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved results to {csvfile}")
 
 
 if __name__ == '__main__':
