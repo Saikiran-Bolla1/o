@@ -112,9 +112,9 @@ def print_dwarf_struct_vars(prefix, base_addr, die):
             eaddr = base_addr + i * (esize if esize else 1)
             # Recursively print element members if struct/array
             if elem_die and elem_die.tag in ('DW_TAG_structure_type', 'DW_TAG_array_type'):
-                print_dwarf_struct_vars(f"{prefix}[{i}]", eaddr, elem_die)
+                print_dwarf_struct_vars(f"{prefix}_{i}_", eaddr, elem_die)
             else:
-                print(f"{prefix}[{i}] {hex(eaddr)} {dwarf_type_to_str(etname, etenc, esize):<10} {esize if esize else ''} array_elem")
+                print(f"{prefix}_{i}_ {hex(eaddr)} {dwarf_type_to_str(etname, etenc, esize):<10} {esize if esize else ''} array_elem")
         print(f"{prefix} {hex(base_addr)} array[{n}] {esize if esize else ''} array")
         return
 
@@ -153,6 +153,7 @@ def main(path, filter_prefix=None):
                 continue
             addr = meta['addr']
             # Find matching variable in DWARF
+            found = False
             for cu in dwarfinfo.iter_CUs():
                 for die in cu.iter_DIEs():
                     if die.tag != 'DW_TAG_variable':
@@ -167,7 +168,10 @@ def main(path, filter_prefix=None):
                             print_dwarf_struct_vars(name, addr, tdie)
                         else:
                             print(f"{name} {hex(addr)} unknown")
+                        found = True
                         break
+                if found:
+                    break
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
