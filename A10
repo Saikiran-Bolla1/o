@@ -1,113 +1,91 @@
 import sys
 import csv
 from elftools.elf.elffile import ELFFile
-from elftools.dwarf.descriptions import describe_form_class
 
-# ------------------------------
-# Utility functions
-# ------------------------------
 
-def get_type_name(die, cu):
-    """Resolve the base type name for a DIE."""
-    if 'DW_AT_type' not in die.attributes:
+def get_type_name(die):
+    if not die:
         return None
-    type_die = die.get_DIE_from_attribute('DW_AT_type')
-    if type_die is None:
+    if die.tag in ("DW_TAG_base_type", "DW_TAG_typedef", "DW_TAG_structure_type"):
+        if "DW_AT_name" in die.attributes:
+            return die.attributes["DW_AT_name"].value.decode("utf-8")
+    if "DW_AT_type" in die.attributes:
+        return get_type_name(die.get_DIE_from_attribute("DW_AT_type"))
+    return None
+
+
+def get_type_size(die):
+    if not die:
         return None
-
-    if type_die.tag == "DW_TAG_base_type":
-        return type_die.attributes["DW_AT_name"].value.decode("utf-8")
-
-    if type_die.tag == "DW_TAG_typedef":
-        return type_die.attributes["DW_AT_name"].value.decode("utf-8")
-
-    return get_type_name(type_die, cu)
+    if "DW_AT_byte_size" in die.attributes:
+        return die.attributes["DW_AT_byte_size"].value
+    if "DW_AT_type" in die.attributes:
+        return get_type_size(die.get_DIE_from_attribute("DW_AT_type"))
+    return None
 
 
-def get_type_size(die, cu):
-    """Get byte size of a DIE type."""
-    if 'DW_AT_type' not in die.attributes:
-        return None
-    type_die = die.get_DIE_from_attribute('DW_AT_type')
-    if type_die is None:
-        return None
-
-    if "DW_AT_byte_size" in type_die.attributes:
-        return type_die.attributes["DW_AT_byte_size"].value
-
-    return get_type_size(type_die, cu)
-
-
-def emit_type_recursive(prefix, addr, die, cu, rows):
-    """Recursive walker: handles structs, arrays, and base types."""
+def emit_recursive(prefix, addr, die, rows):
+    """Recursive expansion of structs/arrays into flat variables."""
     if die is None:
         return
 
-    # Structs
     if die.tag == "DW_TAG_structure_type":
         for child in die.iter_children():
             if child.tag == "DW_TAG_member" and "DW_AT_name" in child.attributes:
-                member_name = child.attributes["DW_AT_name"].value.decode("utf-8")
-                member_off = child.attributes["DW_AT_data_member_location"].value
-                child_die = child.get_DIE_from_attribute("DW_AT_type")
-                emit_type_recursive(f"{prefix}.{member_name}", addr + member_off, child_die, cu, rows)
+                mname = child.attributes["DW_AT_name"].value.decode("utf-8")
+                offset = child.attributes["DW_AT_data_member_location"].value
+                emit_recursive(f"{prefix}.{mname}", addr + offset,
+                               child.get_DIE_from_attribute("DW_AT_type"), rows)
 
-    # Arrays
     elif die.tag == "DW_TAG_array_type":
-        elem_die = die.get_DIE_from_attribute("DW_AT_type")
+        base_type = die.get_DIE_from_attribute("DW_AT_type")
         count = 1
-        for child in die.iter_children():
-            if child.tag == "DW_TAG_subrange_type" and "DW_AT_upper_bound" in child.attributes:
-                count = child.attributes["DW_AT_upper_bound"].value + 1
-        elem_size = get_type_size(elem_die, cu) or 0
+        for c in die.iter_children():
+            if c.tag == "DW_TAG_subrange_type" and "DW_AT_upper_bound" in c.attributes:
+                count = c.attributes["DW_AT_upper_bound"].value + 1
+        elem_size = get_type_size(base_type) or 0
         for i in range(count):
-            emit_type_recursive(f"{prefix}._{i}_", addr + i * elem_size, elem_die, cu, rows)
+            emit_recursive(f"{prefix}._{i}_", addr + i * elem_size, base_type, rows)
 
-    # Base types
     else:
-        tname = get_type_name(die, cu)
-        tsize = get_type_size(die, cu)
+        tname = get_type_name(die)
+        tsize = get_type_size(die)
         if tname and tsize:
             rows.append([prefix, f"0x{addr:08X}", tname, tsize])
 
 
 def process_file(filename, out_csv):
-    with open(filename, 'rb') as f:
+    with open(filename, "rb") as f:
         elf = ELFFile(f)
         dwarfinfo = elf.get_dwarf_info()
 
         rows = [["Name", "Address", "Type", "Byte Size"]]
 
+        # Step 1: build symbol map (from symtab)
+        symtab = elf.get_section_by_name(".symtab")
+        symmap = {}
+        if symtab:
+            for sym in symtab.iter_symbols():
+                if sym.entry["st_info"]["type"] == "STT_OBJECT":
+                    symmap[sym.name] = sym.entry["st_value"]
+
+        # Step 2: iterate DIEs
         for cu in dwarfinfo.iter_CUs():
-            top_DIE = cu.get_top_DIE()
             for die in cu.iter_DIEs():
                 if die.tag == "DW_TAG_variable" and "DW_AT_name" in die.attributes:
-                    var_name = die.attributes["DW_AT_name"].value.decode("utf-8")
-                    if "DW_AT_location" not in die.attributes:
+                    vname = die.attributes["DW_AT_name"].value.decode("utf-8")
+                    if vname not in symmap:
                         continue
+                    addr = symmap[vname]
+                    emit_recursive(vname, addr,
+                                   die.get_DIE_from_attribute("DW_AT_type"), rows)
 
-                    loc_attr = die.attributes["DW_AT_location"]
-                    if describe_form_class(loc_attr.form) != "exprloc":
-                        continue
-
-                    # Extract absolute address
-                    expr = loc_attr.value
-                    if len(expr) >= 1 and expr[0] == 0x91:  # DW_OP_addr
-                        addr = int.from_bytes(expr[1:], byteorder="little")
-                        type_die = die.get_DIE_from_attribute("DW_AT_type")
-                        emit_type_recursive(var_name, addr, type_die, cu, rows)
-
-        # Write CSV
         with open(out_csv, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerows(rows)
+            csv.writer(csvfile).writerows(rows)
 
-        print(f"[OK] Written CSV to {out_csv}")
+        print(f"[OK] Wrote {out_csv}, rows={len(rows)-1}")
 
 
-# ------------------------------
-# Entry point
-# ------------------------------
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print(f"Usage: python {sys.argv[0]} <input.elf> <output.csv>")
