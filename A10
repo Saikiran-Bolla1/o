@@ -1,93 +1,191 @@
+#!/usr/bin/env python3
 import sys
-import csv
 from elftools.elf.elffile import ELFFile
+from elftools.dwarf.descriptions import describe_form_class
 
+MAX_ARRAY = 32
 
-def get_type_name(die):
-    if not die:
-        return None
-    if die.tag in ("DW_TAG_base_type", "DW_TAG_typedef", "DW_TAG_structure_type"):
-        if "DW_AT_name" in die.attributes:
-            return die.attributes["DW_AT_name"].value.decode("utf-8")
-    if "DW_AT_type" in die.attributes:
-        return get_type_name(die.get_DIE_from_attribute("DW_AT_type"))
+# DWARF encodings
+DW_ATE_ADDRESS        = 0x01
+DW_ATE_BOOLEAN        = 0x02
+DW_ATE_COMPLEX_FLOAT  = 0x03
+DW_ATE_FLOAT          = 0x04
+DW_ATE_SIGNED         = 0x05
+DW_ATE_SIGNED_CHAR    = 0x06
+DW_ATE_UNSIGNED       = 0x07
+DW_ATE_UNSIGNED_CHAR  = 0x08
+
+def get_object_symbols(elffile):
+    """Return {name: {'addr': int, 'size': int}} for variables from .symtab + .dynsym"""
+    out = {}
+    for secname in ('.symtab', '.dynsym'):
+        sec = elffile.get_section_by_name(secname)
+        if not sec or not hasattr(sec, "iter_symbols"):
+            continue
+        for s in sec.iter_symbols():
+            if s['st_info']['type'] != 'STT_OBJECT':
+                continue
+            if not s.name:
+                continue
+            addr = int(s['st_value'] or 0)
+            if addr == 0:
+                continue  # skip undef/ABS
+            out[s.name] = {'addr': addr, 'size': int(s['st_size'] or 0)}
+    return out
+
+def iter_dwarf_variables(dwarfinfo):
+    """Map variable name -> DIE (only those with a type)."""
+    out = {}
+    for cu in dwarfinfo.iter_CUs():
+        for die in cu.iter_DIEs():
+            if die.tag != 'DW_TAG_variable':
+                continue
+            n = die.attributes.get('DW_AT_name')
+            if not n:
+                continue
+            if 'DW_AT_type' not in die.attributes:
+                continue
+            name = n.value.decode('utf-8', 'ignore')
+            out[name] = die
+    return out
+
+def resolve_typedefs(die):
+    """Follow DW_AT_type until a concrete type tag."""
+    seen = set()
+    cur = die
+    while cur and cur.offset not in seen:
+        seen.add(cur.offset)
+        if cur.tag in ('DW_TAG_base_type', 'DW_TAG_pointer_type',
+                       'DW_TAG_array_type', 'DW_TAG_structure_type', 'DW_TAG_union_type',
+                       'DW_TAG_enumeration_type'):
+            return cur
+        if 'DW_AT_type' in cur.attributes:
+            cur = cur.get_DIE_from_attribute('DW_AT_type')
+        else:
+            break
+    return cur
+
+def base_type_info(base_die):
+    """Return (type_name, byte_size, encoding) for a DW_TAG_base_type or pointer; else (unknown, size, None)."""
+    if base_die is None:
+        return ('unknown', None, None)
+
+    if base_die.tag == 'DW_TAG_pointer_type':
+        bs = base_die.attributes.get('DW_AT_byte_size')
+        return ('pointer', int(bs.value) if bs else None, None)
+
+    if base_die.tag == 'DW_TAG_base_type':
+        nm = base_die.attributes.get('DW_AT_name')
+        bs = base_die.attributes.get('DW_AT_byte_size')
+        enc = base_die.attributes.get('DW_AT_encoding')
+        return (nm.value.decode('utf-8', 'ignore') if nm else 'unknown',
+                int(bs.value) if bs else None,
+                int(enc.value) if enc else None)
+
+    # enums: treat as signed int with its byte size
+    if base_die.tag == 'DW_TAG_enumeration_type':
+        bs = base_die.attributes.get('DW_AT_byte_size')
+        return ('enum', int(bs.value) if bs else None, DW_ATE_SIGNED)
+
+    # unknown composite: no size known
+    bs = base_die.attributes.get('DW_AT_byte_size')
+    return ('unknown', int(bs.value) if bs else None, None)
+
+def array_len_first_dim(array_die):
+    """Get first dimension length from DW_TAG_array_type."""
+    for child in array_die.iter_children():
+        if child.tag != 'DW_TAG_subrange_type':
+            continue
+        cnt = child.attributes.get('DW_AT_count')
+        if cnt:
+            return int(cnt.value)
+        ub = child.attributes.get('DW_AT_upper_bound')
+        lb = child.attributes.get('DW_AT_lower_bound')
+        if ub and lb:
+            return int(ub.value) - int(lb.value) + 1
+        if ub:
+            return int(ub.value) + 1
     return None
 
+def int_min_max(encoding, byte_size):
+    if byte_size is None:
+        return (None, None)
+    bits = 8 * byte_size
+    if encoding in (DW_ATE_UNSIGNED, DW_ATE_UNSIGNED_CHAR):
+        return (0, (1 << bits) - 1)
+    if encoding in (DW_ATE_SIGNED, DW_ATE_SIGNED_CHAR):
+        return (-(1 << (bits - 1)), (1 << (bits - 1)) - 1)
+    if encoding == DW_ATE_BOOLEAN:
+        return (0, 1)
+    return (None, None)  # floats/pointers/unknown
 
-def get_type_size(die):
-    if not die:
-        return None
-    if "DW_AT_byte_size" in die.attributes:
-        return die.attributes["DW_AT_byte_size"].value
-    if "DW_AT_type" in die.attributes:
-        return get_type_size(die.get_DIE_from_attribute("DW_AT_type"))
+def member_offset(member_die):
+    """Return member byte offset if it is a constant; otherwise None (skip complex exprloc)."""
+    loc = member_die.attributes.get('DW_AT_data_member_location')
+    if not loc:
+        return 0
+    # Many compilers encode this as a constant data form
+    if describe_form_class(loc.form) == 'constant':
+        return int(loc.value)
+    # exprloc often means base + const; we keep it simple and skip if not constant
     return None
 
+def dwarf_type_to_str(tname, tenc, tsize):
+    # Map DWARF info to nice C types for display (like screenshot)
+    if tenc == DW_ATE_UNSIGNED and tsize == 4:
+        return "uint32"
+    if tenc == DW_ATE_UNSIGNED and tsize == 2:
+        return "ushort"
+    if tenc == DW_ATE_UNSIGNED and tsize == 1:
+        return "ubyte"
+    if tenc == DW_ATE_SIGNED and tsize == 4:
+        return "int32"
+    if tenc == DW_ATE_SIGNED and tsize == 2:
+        return "short"
+    if tenc == DW_ATE_SIGNED and tsize == 1:
+        return "byte"
+    if tenc == DW_ATE_BOOLEAN:
+        return "bool"
+    return tname
 
-def emit_recursive(prefix, addr, die, rows):
-    """Recursive expansion of structs/arrays into flat variables."""
-    if die is None:
-        return
+def print_variables_table(symmap, dwarf_vars, filter_prefix=None):
+    print(f"{'Name':<60} {'Address':<12} {'Type':<10} {'Byte Size':<8}")
+    print("="*90)
+    for name, meta in sorted(symmap.items(), key=lambda kv: kv[1]['addr']):
+        if filter_prefix and filter_prefix not in name:
+            continue
+        die = dwarf_vars.get(name)
+        addr = f"0x{meta['addr']:08X}"
+        size = meta['size']
+        if not die:
+            print(f"{name:<60} {addr:<12} {'unknown':<10} {size:<8}")
+            continue
+        tdie = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
+        if not tdie:
+            print(f"{name:<60} {addr:<12} {'unknown':<10} {size:<8}")
+            continue
+        base_die = resolve_typedefs(tdie)
+        tname, tsize, tenc = base_type_info(base_die)
+        type_str = dwarf_type_to_str(tname, tenc, tsize)
+        print(f"{name:<60} {addr:<12} {type_str:<10} {tsize if tsize is not None else size:<8}")
 
-    if die.tag == "DW_TAG_structure_type":
-        for child in die.iter_children():
-            if child.tag == "DW_TAG_member" and "DW_AT_name" in child.attributes:
-                mname = child.attributes["DW_AT_name"].value.decode("utf-8")
-                offset = child.attributes["DW_AT_data_member_location"].value
-                emit_recursive(f"{prefix}.{mname}", addr + offset,
-                               child.get_DIE_from_attribute("DW_AT_type"), rows)
-
-    elif die.tag == "DW_TAG_array_type":
-        base_type = die.get_DIE_from_attribute("DW_AT_type")
-        count = 1
-        for c in die.iter_children():
-            if c.tag == "DW_TAG_subrange_type" and "DW_AT_upper_bound" in c.attributes:
-                count = c.attributes["DW_AT_upper_bound"].value + 1
-        elem_size = get_type_size(base_type) or 0
-        for i in range(count):
-            emit_recursive(f"{prefix}._{i}_", addr + i * elem_size, base_type, rows)
-
-    else:
-        tname = get_type_name(die)
-        tsize = get_type_size(die)
-        if tname and tsize:
-            rows.append([prefix, f"0x{addr:08X}", tname, tsize])
-
-
-def process_file(filename, out_csv):
-    with open(filename, "rb") as f:
+def main(path, filter_prefix=None):
+    with open(path, 'rb') as f:
         elf = ELFFile(f)
+        symmap = get_object_symbols(elf)
+
+        if not elf.has_dwarf_info():
+            print_variables_table(symmap, {}, filter_prefix)
+            return
+
         dwarfinfo = elf.get_dwarf_info()
+        dwarf_vars = iter_dwarf_variables(dwarfinfo)
+        print_variables_table(symmap, dwarf_vars, filter_prefix)
 
-        rows = [["Name", "Address", "Type", "Byte Size"]]
-
-        # Step 1: build symbol map (from symtab)
-        symtab = elf.get_section_by_name(".symtab")
-        symmap = {}
-        if symtab:
-            for sym in symtab.iter_symbols():
-                if sym.entry["st_info"]["type"] == "STT_OBJECT":
-                    symmap[sym.name] = sym.entry["st_value"]
-
-        # Step 2: iterate DIEs
-        for cu in dwarfinfo.iter_CUs():
-            for die in cu.iter_DIEs():
-                if die.tag == "DW_TAG_variable" and "DW_AT_name" in die.attributes:
-                    vname = die.attributes["DW_AT_name"].value.decode("utf-8")
-                    if vname not in symmap:
-                        continue
-                    addr = symmap[vname]
-                    emit_recursive(vname, addr,
-                                   die.get_DIE_from_attribute("DW_AT_type"), rows)
-
-        with open(out_csv, "w", newline="") as csvfile:
-            csv.writer(csvfile).writerows(rows)
-
-        print(f"[OK] Wrote {out_csv}, rows={len(rows)-1}")
-
-
-if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print(f"Usage: python {sys.argv[0]} <input.elf> <output.csv>")
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <elf-file> [filter_prefix]")
         sys.exit(1)
-    process_file(sys.argv[1], sys.argv[2])
+    elf_path = sys.argv[1]
+    filter_prefix = sys.argv[2] if len(sys.argv) > 2 else None
+    main(elf_path, filter_prefix)
