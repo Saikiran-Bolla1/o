@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import sys
 import csv
@@ -24,11 +23,12 @@ def get_symbols(elffile):
             continue
         for s in sec.iter_symbols():
             name = s.name
-            if not name: continue
+            if not name:
+                continue
             addr = int(s['st_value'] or 0)
             size = int(s['st_size'] or 0)
             st_type = s['st_info']['type']
-            kind = s['st_info']['type'].lower() if isinstance(s['st_info']['type'], str) else str(s['st_info']['type']).lower()
+            kind = str(st_type).lower()
             out[name] = {'addr': addr, 'size': size, 'kind': kind}
     return out
 
@@ -91,24 +91,42 @@ def dwarf_type_to_str(tname, tenc, tsize):
     if tenc == DW_ATE_BOOLEAN: return "bool"
     return tname
 
-def matches_filter(name, filter_list):
+# Decide if we should EMIT a row for a given fully-qualified name
+# Rules:
+# - Emit if exact match
+# - Emit if the name is a descendant of a filter token (e.g., name starts with "var." or "var._")
+def should_emit(name, filter_list):
     if not filter_list:
         return True
     for f in filter_list:
-        # exact or prefix (struct member or array element)
-        if (
-            name == f
-            or name.startswith(f + ".")
-            or name.startswith(f + "._")
-            or name.startswith(f)
-        ):
+        if name == f:
+            return True
+        if name.startswith(f + "."):
+            return True
+        if name.startswith(f + "._"):
+            return True
+    return False
+
+# Decide if we should TRAVERSE into a symbol's children given only its top-level name
+# Rules:
+# - Traverse if the symbol itself matches emission rules
+# - Traverse if any filter token is a descendant of this symbol (e.g., "var._0_" or "var.member")
+def should_traverse(name, filter_list):
+    if not filter_list:
+        return True
+    for f in filter_list:
+        # emit-case allows traverse too
+        if name == f or name.startswith(f + ".") or name.startswith(f + "._"):
+            return True
+        # descendant case: filter is under this name
+        if f.startswith(name + ".") or f.startswith(name + "._"):
             return True
     return False
 
 def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter_list):
     die = resolve_typedefs(die)
     if not die:
-        if matches_filter(prefix, filter_list):
+        if should_emit(prefix, filter_list):
             row = [prefix, hex(base_addr), "unknown", "", "unknown"]
             rows.append(row)
             symbols_dict[prefix] = {
@@ -126,7 +144,7 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
         elem_die = resolve_typedefs(elem_die)
         etname, esize, etenc = base_type_info(elem_die)
         n = array_len_first_dim(die) or 0
-        if matches_filter(prefix, filter_list):
+        if should_emit(prefix, filter_list):
             row = [prefix, hex(base_addr), f"array[{n}]", esize if esize else "", "array"]
             rows.append(row)
             symbols_dict[prefix] = {
@@ -140,9 +158,10 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
             eaddr = base_addr + i * (esize if esize else 1)
             array_elem_prefix = f"{prefix}._{i}_"
             if elem_die and elem_die.tag in ('DW_TAG_structure_type', 'DW_TAG_array_type'):
+                # always traverse elements; emission will be filtered inside
                 collect_dwarf_struct_vars(array_elem_prefix, eaddr, elem_die, rows, symbols_dict, filter_list)
             else:
-                if matches_filter(array_elem_prefix, filter_list):
+                if should_emit(array_elem_prefix, filter_list):
                     row = [array_elem_prefix, hex(eaddr), dwarf_type_to_str(etname, etenc, esize), esize if esize else "", "array_elem"]
                     rows.append(row)
                     symbols_dict[array_elem_prefix] = {
@@ -154,9 +173,9 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
         return
 
     if tag == 'DW_TAG_structure_type':
-        # record the struct itself
+        # record the struct itself if needed
         tname, tsize, tenc = base_type_info(die)
-        if matches_filter(prefix, filter_list):
+        if should_emit(prefix, filter_list):
             row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
             rows.append(row)
             symbols_dict[prefix] = {
@@ -182,7 +201,7 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
 
     # leaf/base types
     tname, tsize, tenc = base_type_info(die)
-    if matches_filter(prefix, filter_list):
+    if should_emit(prefix, filter_list):
         row = [prefix, hex(base_addr), dwarf_type_to_str(tname, tenc, tsize), tsize if tsize else "", "variable"]
         rows.append(row)
         symbols_dict[prefix] = {
@@ -205,7 +224,8 @@ def main(path, filter_list=None, csv_filename="output.csv"):
         rows = []
         symbols_dict = {}
         for name, meta in sorted(symbols.items(), key=lambda kv: kv[1]['addr']):
-            if filter_list and not matches_filter(name, filter_list):
+            # IMPORTANT: use traversal-aware check so "varname._0_" forces walking "varname"
+            if filter_list and not should_traverse(name, filter_list):
                 continue
             addr = meta['addr']
             found = False
@@ -222,7 +242,7 @@ def main(path, filter_list=None, csv_filename="output.csv"):
                         if tdie:
                             collect_dwarf_struct_vars(name, addr, tdie, rows, symbols_dict, filter_list)
                         else:
-                            if matches_filter(name, filter_list):
+                            if should_emit(name, filter_list):
                                 row = [name, hex(addr), "unknown", "", "unknown"]
                                 rows.append(row)
                                 symbols_dict[name] = {
@@ -249,6 +269,6 @@ if __name__ == '__main__':
     elf_path = sys.argv[1]
     filter_list = None
     if len(sys.argv) > 2 and sys.argv[2]:
-        filter_list = sys.argv[2].split(",")
+        filter_list = [s.strip() for s in sys.argv[2].split(",") if s.strip()]
     csv_filename = sys.argv[3] if len(sys.argv) > 3 else "output.csv"
     symbols_dict = main(elf_path, filter_list, csv_filename)
