@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Update addresses in an A2L file using symbol addresses from an ELF (with DWARF).
+Update and extend A2L files using symbol addresses from an ELF (with DWARF).
 
 What it does:
-- Reads all MEASUREMENT and CHARACTERISTIC blocks from an A2L.
-- Extracts their symbol names (prefers SYMBOL_LINK, falls back to the block name).
-- Uses your symbol collector (with filtering support and names like VarName._0_) to resolve addresses.
-- Updates ECU_ADDRESS (MEASUREMENT) and VALUE (CHARACTERISTIC) lines with the resolved addresses.
-- Writes a new A2L file with updated addresses.
-- Prints console warnings for any symbols that were requested but not found.
+- Updatea2l(olda2l, elf, newa2l):
+  Reads all MEASUREMENT and CHARACTERISTIC blocks, resolves their addresses from the ELF,
+  and writes an updated A2L with corrected ECU_ADDRESS (MEASUREMENT) or VALUE (CHARACTERISTIC).
+- addvariable(olda2l, elf, variablename, vartype, outputfile):
+  Adds a new MEASUREMENT or CHARACTERISTIC block(s) for ALL filtered symbols that are not
+  already present in the A2L. The filter set is:
+    - Every symbol referenced in the existing A2L (via SYMBOL_LINK or block name), plus
+    - The provided 'variablename' token (supporting hierarchical names and array elements like Var._0_).
+  After resolving, addresses for existing blocks are updated, and ALL missing filtered
+  symbols are appended as new blocks using the provided 'vartype' (characteristic|measurement).
 
-Public function:
-- Updatea2l(olda2l, elf, newa2l)
-
-CLI:
-- python3 update_a2l_addresses.py <olda2l> <elf> <newa2l>
-
-Requires:
-- pip install pyelftools
+Notes:
+- Uses hierarchical symbol resolution (supports names like VarName._0_ and Var.Struct.Member).
+- Array elements are named as {prefix}._i_ (with trailing underscore), e.g., MyArray._0_.
+- Prints warnings in console for any filters/symbols that matched nothing.
+- Requires: pip install pyelftools
 """
 
 import sys
@@ -28,7 +29,7 @@ from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
 
 # ----------------------------
-# Copied and aligned to your collector (with ._i_ naming)
+# DWARF / Symbol helpers
 # ----------------------------
 
 MAX_ARRAY = 32
@@ -43,6 +44,7 @@ DW_ATE_UNSIGNED       = 0x07
 DW_ATE_UNSIGNED_CHAR  = 0x08
 
 def get_symbols(elffile):
+    """Return {name: {'addr': int, 'size': int, 'kind': str}} for variables/functions in symbol tables."""
     out = {}
     for secname in ('.symtab', '.dynsym'):
         sec = elffile.get_section_by_name(secname)
@@ -60,6 +62,9 @@ def get_symbols(elffile):
     return out
 
 def resolve_typedefs(die):
+    """Follow DW_AT_type chain until a concrete type tag."""
+    if die is None:
+        return None
     seen = set()
     cur = die
     while cur and cur.offset not in seen:
@@ -75,6 +80,7 @@ def resolve_typedefs(die):
     return cur
 
 def base_type_info(base_die):
+    """Return (type_name, byte_size, encoding) for base/pointer/enum; else (unknown, size, None)."""
     if base_die is None:
         return ('unknown', None, None)
     if base_die.tag == 'DW_TAG_pointer_type':
@@ -93,7 +99,8 @@ def base_type_info(base_die):
     bs = base_die.attributes.get('DW_AT_byte_size')
     return ('unknown', int(bs.value) if bs else None, None)
 
-def array_len_first_dim(array_die):
+def array_len_first_dim(array_die) -> Optional[int]:
+    """Get first dimension length from DW_TAG_array_type."""
     for child in array_die.iter_children():
         if child.tag != 'DW_TAG_subrange_type':
             continue
@@ -144,6 +151,7 @@ def should_traverse(name, filter_list):
     return False
 
 def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter_list, filter_hits):
+    """Recursively collect members/arrays with full hierarchical names using {prefix}._i_ for arrays."""
     die = resolve_typedefs(die)
     if not die:
         if should_emit(prefix, filter_list, filter_hits):
@@ -193,7 +201,7 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
 
     if tag == 'DW_TAG_structure_type':
         # record the struct itself if needed
-        tname, tsize, tenc = base_type_info(die)
+        _, tsize, _ = base_type_info(die)
         if should_emit(prefix, filter_list, filter_hits):
             row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
             rows.append(row)
@@ -232,7 +240,7 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
 
 def build_symbols_dict(elf_path: str, filter_list: Optional[List[str]]) -> Tuple[Dict[str, Dict[str, str]], Set[str]]:
     """
-    Use your collector logic to build a symbols_dict filtered by filter_list.
+    Use the collector logic to build a symbols_dict filtered by filter_list.
     Returns (symbols_dict, missing_filters)
     """
     with open(elf_path, 'rb') as f:
@@ -248,12 +256,11 @@ def build_symbols_dict(elf_path: str, filter_list: Optional[List[str]]) -> Tuple
             print("No filters provided; processing all symbols.")
 
         dwarfinfo = elf.get_dwarf_info()
-        rows = []  # we don't write CSV here, but keep for parity
+        rows = []  # not writing CSV here, but keep for parity
         symbols_dict: Dict[str, Dict[str, str]] = {}
         filter_hits = {f: 0 for f in (filter_list or [])}
 
         for name, meta in sorted(symbols.items(), key=lambda kv: kv[1]['addr']):
-            # Use traversal-aware check so "varname._0_" forces walking "varname"
             if filter_list and not should_traverse(name, filter_list):
                 continue
             addr = meta['addr']
@@ -310,6 +317,7 @@ class A2LBlock:
 MEAS_BEGIN_RE = re.compile(r'^\s*/begin\s+MEASUREMENT\s+(\S+)')
 CHAR_BEGIN_RE = re.compile(r'^\s*/begin\s+CHARACTERISTIC\s+(\S+)')
 SYMBOL_LINK_RE = re.compile(r'^\s*SYMBOL_LINK\s+"([^"]+)"')
+END_BLOCK_RE_TMPL = "/end {}"
 ECU_ADDRESS_RE = re.compile(r'^(\s*ECU_ADDRESS\s+)0x[0-9A-Fa-f]+(.*)$')
 VALUE_ADDR_RE = re.compile(r'^(\s*VALUE\s+)0x[0-9A-Fa-f]+(.*)$')
 
@@ -355,7 +363,7 @@ def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
                     if VALUE_ADDR_RE.match(l2):
                         addr_line_idx = j
 
-                if l2.strip().lower() == f"/end {kind.lower()}":
+                if l2.strip().lower() == END_BLOCK_RE_TMPL.format(kind.lower()):
                     end_idx = j
                     break
                 j += 1
@@ -402,7 +410,6 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
             if m:
                 new_line = f"{m.group(1)}{addr_hex}{m.group(2)}"
             else:
-                # fallback
                 new_line = re.sub(r'^(\s*ECU_ADDRESS\s+).*$',
                                   r'\1' + addr_hex,
                                   old)
@@ -421,20 +428,78 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
     return out_lines, warnings
 
 # ----------------------------
-# Public API
+# Helpers to create new blocks
+# ----------------------------
+
+def _guess_datatype_and_limits(meta: Optional[Dict[str, str]]) -> Tuple[str, str, str, str]:
+    """
+    Guess A2L data keywords and limit ranges from symbol metadata.
+    Returns tuple:
+      (meas_datatype, char_deposit, lower, upper)
+    """
+    t = (meta or {}).get("type", "") if meta else ""
+    t = (t or "").lower()
+    # Defaults
+    meas = "UBYTE"
+    dep = "UByte_Value"
+    lower = "0"
+    upper = "255"
+
+    if t in ("bool",):
+        meas, dep, lower, upper = "UBYTE", "UByte_Value", "0", "1"
+    elif t in ("ubyte", "uint8", "unsigned char"):
+        meas, dep, lower, upper = "UBYTE", "UByte_Value", "0", "255"
+    elif t in ("byte", "int8", "signed char"):
+        meas, dep, lower, upper = "SBYTE", "SByte_Value", "-128", "127"
+    elif t in ("ushort", "uint16", "unsigned short"):
+        meas, dep, lower, upper = "UWORD", "UWord_Value", "0", "65535"
+    elif t in ("short", "int16", "signed short"):
+        meas, dep, lower, upper = "SWORD", "SWord_Value", "-32768", "32767"
+    elif t in ("uint32", "unsigned int", "unsigned long"):
+        meas, dep, lower, upper = "ULONG", "ULong_Value", "0", "4294967295"
+    elif t in ("int32", "signed int", "long", "int"):
+        meas, dep, lower, upper = "SLONG", "SLong_Value", "-2147483648", "2147483647"
+    elif "float" in t:
+        meas, dep, lower, upper = "FLOAT32", "Float_Value", "-3.402823e+38", "3.402823e+38"
+
+    return meas, dep, lower, upper
+
+def _render_new_block(variablename: str, kind: str, addr_hex: str, meta: Optional[Dict[str, str]]) -> List[str]:
+    """
+    Render a minimal A2L block for variablename with given kind ('MEASUREMENT' or 'CHARACTERISTIC').
+    """
+    meas_dt, char_dep, lower, upper = _guess_datatype_and_limits(meta)
+    lines: List[str] = []
+    if kind == "MEASUREMENT":
+        lines.extend([
+            f'/begin MEASUREMENT {variablename} ""\n',
+            f'  {meas_dt} NO_COMPU_METHOD 0 0 {upper}\n',
+            f'  ECU_ADDRESS {addr_hex}\n',
+            f'  SYMBOL_LINK "{variablename}" 0\n',
+            f'/end MEASUREMENT\n',
+        ])
+    else:  # CHARACTERISTIC
+        lines.extend([
+            f'/begin CHARACTERISTIC {variablename} ""\n',
+            f'  VALUE {addr_hex} {char_dep} 0 NO_COMPU_METHOD 0 {upper}\n',
+            f'  SYMBOL_LINK "{variablename}" 0\n',
+            f'/end CHARACTERISTIC\n',
+        ])
+    return lines
+
+# ----------------------------
+# Public APIs
 # ----------------------------
 
 def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
     """
     Read MEASUREMENT and CHARACTERISTIC symbols from olda2l,
-    resolve addresses from elf (DWARF + symtab) using your collector with filtering,
+    resolve addresses from elf (DWARF + symtab) using the collector with filtering,
     and write updated a2l to newa2l.
     """
-    # Read A2L file
     with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 
-    # Parse blocks and build filter list
     blocks, filters = parse_a2l_blocks(lines)
     if not blocks:
         print("No MEASUREMENT or CHARACTERISTIC blocks found in A2L.")
@@ -445,18 +510,12 @@ def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
         for s in filters:
             print(f" - {s}")
 
-    # Build symbol dictionary using your filtering logic
     symbols_dict, missing_filters = build_symbols_dict(elf, filters)
-
-    # Convert to a simple address map for quick lookups
     addr_map = {name: meta["address"] for name, meta in symbols_dict.items()}
-
     print(f"Resolved {len(addr_map)} symbol addresses from ELF/DWARF.")
 
-    # Update lines
     updated_lines, warnings = update_a2l_lines(lines, blocks, addr_map)
 
-    # Emit warnings for missing filters (not found in ELF)
     for w in warnings:
         print("Warning:", w)
     if missing_filters:
@@ -464,22 +523,117 @@ def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
         for s in sorted(missing_filters):
             print(f" - {s}")
 
-    # Write new A2L
     with open(newa2l, "w", encoding="utf-8", errors="ignore") as f:
         f.writelines(updated_lines)
     print(f"Saved updated A2L to: {newa2l}")
+
+def addvariable(olda2l: str, elf: str, variablename: str, vartype: str, outputfile: str) -> None:
+    """
+    Add new variables (ALL filtered, missing from A2L) and update all existing addresses.
+
+    Parameters:
+    - olda2l: path to existing A2L file
+    - elf: path to ELF file (with DWARF)
+    - variablename: fully-qualified filter token to add (supports members/array elements like Var._0_)
+    - vartype: 'characteristic' or 'measurement' (case-insensitive) used for ALL new blocks appended
+    - outputfile: path to write updated A2L
+    """
+    kind = (vartype or "").strip().upper()
+    if kind not in ("CHARACTERISTIC", "MEASUREMENT"):
+        raise ValueError("vartype must be 'characteristic' or 'measurement'")
+
+    with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    # Parse existing blocks and build base filters from A2L
+    blocks, filters = parse_a2l_blocks(lines)
+    existing_symbols = {b.symbol for b in blocks}
+
+    # Add the provided variablename to the filters
+    if variablename and variablename not in filters:
+        filters.append(variablename)
+
+    print(f"Starting 'addvariable' with {len(filters)} filter token(s).")
+    if variablename:
+        print(f"- Added filter token: {variablename}")
+
+    # Resolve all symbols for these filters
+    symbols_dict, missing_filters = build_symbols_dict(elf, filters)
+    addr_map = {name: meta["address"] for name, meta in symbols_dict.items()}
+    print(f"Resolved {len(addr_map)} addresses from ELF.")
+
+    # 1) Update addresses for existing blocks
+    updated_lines, warnings = update_a2l_lines(lines, blocks, addr_map)
+    for w in warnings:
+        print("Warning:", w)
+
+    # 2) Append ALL filtered symbols that are not already present in the A2L
+    #    Skip container-only nodes (struct/array); include leaves like variables and array elements.
+    missing_symbols = [
+        name for name, meta in symbols_dict.items()
+        if name not in existing_symbols and meta.get("kind") not in ("struct", "array")
+    ]
+
+    if not missing_symbols:
+        print("No new filtered symbols to add; only addresses were updated.")
+        with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
+            f.writelines(updated_lines)
+        print(f"Saved updated A2L to: {outputfile}")
+        return
+
+    print(f"Adding {len(missing_symbols)} new {kind} block(s) for filtered symbols not present in A2L.")
+
+    # Ensure file ends with a newline
+    if updated_lines and not updated_lines[-1].endswith("\n"):
+        updated_lines[-1] = updated_lines[-1] + "\n"
+    # Separate with a blank line
+    if updated_lines and updated_lines[-1].strip():
+        updated_lines.append("\n")
+
+    # Append blocks in sorted order for determinism
+    for name in sorted(missing_symbols):
+        meta = symbols_dict.get(name, {})
+        addr_hex = meta.get("address", "0x0")
+        new_block_lines = _render_new_block(name, kind, addr_hex, meta)
+        updated_lines.extend(new_block_lines)
+
+    with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
+        f.writelines(updated_lines)
+    print(f"Appended {len(missing_symbols)} new {kind} block(s) and saved to: {outputfile}")
 
 # ----------------------------
 # CLI
 # ----------------------------
 
 def _main(argv: List[str]) -> int:
-    if len(argv) < 4:
-        print(f"Usage: {argv[0]} <olda2l> <elf> <newa2l>")
+    if len(argv) < 2:
+        print(f"Usage:\n"
+              f"  {argv[0]} update <olda2l> <elf> <newa2l>\n"
+              f"  {argv[0]} add <olda2l> <elf> <variablename> <characteristic|measurement> <outputfile>\n\n"
+              f"Notes:\n"
+              f"- 'add' updates addresses for existing blocks AND appends ALL filtered symbols missing from the A2L.\n"
+              f"- Filters = all symbols referenced in the A2L + the provided variablename.")
         return 1
-    olda2l, elf, newa2l = argv[1], argv[2], argv[3]
-    Updatea2l(olda2l, elf, newa2l)
-    return 0
+
+    cmd = argv[1].lower()
+    if cmd == "update":
+        if len(argv) < 5:
+            print(f"Usage: {argv[0]} update <olda2l> <elf> <newa2l>")
+            return 1
+        _, _, olda2l, elf, newa2l = argv[:5]
+        Updatea2l(olda2l, elf, newa2l)
+        return 0
+
+    if cmd == "add":
+        if len(argv) < 7:
+            print(f"Usage: {argv[0]} add <olda2l> <elf> <variablename> <characteristic|measurement> <outputfile>")
+            return 1
+        _, _, olda2l, elf, variablename, vartype, outputfile = argv[:7]
+        addvariable(olda2l, elf, variablename, vartype, outputfile)
+        return 0
+
+    print(f"Unknown command: {cmd}")
+    return 1
 
 if __name__ == "__main__":
     sys.exit(_main(sys.argv))
