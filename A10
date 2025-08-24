@@ -6,24 +6,35 @@ What it does:
 - Updatea2l(olda2l, elf, newa2l):
   Reads all MEASUREMENT and CHARACTERISTIC blocks, resolves their addresses from the ELF,
   and writes an updated A2L with corrected ECU_ADDRESS (MEASUREMENT) or VALUE (CHARACTERISTIC).
-- addvariable(olda2l, elf, variablename, vartype, outputfile):
-  Adds a new MEASUREMENT or CHARACTERISTIC block(s) for ALL filtered symbols that are not
+
+- addvariable(olda2l, elf, variablenames, vartype, outputfile) -> list[str]:
+  Adds new MEASUREMENT or CHARACTERISTIC block(s) for ALL filtered symbols that are not
   already present in the A2L. The filter set is:
     - Every symbol referenced in the existing A2L (via SYMBOL_LINK or block name), plus
-    - The provided 'variablename' token (supporting hierarchical names and array elements like Var._0_).
-  After resolving, addresses for existing blocks are updated, and ALL missing filtered
-  symbols are appended as new blocks using the provided 'vartype' (characteristic|measurement).
+    - The provided 'variablenames' (accepts a single string, a comma-separated string, or a Python list of strings).
+  Addresses for existing blocks are updated, and ALL missing filtered symbols are inserted
+  directly after the end of the corresponding list in the A2L:
+    - MEASUREMENTs are inserted after the last "/end MEASUREMENT"
+    - CHARACTERISTICs are inserted after the last "/end CHARACTERISTIC"
+  Indentation for new blocks follows the indentation already present in the file.
+  Returns a Python list of variable names that were added.
 
 Notes:
 - Uses hierarchical symbol resolution (supports names like VarName._0_ and Var.Struct.Member).
 - Array elements are named as {prefix}._i_ (with trailing underscore), e.g., MyArray._0_.
 - Prints warnings in console for any filters/symbols that matched nothing.
 - Requires: pip install pyelftools
+
+CLI:
+- Update addresses only:
+    python3 update_a2l_addresses.py update <olda2l> <elf> <newa2l>
+- Add variables (comma-separated list) and update addresses:
+    python3 update_a2l_addresses.py add <olda2l> <elf> <var1,var2,...> <characteristic|measurement> <outputfile>
 """
 
 import sys
 import re
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Tuple, Set, Iterable, Union
 
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
@@ -428,7 +439,7 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
     return out_lines, warnings
 
 # ----------------------------
-# Helpers to create new blocks
+# Helpers to create and insert new blocks
 # ----------------------------
 
 def _guess_datatype_and_limits(meta: Optional[Dict[str, str]]) -> Tuple[str, str, str, str]:
@@ -464,28 +475,69 @@ def _guess_datatype_and_limits(meta: Optional[Dict[str, str]]) -> Tuple[str, str
 
     return meas, dep, lower, upper
 
-def _render_new_block(variablename: str, kind: str, addr_hex: str, meta: Optional[Dict[str, str]]) -> List[str]:
+def _detect_block_indent(lines: List[str], kind: str) -> str:
     """
-    Render a minimal A2L block for variablename with given kind ('MEASUREMENT' or 'CHARACTERISTIC').
+    Inspect existing blocks of 'kind' and return the inner indentation used (default '  ').
+    """
+    begin_pat = f"/begin {kind}"
+    for i, line in enumerate(lines):
+        if line.strip().startswith(begin_pat):
+            # Find next non-empty, non-begin/end line to measure indent
+            j = i + 1
+            while j < len(lines):
+                s = lines[j]
+                st = s.strip()
+                if st and not st.startswith("/end") and not st.startswith("/begin"):
+                    return s[: len(s) - len(s.lstrip(" \t"))]
+                j += 1
+    return "  "
+
+def _render_new_block(variablename: str, kind: str, addr_hex: str, meta: Optional[Dict[str, str]], indent: str) -> List[str]:
+    """
+    Render a minimal A2L block for variablename with given kind ('MEASUREMENT' or 'CHARACTERISTIC'),
+    using provided inner indentation.
     """
     meas_dt, char_dep, lower, upper = _guess_datatype_and_limits(meta)
     lines: List[str] = []
     if kind == "MEASUREMENT":
         lines.extend([
             f'/begin MEASUREMENT {variablename} ""\n',
-            f'  {meas_dt} NO_COMPU_METHOD 0 0 {upper}\n',
-            f'  ECU_ADDRESS {addr_hex}\n',
-            f'  SYMBOL_LINK "{variablename}" 0\n',
+            f'{indent}{meas_dt} NO_COMPU_METHOD 0 0 {upper}\n',
+            f'{indent}ECU_ADDRESS {addr_hex}\n',
+            f'{indent}SYMBOL_LINK "{variablename}" 0\n',
             f'/end MEASUREMENT\n',
         ])
     else:  # CHARACTERISTIC
         lines.extend([
             f'/begin CHARACTERISTIC {variablename} ""\n',
-            f'  VALUE {addr_hex} {char_dep} 0 NO_COMPU_METHOD 0 {upper}\n',
-            f'  SYMBOL_LINK "{variablename}" 0\n',
+            f'{indent}VALUE {addr_hex} {char_dep} 0 NO_COMPU_METHOD 0 {upper}\n',
+            f'{indent}SYMBOL_LINK "{variablename}" 0\n',
             f'/end CHARACTERISTIC\n',
         ])
     return lines
+
+def _find_insert_index(lines: List[str], kind: str) -> int:
+    """
+    Return the index AFTER the last '/end KIND' line. If none, return len(lines).
+    """
+    target = f"/end {kind}".lower()
+    idx = -1
+    for i, line in enumerate(lines):
+        if line.strip().lower() == target:
+            idx = i
+    return (idx + 1) if idx >= 0 else len(lines)
+
+def _insert_blocks_preserving_spacing(lines: List[str], insert_idx: int, new_block_lines: List[str]) -> List[str]:
+    """
+    Insert new_block_lines into lines at insert_idx, adding a single blank line before
+    the inserted content if the preceding line is not blank.
+    """
+    out = list(lines)
+    prefix = []
+    if insert_idx > 0 and out[insert_idx - 1].strip() != "":
+        prefix = ["\n"]
+    out[insert_idx:insert_idx] = prefix + new_block_lines
+    return out
 
 # ----------------------------
 # Public APIs
@@ -527,35 +579,74 @@ def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
         f.writelines(updated_lines)
     print(f"Saved updated A2L to: {newa2l}")
 
-def addvariable(olda2l: str, elf: str, variablename: str, vartype: str, outputfile: str) -> None:
+def _normalize_variablenames(variablenames: Union[str, Iterable[str]]) -> List[str]:
+    """
+    Normalize 'variablenames' to a unique, ordered list of non-empty strings.
+    - If a string is provided, it may be a single name or a comma-separated list.
+    - If an iterable is provided, it will be flattened and stripped.
+    """
+    out: List[str] = []
+    if isinstance(variablenames, str):
+        parts = []
+        # split comma-separated, but also allow whitespace-only single names
+        for token in variablenames.split(","):
+            token = token.strip()
+            if token:
+                parts.append(token)
+        out = parts
+    else:
+        for v in variablenames:
+            if not isinstance(v, str):
+                continue
+            vv = v.strip()
+            if vv:
+                out.append(vv)
+    # Deduplicate preserving order
+    seen = set()
+    unique = []
+    for v in out:
+        if v not in seen:
+            seen.add(v)
+            unique.append(v)
+    return unique
+
+def addvariable(olda2l: str, elf: str, variablenames: Union[str, Iterable[str]], vartype: str, outputfile: str) -> List[str]:
     """
     Add new variables (ALL filtered, missing from A2L) and update all existing addresses.
 
     Parameters:
     - olda2l: path to existing A2L file
     - elf: path to ELF file (with DWARF)
-    - variablename: fully-qualified filter token to add (supports members/array elements like Var._0_)
+    - variablenames: a single name, a comma-separated string, or a list of names
+                     (supports members/array elements like Var._0_)
     - vartype: 'characteristic' or 'measurement' (case-insensitive) used for ALL new blocks appended
     - outputfile: path to write updated A2L
+
+    Returns:
+    - A Python list of variable names that were added to the A2L.
     """
     kind = (vartype or "").strip().upper()
     if kind not in ("CHARACTERISTIC", "MEASUREMENT"):
         raise ValueError("vartype must be 'characteristic' or 'measurement'")
 
+    new_vars = _normalize_variablenames(variablenames)
+
     with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 
     # Parse existing blocks and build base filters from A2L
-    blocks, filters = parse_a2l_blocks(lines)
+    blocks, base_filters = parse_a2l_blocks(lines)
     existing_symbols = {b.symbol for b in blocks}
 
-    # Add the provided variablename to the filters
-    if variablename and variablename not in filters:
-        filters.append(variablename)
+    # Build final filter list: existing A2L symbols + requested new variables
+    filters_set = set(base_filters)
+    for v in new_vars:
+        filters_set.add(v)
+    filters = list(filters_set)
 
     print(f"Starting 'addvariable' with {len(filters)} filter token(s).")
-    if variablename:
-        print(f"- Added filter token: {variablename}")
+    if new_vars:
+        print(f"- Provided variable list: {new_vars}")
 
     # Resolve all symbols for these filters
     symbols_dict, missing_filters = build_symbols_dict(elf, filters)
@@ -579,27 +670,31 @@ def addvariable(olda2l: str, elf: str, variablename: str, vartype: str, outputfi
         with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
             f.writelines(updated_lines)
         print(f"Saved updated A2L to: {outputfile}")
-        return
+        return []
 
     print(f"Adding {len(missing_symbols)} new {kind} block(s) for filtered symbols not present in A2L.")
 
-    # Ensure file ends with a newline
-    if updated_lines and not updated_lines[-1].endswith("\n"):
-        updated_lines[-1] = updated_lines[-1] + "\n"
-    # Separate with a blank line
-    if updated_lines and updated_lines[-1].strip():
-        updated_lines.append("\n")
+    # Determine insertion point and indentation for this kind
+    insert_idx = _find_insert_index(updated_lines, kind)
+    indent = _detect_block_indent(updated_lines, kind)
 
-    # Append blocks in sorted order for determinism
+    # Build blocks with detected indentation
+    new_blocks: List[str] = []
     for name in sorted(missing_symbols):
         meta = symbols_dict.get(name, {})
         addr_hex = meta.get("address", "0x0")
-        new_block_lines = _render_new_block(name, kind, addr_hex, meta)
-        updated_lines.extend(new_block_lines)
+        new_block_lines = _render_new_block(name, kind, addr_hex, meta, indent)
+        new_blocks.extend(new_block_lines)
+
+    # Insert blocks right after the end of the chosen list, preserving surrounding spacing
+    final_lines = _insert_blocks_preserving_spacing(updated_lines, insert_idx, new_blocks)
 
     with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
-        f.writelines(updated_lines)
-    print(f"Appended {len(missing_symbols)} new {kind} block(s) and saved to: {outputfile}")
+        f.writelines(final_lines)
+    print(f"Appended {len(missing_symbols)} new {kind} block(s) after the {kind} list and saved to: {outputfile}")
+
+    # Return the list of variables added (as requested: keep variables as a list)
+    return sorted(missing_symbols)
 
 # ----------------------------
 # CLI
@@ -609,10 +704,11 @@ def _main(argv: List[str]) -> int:
     if len(argv) < 2:
         print(f"Usage:\n"
               f"  {argv[0]} update <olda2l> <elf> <newa2l>\n"
-              f"  {argv[0]} add <olda2l> <elf> <variablename> <characteristic|measurement> <outputfile>\n\n"
+              f"  {argv[0]} add <olda2l> <elf> <var1,var2,...|@listfile|single> <characteristic|measurement> <outputfile>\n\n"
               f"Notes:\n"
-              f"- 'add' updates addresses for existing blocks AND appends ALL filtered symbols missing from the A2L.\n"
-              f"- Filters = all symbols referenced in the A2L + the provided variablename.")
+              f"- 'add' updates addresses for existing blocks AND appends ALL filtered symbols missing from the A2L,\n"
+              f"  inserting them after the end of the corresponding list while preserving indentation.\n"
+              f"- 'var1,var2,...' is a comma-separated list. Example: MyVar,MyStruct.Field,MyArray._0_")
         return 1
 
     cmd = argv[1].lower()
@@ -626,10 +722,13 @@ def _main(argv: List[str]) -> int:
 
     if cmd == "add":
         if len(argv) < 7:
-            print(f"Usage: {argv[0]} add <olda2l> <elf> <variablename> <characteristic|measurement> <outputfile>")
+            print(f"Usage: {argv[0]} add <olda2l> <elf> <var1,var2,...> <characteristic|measurement> <outputfile>")
             return 1
-        _, _, olda2l, elf, variablename, vartype, outputfile = argv[:7]
-        addvariable(olda2l, elf, variablename, vartype, outputfile)
+        _, _, olda2l, elf, vararg, vartype, outputfile = argv[:7]
+        # Support comma-separated list
+        variablenames = [v.strip() for v in vararg.split(",") if v.strip()]
+        added = addvariable(olda2l, elf, variablenames, vartype, outputfile)
+        print("Added variables list:", added)
         return 0
 
     print(f"Unknown command: {cmd}")
