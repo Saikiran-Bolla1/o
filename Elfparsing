@@ -16,7 +16,6 @@ DW_ATE_UNSIGNED       = 0x07
 DW_ATE_UNSIGNED_CHAR  = 0x08
 
 def get_symbols(elffile):
-    """Return {name: {'addr': int, 'size': int, 'kind': str}} for variables/functions in symbol tables."""
     out = {}
     for secname in ('.symtab', '.dynsym'):
         sec = elffile.get_section_by_name(secname)
@@ -33,7 +32,6 @@ def get_symbols(elffile):
     return out
 
 def resolve_typedefs(die):
-    """Follow DW_AT_type chain until a concrete type tag."""
     seen = set()
     cur = die
     while cur and cur.offset not in seen:
@@ -49,7 +47,6 @@ def resolve_typedefs(die):
     return cur
 
 def base_type_info(base_die):
-    """Return (type_name, byte_size, encoding) for a DW_TAG_base_type or pointer; else (unknown, size, None)."""
     if base_die is None:
         return ('unknown', None, None)
     if base_die.tag == 'DW_TAG_pointer_type':
@@ -69,7 +66,6 @@ def base_type_info(base_die):
     return ('unknown', int(bs.value) if bs else None, None)
 
 def array_len_first_dim(array_die):
-    """Get first dimension length from DW_TAG_array_type."""
     for child in array_die.iter_children():
         if child.tag != 'DW_TAG_subrange_type':
             continue
@@ -94,64 +90,72 @@ def dwarf_type_to_str(tname, tenc, tsize):
     if tenc == DW_ATE_BOOLEAN: return "bool"
     return tname
 
-def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict):
-    """Recursively collect all members, arrays, and fields with full hierarchical name. Also populate symbols_dict."""
+def matches_filter(name, filter_list):
+    if not filter_list:
+        return True
+    for f in filter_list:
+        if name == f or name.startswith(f + ".") or name.startswith(f + "_") or name.startswith(f):
+            return True
+    return False
+
+def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter_list):
     die = resolve_typedefs(die)
     if not die:
-        row = [prefix, hex(base_addr), "unknown", "", "unknown"]
-        rows.append(row)
-        symbols_dict[prefix] = {
-            "address": hex(base_addr),
-            "type": "unknown",
-            "byte_size": "",
-            "kind": "unknown"
-        }
+        if matches_filter(prefix, filter_list):
+            row = [prefix, hex(base_addr), "unknown", "", "unknown"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "unknown",
+                "byte_size": "",
+                "kind": "unknown"
+            }
         return
 
     tag = die.tag
 
     if tag == 'DW_TAG_array_type':
-        # Add the top-level array itself
         elem_die = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
         elem_die = resolve_typedefs(elem_die)
         etname, esize, etenc = base_type_info(elem_die)
         n = array_len_first_dim(die) or 0
-        row = [prefix, hex(base_addr), f"array[{n}]", esize if esize else "", "array"]
-        rows.append(row)
-        symbols_dict[prefix] = {
-            "address": hex(base_addr),
-            "type": f"array[{n}]",
-            "byte_size": esize if esize else "",
-            "kind": "array"
-        }
+        if matches_filter(prefix, filter_list):
+            row = [prefix, hex(base_addr), f"array[{n}]", esize if esize else "", "array"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": f"array[{n}]",
+                "byte_size": esize if esize else "",
+                "kind": "array"
+            }
         n_print = min(n, MAX_ARRAY)
         for i in range(n_print):
             eaddr = base_addr + i * (esize if esize else 1)
-            # Recursively collect element members if struct/array
             if elem_die and elem_die.tag in ('DW_TAG_structure_type', 'DW_TAG_array_type'):
-                collect_dwarf_struct_vars(f"{prefix}_{i}_", eaddr, elem_die, rows, symbols_dict)
+                collect_dwarf_struct_vars(f"{prefix}_{i}_", eaddr, elem_die, rows, symbols_dict, filter_list)
             else:
-                row = [f"{prefix}_{i}_", hex(eaddr), dwarf_type_to_str(etname, etenc, esize), esize if esize else "", "array_elem"]
-                rows.append(row)
-                symbols_dict[f"{prefix}_{i}_"] = {
-                    "address": hex(eaddr),
-                    "type": dwarf_type_to_str(etname, etenc, esize),
-                    "byte_size": esize if esize else "",
-                    "kind": "array_elem"
-                }
+                if matches_filter(f"{prefix}_{i}_", filter_list):
+                    row = [f"{prefix}_{i}_", hex(eaddr), dwarf_type_to_str(etname, etenc, esize), esize if esize else "", "array_elem"]
+                    rows.append(row)
+                    symbols_dict[f"{prefix}_{i}_"] = {
+                        "address": hex(eaddr),
+                        "type": dwarf_type_to_str(etname, etenc, esize),
+                        "byte_size": esize if esize else "",
+                        "kind": "array_elem"
+                    }
         return
 
     if tag == 'DW_TAG_structure_type':
-        # Add the top-level struct itself
         tname, tsize, tenc = base_type_info(die)
-        row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
-        rows.append(row)
-        symbols_dict[prefix] = {
-            "address": hex(base_addr),
-            "type": "struct",
-            "byte_size": tsize if tsize else "",
-            "kind": "struct"
-        }
+        if matches_filter(prefix, filter_list):
+            row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "struct",
+                "byte_size": tsize if tsize else "",
+                "kind": "struct"
+            }
         for child in die.iter_children():
             if child.tag != 'DW_TAG_member':
                 continue
@@ -164,19 +168,19 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict):
             mt = child.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in child.attributes else None
             if not mt:
                 continue
-            collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr + off, mt, rows, symbols_dict)
+            collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr + off, mt, rows, symbols_dict, filter_list)
         return
 
-    # For base/pointer types, add leaf
     tname, tsize, tenc = base_type_info(die)
-    row = [prefix, hex(base_addr), dwarf_type_to_str(tname, tenc, tsize), tsize if tsize else "", "variable"]
-    rows.append(row)
-    symbols_dict[prefix] = {
-        "address": hex(base_addr),
-        "type": dwarf_type_to_str(tname, tenc, tsize),
-        "byte_size": tsize if tsize else "",
-        "kind": "variable"
-    }
+    if matches_filter(prefix, filter_list):
+        row = [prefix, hex(base_addr), dwarf_type_to_str(tname, tenc, tsize), tsize if tsize else "", "variable"]
+        rows.append(row)
+        symbols_dict[prefix] = {
+            "address": hex(base_addr),
+            "type": dwarf_type_to_str(tname, tenc, tsize),
+            "byte_size": tsize if tsize else "",
+            "kind": "variable"
+        }
 
 def main(path, filter_list=None, csv_filename="output.csv"):
     with open(path, 'rb') as f:
@@ -191,11 +195,9 @@ def main(path, filter_list=None, csv_filename="output.csv"):
         rows = []
         symbols_dict = {}
         for name, meta in sorted(symbols.items(), key=lambda kv: kv[1]['addr']):
-            # Filter by list of symbols if provided
-            if filter_list and name not in filter_list:
+            if filter_list and not matches_filter(name, filter_list):
                 continue
             addr = meta['addr']
-            # Find matching variable in DWARF
             found = False
             for cu in dwarfinfo.iter_CUs():
                 for die in cu.iter_DIEs():
@@ -208,30 +210,26 @@ def main(path, filter_list=None, csv_filename="output.csv"):
                     if vname == name:
                         tdie = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
                         if tdie:
-                            collect_dwarf_struct_vars(name, addr, tdie, rows, symbols_dict)
+                            collect_dwarf_struct_vars(name, addr, tdie, rows, symbols_dict, filter_list)
                         else:
-                            row = [name, hex(addr), "unknown", "", "unknown"]
-                            rows.append(row)
-                            symbols_dict[name] = {
-                                "address": hex(addr),
-                                "type": "unknown",
-                                "byte_size": "",
-                                "kind": "unknown"
-                            }
+                            if matches_filter(name, filter_list):
+                                row = [name, hex(addr), "unknown", "", "unknown"]
+                                rows.append(row)
+                                symbols_dict[name] = {
+                                    "address": hex(addr),
+                                    "type": "unknown",
+                                    "byte_size": "",
+                                    "kind": "unknown"
+                                }
                         found = True
                         break
                 if found:
                     break
-        # Write to CSV
         with open(csv_filename, "w", newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(["Name", "Address", "Type", "Byte Size", "Kind"])
             writer.writerows(rows)
         print(f"Saved to {csv_filename}")
-        # Optionally: Save symbols_dict as a JSON file or print it
-        # import json
-        # with open("symbols_dict.json", "w") as jsonfile:
-        #     json.dump(symbols_dict, jsonfile, indent=2)
         return symbols_dict
 
 if __name__ == '__main__':
@@ -244,5 +242,3 @@ if __name__ == '__main__':
         filter_list = sys.argv[2].split(",")
     csv_filename = sys.argv[3] if len(sys.argv) > 3 else "output.csv"
     symbols_dict = main(elf_path, filter_list, csv_filename)
-    # Optionally print dictionary
-    # import pprint; pprint.pprint(symbols_dict)
