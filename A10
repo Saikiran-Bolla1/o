@@ -22,6 +22,10 @@ New in this version:
   (e.g., 0x1a2b -> 0x1A2B), both for updated values and any existing ones in the file.
 - addvariable accepts a list of variable names and will append ALL filtered symbols (leaves)
   missing from the A2L.
+- Placement rule: when adding new variables, MEASUREMENT blocks are inserted immediately
+  after the last existing MEASUREMENT block; CHARACTERISTIC blocks are inserted immediately
+  after the last existing CHARACTERISTIC block. One blank line is kept between each new block
+  and there is one blank line before the first inserted block if needed.
 
 Notes:
 - Uses hierarchical symbol resolution (supports names like VarName._0_ and Var.Struct.Member).
@@ -498,7 +502,7 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
     return out_lines, warnings
 
 # ----------------------------
-# Helpers to create new blocks
+# Helpers to create new blocks and placement
 # ----------------------------
 
 def _guess_datatype_and_limits(meta: Optional[Dict[str, str]]) -> Tuple[str, str, str, str]:
@@ -559,6 +563,55 @@ def _render_new_block(variablename: str, kind: str, addr_hex: str, meta: Optiona
         ])
     return lines
 
+def _normalize_variablename_input(variablename: Union[str, List[str]]) -> List[str]:
+    """
+    Accepts:
+      - a list/tuple/set of names
+      - a comma-separated string "A,B,C"
+      - a Python/JSON-like list string '["A","B"]'
+      - a single string "A"
+    Returns a deduplicated list of trimmed names.
+    """
+    names: List[str] = []
+    if isinstance(variablename, (list, tuple, set)):
+        names = [str(x).strip() for x in variablename if str(x).strip()]
+    elif isinstance(variablename, str):
+        s = variablename.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, (list, tuple, set)):
+                    names = [str(x).strip() for x in parsed if str(x).strip()]
+                else:
+                    names = [s]
+            except Exception:
+                names = [p.strip() for p in s.strip("[]").split(",") if p.strip()]
+        elif "," in s:
+            names = [p.strip() for p in s.split(",") if p.strip()]
+        elif s:
+            names = [s]
+    # Deduplicate preserving order
+    seen = set()
+    uniq = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+def _find_insert_position_after_kind(lines: List[str], blocks: List[A2LBlock], kind: str) -> int:
+    """
+    Returns the line index to insert new blocks right after the last existing block of 'kind'.
+    If none exist, returns len(lines) to append at the end.
+    """
+    last_end = -1
+    for b in blocks:
+        if b.kind == kind and b.end_idx > last_end:
+            last_end = b.end_idx
+    if last_end >= 0:
+        return last_end + 1
+    return len(lines)
+
 # ----------------------------
 # Public APIs
 # ----------------------------
@@ -601,45 +654,14 @@ def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
         f.writelines(updated_lines)
     print(f"Saved updated A2L to: {newa2l}")
 
-def _normalize_variablename_input(variablename: Union[str, List[str]]) -> List[str]:
-    """
-    Accepts:
-      - a list/tuple/set of names
-      - a comma-separated string "A,B,C"
-      - a Python/JSON-like list string '["A","B"]'
-      - a single string "A"
-    Returns a deduplicated list of trimmed names.
-    """
-    names: List[str] = []
-    if isinstance(variablename, (list, tuple, set)):
-        names = [str(x).strip() for x in variablename if str(x).strip()]
-    elif isinstance(variablename, str):
-        s = variablename.strip()
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                parsed = ast.literal_eval(s)
-                if isinstance(parsed, (list, tuple, set)):
-                    names = [str(x).strip() for x in parsed if str(x).strip()]
-                else:
-                    names = [s]
-            except Exception:
-                names = [p.strip() for p in s.strip("[]").split(",") if p.strip()]
-        elif "," in s:
-            names = [p.strip() for p in s.split(",") if p.strip()]
-        elif s:
-            names = [s]
-    # Deduplicate preserving order
-    seen = set()
-    uniq = []
-    for n in names:
-        if n not in seen:
-            seen.add(n)
-            uniq.append(n)
-    return uniq
-
 def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vartype: str, outputfile: str) -> None:
     """
     Add new variables (ALL filtered, missing from A2L) and update all existing addresses.
+
+    Placement:
+    - MEASUREMENT additions are inserted right after the last existing MEASUREMENT block.
+    - CHARACTERISTIC additions are inserted right after the last existing CHARACTERISTIC block.
+    - Ensure exactly one blank line between new blocks, and one blank line before the first inserted block if needed.
 
     Parameters:
     - olda2l: path to existing A2L file
@@ -696,26 +718,43 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
 
     print(f"Adding {len(missing_symbols)} new {kind} block(s) for filtered symbols not present in A2L.")
 
-    # Ensure file ends with a newline
-    if updated_lines and not updated_lines[-1].endswith("\n"):
-        updated_lines[-1] = updated_lines[-1] + "\n"
-    # Separate with a blank line
-    if updated_lines and updated_lines[-1].strip():
-        updated_lines.append("\n")
-
-    # Append blocks in sorted order for determinism
-    for name in sorted(missing_symbols):
+    # Build the block text with one blank line between blocks
+    insert_lines: List[str] = []
+    for idx, name in enumerate(sorted(missing_symbols)):
         meta = symbols_dict.get(name, {})
         addr_hex = to_upper_hex(meta.get("address", "0x0"))
-        new_block_lines = _render_new_block(name, kind, addr_hex, meta)
-        updated_lines.extend(new_block_lines)
+        block_lines = _render_new_block(name, kind, addr_hex, meta)
+        insert_lines.extend(block_lines)
+        if idx != len(missing_symbols) - 1:
+            insert_lines.append("\n")  # one blank line between new variables
 
-    # As a final pass, ensure uppercase hex on known keywords
+    # Find insertion point after the last block of the given kind
+    insert_idx = _find_insert_position_after_kind(updated_lines, blocks, kind)
+
+    # Ensure exactly one blank line before the first inserted block (if not at start)
+    if insert_idx > 0:
+        prev_line = updated_lines[insert_idx - 1]
+        if prev_line.strip() != "":
+            updated_lines[insert_idx:insert_idx] = ["\n"]
+            insert_idx += 1
+        else:
+            # If there are multiple blank lines, collapse to a single one
+            # Remove extra blank lines directly before insert_idx leaving one
+            k = insert_idx - 1
+            while k - 1 >= 0 and updated_lines[k - 1].strip() == "":
+                del updated_lines[k - 1]
+                insert_idx -= 1
+                k -= 1
+
+    # Insert the new blocks at the computed position
+    updated_lines[insert_idx:insert_idx] = insert_lines
+
+    # Final pass: ensure uppercase hex on known keywords everywhere
     updated_lines = force_uppercase_known_address_keywords(updated_lines)
 
     with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
         f.writelines(updated_lines)
-    print(f"Appended {len(missing_symbols)} new {kind} block(s) and saved to: {outputfile}")
+    print(f"Appended {len(missing_symbols)} new {kind} block(s) after last {kind} section and saved to: {outputfile}")
 
 # ----------------------------
 # CLI
@@ -730,6 +769,7 @@ def _main(argv: List[str]) -> int:
               f"- 'add' updates addresses for existing blocks AND appends ALL filtered symbols missing from the A2L.\n"
               f"- Filters = all symbols referenced in the A2L + provided variablename(s).\n"
               f"- variablename can be a comma-separated list (A,B,C) or a JSON-like list string (e.g., [\"A\",\"B\"]).\n"
+              f"- New MEASUREMENT/CHARACTERISTIC blocks are inserted right after the last block of the same kind.\n"
               f"- All ECU_ADDRESS/ADDRESS/VALUE addresses are emitted in uppercase hex.")
         return 1
 
