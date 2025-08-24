@@ -131,13 +131,14 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
         n_print = min(n, MAX_ARRAY)
         for i in range(n_print):
             eaddr = base_addr + i * (esize if esize else 1)
+            array_elem_prefix = f"{prefix}._{i}"
             if elem_die and elem_die.tag in ('DW_TAG_structure_type', 'DW_TAG_array_type'):
-                collect_dwarf_struct_vars(f"{prefix}_{i}_", eaddr, elem_die, rows, symbols_dict, filter_list)
+                collect_dwarf_struct_vars(array_elem_prefix, eaddr, elem_die, rows, symbols_dict, filter_list)
             else:
-                if matches_filter(f"{prefix}_{i}_", filter_list):
-                    row = [f"{prefix}_{i}_", hex(eaddr), dwarf_type_to_str(etname, etenc, esize), esize if esize else "", "array_elem"]
+                if matches_filter(array_elem_prefix, filter_list):
+                    row = [array_elem_prefix, hex(eaddr), dwarf_type_to_str(etname, etenc, esize), esize if esize else "", "array_elem"]
                     rows.append(row)
-                    symbols_dict[f"{prefix}_{i}_"] = {
+                    symbols_dict[array_elem_prefix] = {
                         "address": hex(eaddr),
                         "type": dwarf_type_to_str(etname, etenc, esize),
                         "byte_size": esize if esize else "",
