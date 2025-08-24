@@ -1,8 +1,35 @@
 #!/usr/bin/env python3
+"""
+Update addresses in an A2L file using symbol addresses from an ELF (with DWARF).
+
+What it does:
+- Reads all MEASUREMENT and CHARACTERISTIC blocks from an A2L.
+- Extracts their symbol names (prefers SYMBOL_LINK, falls back to the block name).
+- Uses your symbol collector (with filtering support and names like VarName._0_) to resolve addresses.
+- Updates ECU_ADDRESS (MEASUREMENT) and VALUE (CHARACTERISTIC) lines with the resolved addresses.
+- Writes a new A2L file with updated addresses.
+- Prints console warnings for any symbols that were requested but not found.
+
+Public function:
+- Updatea2l(olda2l, elf, newa2l)
+
+CLI:
+- python3 update_a2l_addresses.py <olda2l> <elf> <newa2l>
+
+Requires:
+- pip install pyelftools
+"""
+
 import sys
-import csv
+import re
+from typing import List, Dict, Optional, Tuple, Set
+
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
+
+# ----------------------------
+# Copied and aligned to your collector (with ._i_ naming)
+# ----------------------------
 
 MAX_ARRAY = 32
 
@@ -16,7 +43,6 @@ DW_ATE_UNSIGNED       = 0x07
 DW_ATE_UNSIGNED_CHAR  = 0x08
 
 def get_symbols(elffile):
-    """Return {name: {'addr': int, 'size': int, 'kind': str}} for variables/functions in symbol tables."""
     out = {}
     for secname in ('.symtab', '.dynsym'):
         sec = elffile.get_section_by_name(secname)
@@ -24,16 +50,16 @@ def get_symbols(elffile):
             continue
         for s in sec.iter_symbols():
             name = s.name
-            if not name: continue
+            if not name:
+                continue
             addr = int(s['st_value'] or 0)
             size = int(s['st_size'] or 0)
             st_type = s['st_info']['type']
-            kind = st_type.lower()
+            kind = st_type.lower() if isinstance(st_type, str) else str(st_type).lower()
             out[name] = {'addr': addr, 'size': size, 'kind': kind}
     return out
 
 def resolve_typedefs(die):
-    """Follow DW_AT_type chain until a concrete type tag."""
     seen = set()
     cur = die
     while cur and cur.offset not in seen:
@@ -49,7 +75,6 @@ def resolve_typedefs(die):
     return cur
 
 def base_type_info(base_die):
-    """Return (type_name, byte_size, encoding) for a DW_TAG_base_type or pointer; else (unknown, size, None)."""
     if base_die is None:
         return ('unknown', None, None)
     if base_die.tag == 'DW_TAG_pointer_type':
@@ -69,7 +94,6 @@ def base_type_info(base_die):
     return ('unknown', int(bs.value) if bs else None, None)
 
 def array_len_first_dim(array_die):
-    """Get first dimension length from DW_TAG_array_type."""
     for child in array_die.iter_children():
         if child.tag != 'DW_TAG_subrange_type':
             continue
@@ -94,11 +118,43 @@ def dwarf_type_to_str(tname, tenc, tsize):
     if tenc == DW_ATE_BOOLEAN: return "bool"
     return tname
 
-def collect_dwarf_struct_vars(prefix, base_addr, die, rows):
-    """Recursively collect all members, arrays, and fields with full hierarchical name."""
+# Decide if we should EMIT a row for a given fully-qualified name.
+# Also record which filter tokens actually matched a real symbol.
+def should_emit(name, filter_list, filter_hits):
+    if not filter_list:
+        return True
+    matched = False
+    for f in filter_list:
+        if name == f or name.startswith(f + ".") or name.startswith(f + "._"):
+            matched = True
+            if filter_hits is not None and f in filter_hits:
+                filter_hits[f] += 1
+    return matched
+
+# Decide if we should TRAVERSE a top-level symbol for potential descendants.
+# Note: traversal does NOT count as a "hit"; we only count actual emitted names.
+def should_traverse(name, filter_list):
+    if not filter_list:
+        return True
+    for f in filter_list:
+        if name == f or name.startswith(f + ".") or name.startswith(f + "._"):
+            return True
+        if f.startswith(name + ".") or f.startswith(name + "._"):
+            return True
+    return False
+
+def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter_list, filter_hits):
     die = resolve_typedefs(die)
     if not die:
-        rows.append([prefix, hex(base_addr), "unknown", "", "unknown"])
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), "unknown", "", "unknown"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "unknown",
+                "byte_size": "",
+                "kind": "unknown"
+            }
         return
 
     tag = die.tag
@@ -108,18 +164,45 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows):
         elem_die = resolve_typedefs(elem_die)
         etname, esize, etenc = base_type_info(elem_die)
         n = array_len_first_dim(die) or 0
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), f"array[{n}]", esize if esize else "", "array"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": f"array[{n}]",
+                "byte_size": esize if esize else "",
+                "kind": "array"
+            }
         n_print = min(n, MAX_ARRAY)
         for i in range(n_print):
             eaddr = base_addr + i * (esize if esize else 1)
-            # Recursively collect element members if struct/array
+            array_elem_prefix = f"{prefix}._{i}_"
             if elem_die and elem_die.tag in ('DW_TAG_structure_type', 'DW_TAG_array_type'):
-                collect_dwarf_struct_vars(f"{prefix}_{i}_", eaddr, elem_die, rows)
+                collect_dwarf_struct_vars(array_elem_prefix, eaddr, elem_die, rows, symbols_dict, filter_list, filter_hits)
             else:
-                rows.append([f"{prefix}_{i}_", hex(eaddr), dwarf_type_to_str(etname, etenc, esize), esize if esize else "", "array_elem"])
-        rows.append([prefix, hex(base_addr), f"array[{n}]", esize if esize else "", "array"])
+                if should_emit(array_elem_prefix, filter_list, filter_hits):
+                    row = [array_elem_prefix, hex(eaddr), dwarf_type_to_str(etname, etenc, esize), esize if esize else "", "array_elem"]
+                    rows.append(row)
+                    symbols_dict[array_elem_prefix] = {
+                        "address": hex(eaddr),
+                        "type": dwarf_type_to_str(etname, etenc, esize),
+                        "byte_size": esize if esize else "",
+                        "kind": "array_elem"
+                    }
         return
 
     if tag == 'DW_TAG_structure_type':
+        # record the struct itself if needed
+        tname, tsize, tenc = base_type_info(die)
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "struct",
+                "byte_size": tsize if tsize else "",
+                "kind": "struct"
+            }
         for child in die.iter_children():
             if child.tag != 'DW_TAG_member':
                 continue
@@ -132,29 +215,48 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows):
             mt = child.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in child.attributes else None
             if not mt:
                 continue
-            collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr + off, mt, rows)
+            collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr + off, mt, rows, symbols_dict, filter_list, filter_hits)
         return
 
-    # For base/pointer types, add leaf
+    # leaf/base types
     tname, tsize, tenc = base_type_info(die)
-    rows.append([prefix, hex(base_addr), dwarf_type_to_str(tname, tenc, tsize), tsize if tsize else "", "variable"])
+    if should_emit(prefix, filter_list, filter_hits):
+        row = [prefix, hex(base_addr), dwarf_type_to_str(tname, tenc, tsize), tsize if tsize else "", "variable"]
+        rows.append(row)
+        symbols_dict[prefix] = {
+            "address": hex(base_addr),
+            "type": dwarf_type_to_str(tname, tenc, tsize),
+            "byte_size": tsize if tsize else "",
+            "kind": "variable"
+        }
 
-def main(path, filter_prefix=None, csv_filename="output.csv"):
-    with open(path, 'rb') as f:
+def build_symbols_dict(elf_path: str, filter_list: Optional[List[str]]) -> Tuple[Dict[str, Dict[str, str]], Set[str]]:
+    """
+    Use your collector logic to build a symbols_dict filtered by filter_list.
+    Returns (symbols_dict, missing_filters)
+    """
+    with open(elf_path, 'rb') as f:
         elf = ELFFile(f)
         symbols = get_symbols(elf)
 
         if not elf.has_dwarf_info():
-            print("No DWARF info found in ELF file.")
-            sys.exit(1)
+            raise RuntimeError("No DWARF info found in ELF file.")
+
+        if filter_list and len(filter_list) > 0:
+            print("Filters provided:", ", ".join(filter_list))
+        else:
+            print("No filters provided; processing all symbols.")
 
         dwarfinfo = elf.get_dwarf_info()
-        rows = []
+        rows = []  # we don't write CSV here, but keep for parity
+        symbols_dict: Dict[str, Dict[str, str]] = {}
+        filter_hits = {f: 0 for f in (filter_list or [])}
+
         for name, meta in sorted(symbols.items(), key=lambda kv: kv[1]['addr']):
-            if filter_prefix and filter_prefix not in name:
+            # Use traversal-aware check so "varname._0_" forces walking "varname"
+            if filter_list and not should_traverse(name, filter_list):
                 continue
             addr = meta['addr']
-            # Find matching variable in DWARF
             found = False
             for cu in dwarfinfo.iter_CUs():
                 for die in cu.iter_DIEs():
@@ -167,25 +269,217 @@ def main(path, filter_prefix=None, csv_filename="output.csv"):
                     if vname == name:
                         tdie = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
                         if tdie:
-                            collect_dwarf_struct_vars(name, addr, tdie, rows)
+                            collect_dwarf_struct_vars(name, addr, tdie, rows, symbols_dict, filter_list, filter_hits)
                         else:
-                            rows.append([name, hex(addr), "unknown", "", "unknown"])
+                            if should_emit(name, filter_list, filter_hits):
+                                symbols_dict[name] = {
+                                    "address": hex(addr),
+                                    "type": "unknown",
+                                    "byte_size": "",
+                                    "kind": "unknown"
+                                }
                         found = True
                         break
                 if found:
                     break
-        # Write to CSV
-        with open(csv_filename, "w", newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(["Name", "Address", "Type", "Byte Size", "Kind"])
-            writer.writerows(rows)
-        print(f"Saved to {csv_filename}")
 
-if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <elf-file> [filter_prefix] [csv_filename]")
-        sys.exit(1)
-    elf_path = sys.argv[1]
-    filter_prefix = sys.argv[2] if len(sys.argv) > 2 else None
-    csv_filename = sys.argv[3] if len(sys.argv) > 3 else "output.csv"
-    main(elf_path, filter_prefix, csv_filename)
+        unmatched = {f for f, c in filter_hits.items() if c == 0}
+        if filter_list:
+            if unmatched:
+                print("Warning: the following filters matched no symbols:")
+                for f in unmatched:
+                    print(f" - {f}")
+            else:
+                print("All filters matched at least one symbol.")
+
+        return symbols_dict, unmatched
+
+# ----------------------------
+# A2L parsing and updating
+# ----------------------------
+
+class A2LBlock:
+    def __init__(self, kind: str, name: str, symbol: str, begin_idx: int, end_idx: int, addr_line_idx: Optional[int]):
+        self.kind = kind  # "MEASUREMENT" or "CHARACTERISTIC"
+        self.name = name
+        self.symbol = symbol  # SYMBOL_LINK if present, else block name
+        self.begin_idx = begin_idx
+        self.end_idx = end_idx
+        self.addr_line_idx = addr_line_idx
+
+MEAS_BEGIN_RE = re.compile(r'^\s*/begin\s+MEASUREMENT\s+(\S+)')
+CHAR_BEGIN_RE = re.compile(r'^\s*/begin\s+CHARACTERISTIC\s+(\S+)')
+SYMBOL_LINK_RE = re.compile(r'^\s*SYMBOL_LINK\s+"([^"]+)"')
+ECU_ADDRESS_RE = re.compile(r'^(\s*ECU_ADDRESS\s+)0x[0-9A-Fa-f]+(.*)$')
+VALUE_ADDR_RE = re.compile(r'^(\s*VALUE\s+)0x[0-9A-Fa-f]+(.*)$')
+
+def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
+    """
+    Parse A2L lines and return list of blocks with their symbol names and positions.
+    Also return a list of symbols (filters) to look up.
+    Preference: use SYMBOL_LINK if available, otherwise the block name.
+    """
+    blocks: List[A2LBlock] = []
+    filters: List[str] = []
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+
+        m_meas = MEAS_BEGIN_RE.match(line)
+        m_char = CHAR_BEGIN_RE.match(line)
+
+        if m_meas or m_char:
+            kind = "MEASUREMENT" if m_meas else "CHARACTERISTIC"
+            name = (m_meas or m_char).group(1)
+            begin_idx = i
+            symbol_name = name
+            addr_line_idx: Optional[int] = None
+
+            # find end of block
+            j = i + 1
+            end_idx = None
+            while j < n:
+                l2 = lines[j]
+                # capture SYMBOL_LINK if present
+                m_sym = SYMBOL_LINK_RE.match(l2)
+                if m_sym:
+                    symbol_name = m_sym.group(1).strip()
+
+                # capture address line
+                if kind == "MEASUREMENT":
+                    if ECU_ADDRESS_RE.match(l2):
+                        addr_line_idx = j
+                else:  # CHARACTERISTIC
+                    if VALUE_ADDR_RE.match(l2):
+                        addr_line_idx = j
+
+                if l2.strip().lower() == f"/end {kind.lower()}":
+                    end_idx = j
+                    break
+                j += 1
+            if end_idx is None:
+                end_idx = n - 1  # Unclosed block - treat until EOF
+
+            blocks.append(A2LBlock(kind=kind, name=name, symbol=symbol_name,
+                                   begin_idx=begin_idx, end_idx=end_idx,
+                                   addr_line_idx=addr_line_idx))
+
+            if symbol_name not in filters:
+                filters.append(symbol_name)
+
+            i = end_idx + 1
+            continue
+
+        i += 1
+
+    return blocks, filters
+
+def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[str, str]) -> Tuple[List[str], List[str]]:
+    """
+    Update the lines for each block using addr_map.
+    Returns updated lines and a list of warnings for blocks without matches.
+    """
+    out_lines = list(lines)
+    warnings: List[str] = []
+
+    for b in blocks:
+        addr_hex = addr_map.get(b.symbol)
+        if not addr_hex:
+            warnings.append(f"No address found for symbol '{b.symbol}' (block {b.kind} {b.name}).")
+            continue
+
+        if b.addr_line_idx is None:
+            warnings.append(f"No address line found to update for symbol '{b.symbol}' (block {b.kind} {b.name}).")
+            continue
+
+        old = out_lines[b.addr_line_idx].rstrip("\n")
+
+        if b.kind == "MEASUREMENT":
+            # Replace ECU_ADDRESS hex
+            m = ECU_ADDRESS_RE.match(old)
+            if m:
+                new_line = f"{m.group(1)}{addr_hex}{m.group(2)}"
+            else:
+                # fallback
+                new_line = re.sub(r'^(\s*ECU_ADDRESS\s+).*$',
+                                  r'\1' + addr_hex,
+                                  old)
+        else:
+            # Replace VALUE hex
+            m = VALUE_ADDR_RE.match(old)
+            if m:
+                new_line = f"{m.group(1)}{addr_hex}{m.group(2)}"
+            else:
+                new_line = re.sub(r'^(\s*VALUE\s+).*$',
+                                  r'\1' + addr_hex,
+                                  old)
+
+        out_lines[b.addr_line_idx] = new_line + "\n"
+
+    return out_lines, warnings
+
+# ----------------------------
+# Public API
+# ----------------------------
+
+def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
+    """
+    Read MEASUREMENT and CHARACTERISTIC symbols from olda2l,
+    resolve addresses from elf (DWARF + symtab) using your collector with filtering,
+    and write updated a2l to newa2l.
+    """
+    # Read A2L file
+    with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    # Parse blocks and build filter list
+    blocks, filters = parse_a2l_blocks(lines)
+    if not blocks:
+        print("No MEASUREMENT or CHARACTERISTIC blocks found in A2L.")
+    else:
+        print(f"Found {len(blocks)} blocks to process.")
+    if filters:
+        print("Symbols to resolve from ELF:")
+        for s in filters:
+            print(f" - {s}")
+
+    # Build symbol dictionary using your filtering logic
+    symbols_dict, missing_filters = build_symbols_dict(elf, filters)
+
+    # Convert to a simple address map for quick lookups
+    addr_map = {name: meta["address"] for name, meta in symbols_dict.items()}
+
+    print(f"Resolved {len(addr_map)} symbol addresses from ELF/DWARF.")
+
+    # Update lines
+    updated_lines, warnings = update_a2l_lines(lines, blocks, addr_map)
+
+    # Emit warnings for missing filters (not found in ELF)
+    for w in warnings:
+        print("Warning:", w)
+    if missing_filters:
+        print("These A2L symbols were not found in ELF/DWARF:")
+        for s in sorted(missing_filters):
+            print(f" - {s}")
+
+    # Write new A2L
+    with open(newa2l, "w", encoding="utf-8", errors="ignore") as f:
+        f.writelines(updated_lines)
+    print(f"Saved updated A2L to: {newa2l}")
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def _main(argv: List[str]) -> int:
+    if len(argv) < 4:
+        print(f"Usage: {argv[0]} <olda2l> <elf> <newa2l>")
+        return 1
+    olda2l, elf, newa2l = argv[1], argv[2], argv[3]
+    Updatea2l(olda2l, elf, newa2l)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv))
