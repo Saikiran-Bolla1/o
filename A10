@@ -4,25 +4,25 @@ Update and extend A2L files using symbol addresses from an ELF (with DWARF).
 
 What it does:
 - Updatea2l(olda2l, elf, newa2l):
-  Reads all MEASUREMENT and CHARACTERISTIC blocks, resolves their addresses from the ELF,
-  and writes an updated A2L with corrected ECU_ADDRESS (MEASUREMENT) or VALUE (CHARACTERISTIC).
+  - Reads all MEASUREMENT and CHARACTERISTIC blocks.
+  - Resolves their addresses from the ELF using hierarchical filtering.
+  - Updates ECU_ADDRESS/ADDRESS/VALUE with uppercase hex.
+  - ALSO appends ALL filtered leaf symbols produced by filtering that are NOT
+    present in the A2L yet, inferring their kind (MEASUREMENT/CHARACTERISTIC)
+    from their closest parent block in the A2L.
 - addvariable(olda2l, elf, variablename, vartype, outputfile):
-  Adds a new MEASUREMENT or CHARACTERISTIC block(s) for ALL filtered symbols that are not
-  already present in the A2L. The filter set is:
-    - Every symbol referenced in the existing A2L (via SYMBOL_LINK or block name), plus
-    - The provided 'variablename' token (supporting hierarchical names and array elements like Var._0_).
-  After resolving, addresses for existing blocks are updated, and ALL missing filtered
-  symbols are appended as new blocks using the provided 'vartype' (characteristic|measurement).
-
-New in this version:
-- All hex addresses written to ECU_ADDRESS, ADDRESS, and VALUE are forced to uppercase hex
-  (e.g., 0x1a2b -> 0x1A2B), both for updated values and any existing ones in the file.
+  - Adds a new block for ALL filtered symbols missing from the A2L (using the provided vartype),
+    and updates addresses for existing blocks.
+  - Useful when you want to force all appended entries to be a specific kind.
 
 Notes:
-- Uses hierarchical symbol resolution (supports names like VarName._0_ and Var.Struct.Member).
+- Hierarchical symbol resolution supports names like VarName._0_ and Var.Struct.Member.
 - Array elements are named as {prefix}._i_ (with trailing underscore), e.g., MyArray._0_.
-- Prints warnings in console for any filters/symbols that matched nothing.
-- Requires: pip install pyelftools
+- All written addresses (ECU_ADDRESS/ADDRESS/VALUE) are uppercase hex (0xXXXXXXXX).
+- Prints warnings for any filters/symbols that matched nothing.
+
+Requires:
+- pip install pyelftools
 """
 
 import sys
@@ -204,7 +204,6 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
         return
 
     if tag == 'DW_TAG_structure_type':
-        # record the struct itself if needed
         _, tsize, _ = base_type_info(die)
         if should_emit(prefix, filter_list, filter_hits):
             row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
@@ -352,7 +351,7 @@ CHAR_BEGIN_RE = re.compile(r'^\s*/begin\s+CHARACTERISTIC\s+(\S+)')
 SYMBOL_LINK_RE = re.compile(r'^\s*SYMBOL_LINK\s+"([^"]+)"')
 END_BLOCK_RE_TMPL = "/end {}"
 
-# Updated regexes to capture the hex address in group(2)
+# Regexes with captured hex address in group(2)
 ECU_ADDRESS_RE = re.compile(r'^(\s*ECU_ADDRESS\s+)(0x[0-9A-Fa-f]+)(.*)$')
 VALUE_ADDR_RE  = re.compile(r'^(\s*VALUE\s+)(0x[0-9A-Fa-f]+)(.*)$')
 ADDRESS_RE     = re.compile(r'^(\s*ADDRESS\s+)(0x[0-9A-Fa-f]+)(.*)$')
@@ -465,17 +464,14 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
         addr_hex_up = to_upper_hex(addr_hex)
 
         if b.kind == "MEASUREMENT":
-            # Replace ECU_ADDRESS hex
             m = ECU_ADDRESS_RE.match(old)
             if m:
                 new_line = f"{m.group(1)}{addr_hex_up}{m.group(3)}"
             else:
-                # fallback
                 new_line = re.sub(r'^(\s*ECU_ADDRESS\s+)(0x[0-9A-Fa-f]+)',
                                   lambda mm: mm.group(1) + addr_hex_up,
                                   old)
         else:
-            # Replace VALUE hex
             m = VALUE_ADDR_RE.match(old)
             if m:
                 new_line = f"{m.group(1)}{addr_hex_up}{m.group(3)}"
@@ -498,8 +494,7 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
 def _guess_datatype_and_limits(meta: Optional[Dict[str, str]]) -> Tuple[str, str, str, str]:
     """
     Guess A2L data keywords and limit ranges from symbol metadata.
-    Returns tuple:
-      (meas_datatype, char_deposit, lower, upper)
+    Returns tuple: (meas_datatype, char_deposit, lower, upper)
     """
     t = (meta or {}).get("type", "") if meta else ""
     t = (t or "").lower()
@@ -553,6 +548,24 @@ def _render_new_block(variablename: str, kind: str, addr_hex: str, meta: Optiona
         ])
     return lines
 
+def _find_parent_kind(name: str, blocks: List[A2LBlock]) -> Optional[str]:
+    """
+    For a hierarchical symbol 'name', find the longest existing A2L block symbol
+    that is a boundary prefix (parent.) or (parent._). Return its kind.
+    """
+    best = None
+    best_len = -1
+    for b in blocks:
+        p = b.symbol
+        if name == p:
+            # already exists, caller shouldn't be asking for parent
+            continue
+        if name.startswith(p + ".") or name.startswith(p + "._"):
+            if len(p) > best_len:
+                best = b.kind
+                best_len = len(p)
+    return best
+
 # ----------------------------
 # Public APIs
 # ----------------------------
@@ -561,19 +574,24 @@ def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
     """
     Read MEASUREMENT and CHARACTERISTIC symbols from olda2l,
     resolve addresses from elf (DWARF + symtab) using the collector with filtering,
-    and write updated a2l to newa2l.
+    update addresses, and append ALL filtered leaf symbols not present in the A2L.
+    The kind (MEASUREMENT/CHARACTERISTIC) of appended items is inferred from the closest
+    parent symbol's block kind in the existing A2L. If no parent can be found, the item
+    is skipped with a warning.
     All ECU_ADDRESS/ADDRESS/VALUE lines use uppercase hex for addresses.
     """
     with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 
     blocks, filters = parse_a2l_blocks(lines)
+    existing_symbols = {b.symbol for b in blocks}
+
     if not blocks:
         print("No MEASUREMENT or CHARACTERISTIC blocks found in A2L.")
     else:
         print(f"Found {len(blocks)} blocks to process.")
     if filters:
-        print("Symbols to resolve from ELF:")
+        print("Symbols to resolve from ELF (filter roots):")
         for s in filters:
             print(f" - {s}")
 
@@ -582,14 +600,48 @@ def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
     addr_map = {name: to_upper_hex(meta["address"]) for name, meta in symbols_dict.items()}
     print(f"Resolved {len(addr_map)} symbol addresses from ELF/DWARF.")
 
+    # 1) Update addresses for existing blocks
     updated_lines, warnings = update_a2l_lines(lines, blocks, addr_map)
-
     for w in warnings:
         print("Warning:", w)
     if missing_filters:
-        print("These A2L symbols were not found in ELF/DWARF:")
+        print("These filter tokens from A2L matched no symbols in ELF/DWARF:")
         for s in sorted(missing_filters):
             print(f" - {s}")
+
+    # 2) Append ALL filtered symbols that are not already present in the A2L (leaf nodes only)
+    missing_symbols = [
+        name for name, meta in symbols_dict.items()
+        if name not in existing_symbols and meta.get("kind") not in ("struct", "array")
+    ]
+
+    if missing_symbols:
+        print(f"Appending {len(missing_symbols)} new block(s) inferred from parent kinds.")
+        # Ensure file ends with a newline
+        if updated_lines and not updated_lines[-1].endswith("\n"):
+            updated_lines[-1] = updated_lines[-1] + "\n"
+        # Separate with a blank line
+        if updated_lines and updated_lines[-1].strip():
+            updated_lines.append("\n")
+
+        added = 0
+        for name in sorted(missing_symbols):
+            parent_kind = _find_parent_kind(name, blocks)
+            if not parent_kind:
+                print(f"Warning: cannot infer kind for '{name}' (no parent block found). Skipping append.")
+                continue
+            meta = symbols_dict.get(name, {})
+            addr_hex = to_upper_hex(meta.get("address", "0x0"))
+            new_block_lines = _render_new_block(name, parent_kind, addr_hex, meta)
+            updated_lines.extend(new_block_lines)
+            added += 1
+
+        print(f"Appended {added} new block(s).")
+    else:
+        print("No additional filtered symbols to append.")
+
+    # Final pass: enforce uppercase hex on any existing address/value lines
+    updated_lines = force_uppercase_known_address_keywords(updated_lines)
 
     with open(newa2l, "w", encoding="utf-8", errors="ignore") as f:
         f.writelines(updated_lines)
@@ -683,8 +735,9 @@ def _main(argv: List[str]) -> int:
               f"  {argv[0]} update <olda2l> <elf> <newa2l>\n"
               f"  {argv[0]} add <olda2l> <elf> <variablename> <characteristic|measurement> <outputfile>\n\n"
               f"Notes:\n"
-              f"- 'add' updates addresses for existing blocks AND appends ALL filtered symbols missing from the A2L.\n"
-              f"- Filters = all symbols referenced in the A2L + the provided variablename.\n"
+              f"- 'update' updates addresses for existing blocks AND appends all filtered leaf symbols not present in the A2L (kind inferred from parent).\n"
+              f"- 'add' updates and appends missing filtered symbols using the provided vartype for all new blocks.\n"
+              f"- Filters = all symbols referenced in the A2L (SYMBOL_LINK or block name), plus any hierarchical expansions they imply.\n"
               f"- All ECU_ADDRESS/ADDRESS/VALUE addresses are emitted in uppercase hex.")
         return 1
 
