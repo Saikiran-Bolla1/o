@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 import sys
 import csv
@@ -27,7 +28,7 @@ def get_symbols(elffile):
             addr = int(s['st_value'] or 0)
             size = int(s['st_size'] or 0)
             st_type = s['st_info']['type']
-            kind = st_type.lower()
+            kind = s['st_info']['type'].lower() if isinstance(s['st_info']['type'], str) else str(s['st_info']['type']).lower()
             out[name] = {'addr': addr, 'size': size, 'kind': kind}
     return out
 
@@ -94,7 +95,13 @@ def matches_filter(name, filter_list):
     if not filter_list:
         return True
     for f in filter_list:
-        if name == f or name.startswith(f + ".") or name.startswith(f + "_") or name.startswith(f):
+        # exact or prefix (struct member or array element)
+        if (
+            name == f
+            or name.startswith(f + ".")
+            or name.startswith(f + "._")
+            or name.startswith(f)
+        ):
             return True
     return False
 
@@ -131,7 +138,7 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
         n_print = min(n, MAX_ARRAY)
         for i in range(n_print):
             eaddr = base_addr + i * (esize if esize else 1)
-            array_elem_prefix = f"{prefix}._{i}"
+            array_elem_prefix = f"{prefix}._{i}_"
             if elem_die and elem_die.tag in ('DW_TAG_structure_type', 'DW_TAG_array_type'):
                 collect_dwarf_struct_vars(array_elem_prefix, eaddr, elem_die, rows, symbols_dict, filter_list)
             else:
@@ -147,6 +154,7 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
         return
 
     if tag == 'DW_TAG_structure_type':
+        # record the struct itself
         tname, tsize, tenc = base_type_info(die)
         if matches_filter(prefix, filter_list):
             row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
@@ -172,6 +180,7 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
             collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr + off, mt, rows, symbols_dict, filter_list)
         return
 
+    # leaf/base types
     tname, tsize, tenc = base_type_info(die)
     if matches_filter(prefix, filter_list):
         row = [prefix, hex(base_addr), dwarf_type_to_str(tname, tenc, tsize), tsize if tsize else "", "variable"]
