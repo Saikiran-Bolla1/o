@@ -1,181 +1,108 @@
-#!/usr/bin/env python3
-# pip install pyelftools
+import os
+from typing import Any, Dict, List, Optional
 
-from elftools.elf.elffile import ELFFile
-import sys
+from TestPackage.logger.logger_manager import LoggerManager
+from TestPackage.config.config_manager import ConfigManager
 
-MAX_ARRAY_ELEMS = 32
+logger = LoggerManager().get_logger()
 
-# DWARF encodings
-DW_ATE_ADDRESS        = 0x01
-DW_ATE_BOOLEAN        = 0x02
-DW_ATE_COMPLEX_FLOAT  = 0x03
-DW_ATE_FLOAT          = 0x04
-DW_ATE_SIGNED         = 0x05
-DW_ATE_SIGNED_CHAR    = 0x06
-DW_ATE_UNSIGNED       = 0x07
-DW_ATE_UNSIGNED_CHAR  = 0x08
-
-
-def get_object_symbols(elffile):
-    """Return {name: {'addr': int, 'size': int}} for STT_OBJECT from .symtab and .dynsym only."""
-    out = {}
-    for secname in ('.symtab', '.dynsym'):
-        sec = elffile.get_section_by_name(secname)
-        if not sec or not hasattr(sec, 'iter_symbols'):
-            continue
-        for sym in sec.iter_symbols():
-            if sym['st_info']['type'] != 'STT_OBJECT':
-                continue
-            name = sym.name
-            if not name:
-                continue
-            addr = int(sym['st_value'] or 0)
-            size = int(sym['st_size'] or 0)
-            if addr == 0:  # skip undefined
-                continue
-            out[name] = {'addr': addr, 'size': size}
-    return out
+def _dispatch_canape():
+    try:
+        import win32com.client
+    except Exception as exc:
+        raise RuntimeError("pywin32 is required. Install with pip install pywin32") from exc
+    try:
+        return win32com.client.Dispatch("CANape.Application")
+    except Exception:
+        return win32com.client.Dispatch("CAMape.Application")
 
 
-def iter_dwarf_variables(dwarfinfo):
-    """Yield (name, die) for DWARF variables that have a name and type."""
-    for cu in dwarfinfo.iter_CUs():
-        for die in cu.iter_DIEs():
-            if die.tag != 'DW_TAG_variable':
-                continue
-            n = die.attributes.get('DW_AT_name')
-            if not n:
-                continue
-            if 'DW_AT_type' not in die.attributes:
-                continue
-            yield n.value.decode('utf-8', 'ignore'), die
+class CanapeController:
+    """
+    Opens CANape project from config.yml CANape.projectpath,
+    and uses the already declared Devices section for automation.
+    Devices are added to CANape only once; controller exposes them for further automation.
+    """
 
+    def __init__(self, config: Optional[ConfigManager] = None):
+        self._cfg = config or ConfigManager()
+        self._canape_cfg = self._cfg.get("CANape")
+        if not self._canape_cfg:
+            raise RuntimeError("CANape section missing in config.yml.")
 
-def resolve_base_type(dwarfinfo, die):
-    """Walk typedef/const/volatile/restrict/pointer until DW_TAG_base_type."""
-    seen = set()
-    cur = die
-    while cur and cur.offset not in seen:
-        seen.add(cur.offset)
-        if cur.tag == 'DW_TAG_base_type':
-            tname = cur.attributes.get('DW_AT_name')
-            bsize = cur.attributes.get('DW_AT_byte_size')
-            enc   = cur.attributes.get('DW_AT_encoding')
-            return (
-                tname.value.decode('utf-8', 'ignore') if tname else 'unknown',
-                int(bsize.value) if bsize else None,
-                int(enc.value) if enc else None
-            )
-        if cur.tag == 'DW_TAG_pointer_type':
-            bsize = cur.attributes.get('DW_AT_byte_size')
-            return ('pointer', int(bsize.value) if bsize else None, None)
-        nxt = cur.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in cur.attributes else None
-        cur = nxt
-    return ('unknown', None, None)
+        self._projectpath = os.path.expandvars(os.path.expanduser(self._canape_cfg.get("projectpath")))
+        self._devices_cfg = self._canape_cfg.get("Devices") or []
+        if not self._devices_cfg:
+            raise RuntimeError("No devices declared in CANape.Devices in config.yml.")
 
+        self._app = None
+        self._devices: Dict[str, Any] = {}
+        self._opened = False
 
-def array_first_dim_len(array_die):
-    """Get first dimension length from DW_TAG_array_type."""
-    for child in array_die.iter_children():
-        if child.tag != 'DW_TAG_subrange_type':
-            continue
-        cnt = child.attributes.get('DW_AT_count')
-        if cnt:
-            return int(cnt.value)
-        ub = child.attributes.get('DW_AT_upper_bound')
-        lb = child.attributes.get('DW_AT_lower_bound')
-        if ub and lb:
-            return int(ub.value) - int(lb.value) + 1
-        if ub:
-            return int(ub.value) + 1
-    return None
+        self._open_project_and_add_devices()
 
+    @property
+    def app(self):
+        return self._app
 
-def type_min_max(encoding, byte_size):
-    """Infer min/max from encoding & size."""
-    if byte_size is None:
-        return (None, None)
-    bits = 8 * byte_size
-    if encoding in (DW_ATE_UNSIGNED, DW_ATE_UNSIGNED_CHAR):
-        return (0, (1 << bits) - 1)
-    if encoding in (DW_ATE_SIGNED, DW_ATE_SIGNED_CHAR):
-        return (-(1 << (bits - 1)), (1 << (bits - 1)) - 1)
-    if encoding == DW_ATE_BOOLEAN:
-        return (0, 1)
-    return (None, None)
+    @property
+    def devices(self) -> Dict[str, Any]:
+        return self._devices
 
+    def _open_project_and_add_devices(self):
+        self._app = _dispatch_canape()
+        # Open CANape project
+        self._app.Open2(self._projectpath, 1, 100000, 0, 0, 1)
+        self._opened = True
+        logger.info(f"[CANape] Project opened: {self._projectpath}")
 
-def main(path):
-    with open(path, 'rb') as f:
-        elf = ELFFile(f)
+        # Add devices from config (do not duplicate if already present)
+        for device in self._devices_cfg:
+            name = str(device.get("DeviceName"))
+            a2l = str(device.get("A2lPATH", ""))
+            protocol = str(device.get("Protocol"))
+            channel = int(device.get("CANChannel", 1))
 
-        symmap = get_object_symbols(elf)
+            # Only add if not already present
+            if name not in self._devices:
+                dev_com = self._app.Devices.Add(name, a2l, protocol, channel)
+                self._devices[name] = dev_com
+                logger.info(f"[CANape] Device added: {name}")
 
-        if not elf.has_dwarf_info():
-            for name, meta in sorted(symmap.items(), key=lambda kv: kv[1]['addr']):
-                print(f"{name}  type=unknown addr=0x{meta['addr']:x} size={meta['size']}")
-            return
+    def get_device(self, name: str):
+        """Get device COM object by name (must match DeviceName from config)."""
+        return self._devices.get(name, None)
 
-        dwarfinfo = elf.get_dwarf_info()
-        dwarf_vars = {name: die for name, die in iter_dwarf_variables(dwarfinfo)}
+    def go_online_all(self, reconnect: bool = False):
+        for name, dev in self._devices.items():
+            try:
+                dev.GoOnline(bool(reconnect))
+                logger.info(f"[CANape] Device '{name}' online")
+            except Exception as exc:
+                logger.error(f"[CANape] Device '{name}' goonline error: {exc}")
 
-        sorted_syms = sorted(symmap.items(), key=lambda kv: kv[1]['addr'])
+    def go_offline_all(self):
+        for name, dev in self._devices.items():
+            try:
+                dev.GoOffline()
+                logger.info(f"[CANape] Device '{name}' offline")
+            except Exception as exc:
+                logger.error(f"[CANape] Device '{name}' gooffline error: {exc}")
 
-        for idx, (name, meta) in enumerate(sorted_syms):
-            addr = meta['addr']
-            size = meta['size']
-            die  = dwarf_vars.get(name)
+    def quit(self):
+        try:
+            self.go_offline_all()
+        except Exception:
+            pass
+        try:
+            if self._app:
+                self._app.Quit()
+        except Exception:
+            pass
+        finally:
+            self._app = None
 
-            tdie = die.get_DIE_from_attribute('DW_AT_type') if die and 'DW_AT_type' in die.attributes else None
-
-            # --- Case A: DWARF explicit array ---
-            if tdie and tdie.tag == 'DW_TAG_array_type':
-                elem_die = tdie.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in tdie.attributes else None
-                elem_type, elem_size, elem_enc = resolve_base_type(dwarfinfo, elem_die)
-                if not elem_size:
-                    elem_size = 1
-                n = array_first_dim_len(tdie) or 0
-                n_print = min(n, MAX_ARRAY_ELEMS)
-                for i in range(n_print):
-                    eaddr = addr + i * elem_size
-                    vmin, vmax = type_min_max(elem_enc, elem_size)
-                    print(f"{name}._{i}_  type={elem_type} addr=0x{eaddr:x} size={elem_size} min={vmin} max={vmax}")
-                print(f"{name}  type=array[{n}] of {elem_type} base_addr=0x{addr:x} elem_size={elem_size}")
-                continue
-
-            # --- Case B: Heuristic array (from size or address gap) ---
-            next_addr = sorted_syms[idx+1][1]['addr'] if idx+1 < len(sorted_syms) else None
-            elem_size = size if size in (1,2,4,8) else 1
-
-            if size > elem_size and size % elem_size == 0:
-                count = min(size // elem_size, MAX_ARRAY_ELEMS)
-                for i in range(count):
-                    eaddr = addr + i * elem_size
-                    print(f"{name}._{i}_  type=unknown addr=0x{eaddr:x} size={elem_size}")
-                print(f"{name}  type=array[{count}] of unknown base_addr=0x{addr:x} elem_size={elem_size}")
-                continue
-
-            if next_addr and next_addr > addr and (next_addr - addr) > elem_size*2:
-                gap = next_addr - addr
-                count = min(gap // elem_size, MAX_ARRAY_ELEMS)
-                for i in range(count):
-                    eaddr = addr + i * elem_size
-                    print(f"{name}._{i}_  type=unknown addr=0x{eaddr:x} size={elem_size}")
-                print(f"{name}  type=array[{count}] of unknown base_addr=0x{addr:x} elem_size={elem_size}")
-                continue
-
-            # --- Case C: Scalar ---
-            if tdie:
-                base_type, bsize, enc = resolve_base_type(dwarfinfo, tdie)
-                vmin, vmax = type_min_max(enc, bsize)
-                print(f"{name}  type={base_type} addr=0x{addr:x} size={bsize if bsize else size} min={vmin} max={vmax}")
-            else:
-                print(f"{name}  type=unknown addr=0x{addr:x} size={size}")
-
-
-if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <elf-file>")
-        sys.exit(1)
-    main(sys.argv[1])
+# Usage:
+# ctl = CanapeController()
+# ctl.go_online_all()
+# device = ctl.get_device("XCPsim")
