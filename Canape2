@@ -213,15 +213,13 @@ class RecorderResult:
     def __init__(
         self,
         app,
-        tasks_per_device: Dict[str, List[Any]],
-        added_per_device: Dict[str, Dict[Any, List[str]]],
+        cleanup_items: List[Tuple[Any, str]],  # (task_com_object, channel_name)
         var_list: List[CanapeVariable],
         vector_refs: List[VectorSignalRef],
         mdf_path: str
     ):
         self._app = app
-        self._tasks_per_device = tasks_per_device
-        self._added_per_device = added_per_device
+        self._cleanup_items = cleanup_items
         self._vars = var_list
         self._vectors = vector_refs
         self.filepath = os.path.abspath(mdf_path)
@@ -297,21 +295,18 @@ class RecorderResult:
                     continue
 
     def finalize(self):
-        # Stop CANape measurement and cleanup channels we added
+        # Stop CANape measurement
         try:
             self._app.Measurement.Stop()
         except Exception:
             pass
 
-        # Remove channels from all tasks we touched
-        for dev_name, task_list in self._tasks_per_device.items():
-            for task in task_list:
-                added_for_task = self._added_per_device.get(dev_name, {}).get(task, [])
-                for ch in added_for_task:
-                    try:
-                        task.Channels.Remove(ch)
-                    except Exception:
-                        pass
+        # Cleanup: remove channels we added (iterate directly over COM objects; no hashing!)
+        for task_obj, ch_name in self._cleanup_items:
+            try:
+                task_obj.Channels.Remove(ch_name)
+            except Exception:
+                pass
 
         # Wait until MF4 appears and is stable, then load
         _wait_for_file_stable(self.filepath, timeout_s=30.0, poll_s=0.25)
@@ -504,22 +499,13 @@ class CanapeAutomation:
         for v in var_list:
             cal_by_dev.setdefault(v.device_name, []).append(v)
 
-        # Prepare tracking of tasks and channels added
-        tasks_per_device: Dict[str, List[Any]] = {}
-        added_per_device: Dict[str, Dict[Any, List[str]]] = {}
-
-        def _register_task(dev_name: str, task_obj) -> None:
-            # Keep unique list per device
-            lst = tasks_per_device.setdefault(dev_name, [])
-            if task_obj not in lst:
-                lst.append(task_obj)
-            added_per_device.setdefault(dev_name, {}).setdefault(task_obj, [])
+        # Track channels to clean up later as a simple list of tuples to avoid using unhashable COM objects as dict keys.
+        cleanup_items: List[Tuple[Any, str]] = []  # (task_com_object, channel_name)
 
         # Configure normal calibration variables
         for devname, dev_vars in cal_by_dev.items():
             dev_com = self.devices[devname].dev
             tsk = dev_com.Tasks(task)
-            _register_task(devname, tsk)
 
             if sampling_time is not None:
                 try:
@@ -538,7 +524,7 @@ class CanapeAutomation:
                         tsk.Channels(v.varname).Save2MDF = True
                     except Exception:
                         pass
-                    added_per_device[devname][tsk].append(v.varname)
+                    cleanup_items.append((tsk, v.varname))
                 except Exception:
                     # ignore if already present or not addable
                     pass
@@ -554,7 +540,6 @@ class CanapeAutomation:
                 raise KeyError(f"Vector driver device '{devname}' is not added.")
             dev_com = self.devices[devname].dev
             vtask = dev_com.Tasks(vector_task)
-            _register_task(devname, vtask)
 
             if vector_sampling_time is not None:
                 try:
@@ -570,7 +555,7 @@ class CanapeAutomation:
                         vtask.Channels(r.signal_name).Save2MDF = True
                     except Exception:
                         pass
-                    added_per_device[devname][vtask].append(r.signal_name)
+                    cleanup_items.append((vtask, r.signal_name))
                 except Exception:
                     # Ignore if already present or cannot be added
                     pass
@@ -591,7 +576,7 @@ class CanapeAutomation:
         except Exception:
             pass
 
-        rec = RecorderResult(self.app, tasks_per_device, added_per_device, var_list, vector_refs, mdf_path)
+        rec = RecorderResult(self.app, cleanup_items, var_list, vector_refs, mdf_path)
         try:
             yield rec
         finally:
