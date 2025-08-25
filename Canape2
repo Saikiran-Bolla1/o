@@ -1,7 +1,7 @@
 # Requires:
 #   pip install pywin32 asammdf numpy
 #
-# Features kept minimal and aligned to your asks:
+# Features:
 # - Direct longname access: var = session["Device:Variable"]
 # - Recording uses CANape's MF4 only (no background threads).
 # - session.recorder(...) sets CANape.Measurement.MDFFilename to your path and reads the same file.
@@ -11,9 +11,24 @@
 #     V.y -> values (numpy array)
 #     V.name -> "Device:Variable" when resolvable (else raw MF4 name)
 #     V.data -> ((x0,y0), ..., (xn,yn))
-# - rec.signals -> list of all recorded signal names (as in the recorder)
+# - rec.signals -> list of all recorded signal names (as provided to the recorder)
 # - rec.values() -> list of objects having name, x, y, data for all recorded signals
 # - Enum/text signals are converted to RAW (numeric) values whenever possible.
+#
+# NEW (simplified Vector driver support):
+# - Optional vector_signals (list of "Device:Signal" or CanapeVariable)
+# - vector_task: task name to enable for vector signals (default "cyclic")
+# - vector_sampling_time: sampling time (ms) for vector_task (applied once to the task)
+#
+# Usage:
+# with session.recorder(
+#       "ECU:Var1", "ECU:Var2",
+#       task="100ms", sampling_time=100,
+#       vector_signals=["VectorDev:Voltage", "VectorDev:Current"],
+#       vector_task="cyclic", vector_sampling_time=10,
+# ) as rec:
+#     y = rec["VectorDev:Voltage"].y
+#
 
 import os
 import time
@@ -21,7 +36,7 @@ import win32com.client
 import numpy as np
 from datetime import datetime
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union, Any, Tuple
+from typing import Dict, List, Optional, Union, Any, Tuple, Iterable
 
 from asammdf import MDF, Signal
 
@@ -78,6 +93,19 @@ class CanapeVariable:
 
     def __repr__(self):
         return f"<CanapeVariable {self.longname}>"
+
+
+class VectorSignalRef:
+    def __init__(self, device_name: str, signal_name: str):
+        self.device_name = device_name
+        self.signal_name = signal_name
+
+    @property
+    def longname(self) -> str:
+        return f"{self.device_name}:{self.signal_name}"
+
+    def __repr__(self):
+        return f"<VectorSignal {self.longname}>"
 
 
 def _get_signal_raw_preferred(mdf: MDF, name: str) -> Signal:
@@ -182,17 +210,26 @@ class RecorderResult:
       - .y    -> numpy array of values
       - .data -> tuple of (x,y) pairs for all samples
     """
-    def __init__(self, app, task_per_device: Dict[str, Any], added_per_device: Dict[str, List[str]], vars_list: List[CanapeVariable], mdf_path: str):
+    def __init__(
+        self,
+        app,
+        tasks_per_device: Dict[str, List[Any]],
+        added_per_device: Dict[str, Dict[Any, List[str]]],
+        var_list: List[CanapeVariable],
+        vector_refs: List[VectorSignalRef],
+        mdf_path: str
+    ):
         self._app = app
-        self._tasks = task_per_device
-        self._added = added_per_device
-        self._vars = vars_list
+        self._tasks_per_device = tasks_per_device
+        self._added_per_device = added_per_device
+        self._vars = var_list
+        self._vectors = vector_refs
         self.filepath = os.path.abspath(mdf_path)
 
         self._mdf: Optional[MDF] = None
         self._views_by_var: Dict[CanapeVariable, _SignalView] = {}
         self._views_by_name: Dict[str, _SignalView] = {}
-        self._ordered_names: List[str] = []  # keep order consistent with vars_list
+        self._ordered_names: List[str] = []  # keep order consistent with input
 
     def _resolve_signal(self, mdf: MDF, expected_long: str, tail: str, names: List[str]) -> Optional[Signal]:
         # 1) Try exact long name raw
@@ -232,7 +269,7 @@ class RecorderResult:
         except Exception:
             names = []
 
-        # Build views for the signals explicitly requested in the recorder
+        # Build views for the calibration variables requested in the recorder
         for v in self._vars:
             sig = self._resolve_signal(self._mdf, v.longname, v.varname, names)
             if sig is not None:
@@ -240,6 +277,15 @@ class RecorderResult:
                 self._views_by_var[v] = view
                 self._views_by_name[v.longname] = view
                 self._ordered_names.append(v.longname)
+
+        # Build views for the Vector driver signals added explicitly
+        for ref in self._vectors:
+            expected_long = ref.longname
+            sig = self._resolve_signal(self._mdf, expected_long, ref.signal_name, names)
+            if sig is not None:
+                view = _SignalView(sig, display_name=expected_long)
+                self._views_by_name[expected_long] = view
+                self._ordered_names.append(expected_long)
 
         # Also allow access by raw MDF names (in case user queries by that)
         for n in names:
@@ -257,12 +303,15 @@ class RecorderResult:
         except Exception:
             pass
 
-        for dev, task in self._tasks.items():
-            for ch in self._added.get(dev, []):
-                try:
-                    task.Channels.Remove(ch)
-                except Exception:
-                    pass
+        # Remove channels from all tasks we touched
+        for dev_name, task_list in self._tasks_per_device.items():
+            for task in task_list:
+                added_for_task = self._added_per_device.get(dev_name, {}).get(task, [])
+                for ch in added_for_task:
+                    try:
+                        task.Channels.Remove(ch)
+                    except Exception:
+                        pass
 
         # Wait until MF4 appears and is stable, then load
         _wait_for_file_stable(self.filepath, timeout_s=30.0, poll_s=0.25)
@@ -306,11 +355,8 @@ class RecorderResult:
                 out.append(view)
         return out
 
-    # Backward compatible helper to get names and y-arrays only (previous behavior)
+    # Backward compatible helper to get names and y-arrays only
     def y_values(self) -> List[Tuple[str, np.ndarray]]:
-        """
-        Returns list of (name, y-array) for recorded signals (preserve order).
-        """
         out: List[Tuple[str, np.ndarray]] = []
         for name in self._ordered_names:
             view = self._views_by_name.get(name)
@@ -390,62 +436,144 @@ class CanapeAutomation:
         self._var_cache[key] = var
         return var
 
+    @staticmethod
+    def _normalize_vector_signals(
+        vector_signals: Optional[Iterable[Union[str, CanapeVariable]]]
+    ) -> List[VectorSignalRef]:
+        """
+        Accepts strings "Device:Signal" or CanapeVariable. Returns normalized VectorSignalRef list.
+        """
+        out: List[VectorSignalRef] = []
+        if not vector_signals:
+            return out
+        for item in vector_signals:
+            if isinstance(item, CanapeVariable):
+                out.append(VectorSignalRef(item.device_name, item.varname))
+            elif isinstance(item, str):
+                if ":" not in item:
+                    raise ValueError(f"Invalid vector signal '{item}', expected 'Device:Signal'")
+                dev, sig = item.split(":", 1)
+                out.append(VectorSignalRef(dev, sig))
+            else:
+                raise TypeError("vector_signals entries must be 'Device:Signal' or CanapeVariable")
+        return out
+
     @contextmanager
     def recorder(
         self,
-        *vars_or_longnames: Union[CanapeVariable, str],
-        task_name: str = "100ms",
+        *signals: Union[CanapeVariable, str],
+        task: str = "100ms",
         sampling_time: Optional[int] = 100,
-        mdf_path: Optional[str] = None
+        mdf_path: Optional[str] = None,
+        vector_signals: Optional[Iterable[Union[str, CanapeVariable]]] = None,
+        vector_task: str = "cyclic",
+        vector_sampling_time: Optional[int] = None,
     ):
-        if not vars_or_longnames:
-            raise TypeError("Provide at least one variable or 'Device:Variable'.")
+        """
+        Start a measurement, add requested calibration variables into `task` (with `sampling_time`),
+        and optionally add Vector driver signals into `vector_task` (with `vector_sampling_time`).
+        The two groups are independent and can use different tasks/timing.
 
-        # Normalize to CanapeVariable
-        vars_list: List[CanapeVariable] = []
-        for item in vars_or_longnames:
+        Examples:
+          with session.recorder(
+                "ECU:Var1", "ECU:Var2",
+                task="100ms", sampling_time=100,
+                vector_signals=["VectorDev:Voltage", "VectorDev:Current"],
+                vector_task="cyclic", vector_sampling_time=10,
+          ) as rec:
+              print(rec.signals)
+        """
+        if not signals and not vector_signals:
+            raise TypeError("Provide at least one normal signal or vector_signals entry.")
+
+        # Normalize normal signals -> CanapeVariable list
+        var_list: List[CanapeVariable] = []
+        for item in signals:
             if isinstance(item, CanapeVariable):
-                vars_list.append(item)
+                var_list.append(item)
             elif isinstance(item, str):
-                vars_list.append(self[item])
+                var_list.append(self[item])
             else:
-                raise TypeError("Items must be CanapeVariable or 'Device:Variable'.")
+                raise TypeError("Signals must be CanapeVariable or 'Device:Variable' strings.")
 
-        # Group by device and configure tasks/channels
-        by_dev: Dict[str, List[CanapeVariable]] = {}
-        for v in vars_list:
-            by_dev.setdefault(v.device_name, []).append(v)
+        # Normalize vector signals
+        vector_refs: List[VectorSignalRef] = self._normalize_vector_signals(vector_signals)
 
-        tasks: Dict[str, Any] = {}
-        added: Dict[str, List[str]] = {}
+        # Group normal vars by device
+        cal_by_dev: Dict[str, List[CanapeVariable]] = {}
+        for v in var_list:
+            cal_by_dev.setdefault(v.device_name, []).append(v)
 
-        for devname, dev_vars in by_dev.items():
+        # Prepare tracking of tasks and channels added
+        tasks_per_device: Dict[str, List[Any]] = {}
+        added_per_device: Dict[str, Dict[Any, List[str]]] = {}
+
+        def _register_task(dev_name: str, task_obj) -> None:
+            # Keep unique list per device
+            lst = tasks_per_device.setdefault(dev_name, [])
+            if task_obj not in lst:
+                lst.append(task_obj)
+            added_per_device.setdefault(dev_name, {}).setdefault(task_obj, [])
+
+        # Configure normal calibration variables
+        for devname, dev_vars in cal_by_dev.items():
             dev_com = self.devices[devname].dev
-            task = dev_com.Tasks(task_name)
-            tasks[devname] = task
+            tsk = dev_com.Tasks(task)
+            _register_task(devname, tsk)
 
             if sampling_time is not None:
                 try:
-                    task.SamplingTime = int(sampling_time)
+                    tsk.SamplingTime = int(sampling_time)
                 except Exception:
                     pass
 
-            added_names: List[str] = []
             for v in dev_vars:
                 try:
                     dev_com.CalibrationObjects.Add(v.varname)
                 except Exception:
                     pass
                 try:
-                    task.Channels.Add(v.varname)
+                    tsk.Channels.Add(v.varname)
                     try:
-                        task.Channels(v.varname).Save2MDF = True
+                        tsk.Channels(v.varname).Save2MDF = True
                     except Exception:
                         pass
-                    added_names.append(v.varname)
+                    added_per_device[devname][tsk].append(v.varname)
+                except Exception:
+                    # ignore if already present or not addable
+                    pass
+
+        # Configure Vector driver signals (common task & sampling time for all)
+        # Group vector refs by device
+        vec_by_dev: Dict[str, List[VectorSignalRef]] = {}
+        for ref in vector_refs:
+            vec_by_dev.setdefault(ref.device_name, []).append(ref)
+
+        for devname, refs in vec_by_dev.items():
+            if devname not in self.devices:
+                raise KeyError(f"Vector driver device '{devname}' is not added.")
+            dev_com = self.devices[devname].dev
+            vtask = dev_com.Tasks(vector_task)
+            _register_task(devname, vtask)
+
+            if vector_sampling_time is not None:
+                try:
+                    vtask.SamplingTime = int(vector_sampling_time)
                 except Exception:
                     pass
-            added[devname] = added_names
+
+            for r in refs:
+                try:
+                    # Vector driver signals are typically available as measurement channels directly
+                    vtask.Channels.Add(r.signal_name)
+                    try:
+                        vtask.Channels(r.signal_name).Save2MDF = True
+                    except Exception:
+                        pass
+                    added_per_device[devname][vtask].append(r.signal_name)
+                except Exception:
+                    # Ignore if already present or cannot be added
+                    pass
 
         # MF4 path
         if mdf_path is None:
@@ -463,7 +591,7 @@ class CanapeAutomation:
         except Exception:
             pass
 
-        rec = RecorderResult(self.app, tasks, added, vars_list, mdf_path)
+        rec = RecorderResult(self.app, tasks_per_device, added_per_device, var_list, vector_refs, mdf_path)
         try:
             yield rec
         finally:
