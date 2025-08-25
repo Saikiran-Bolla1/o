@@ -12,23 +12,16 @@
 #     V.name -> "Device:Variable" when resolvable (else raw MF4 name)
 #     V.data -> ((x0,y0), ..., (xn,yn))
 # - rec.signals -> list of all recorded signal names (as provided to the recorder)
-# - rec.values() -> list of objects having name, x, y, data for all recorded signals
-# - Enum/text signals are converted to RAW (numeric) values whenever possible.
+# - rec.values() -> list of objects having name, x, y, data
+# - Enum/text signals are converted to numeric whenever possible.
 #
-# NEW (simplified Vector driver support):
-# - Optional vector_signals (list of "Device:Signal" or CanapeVariable)
-# - vector_task: task name to enable for vector signals (default "cyclic")
-# - vector_sampling_time: sampling time (ms) for vector_task (applied once to the task)
+# Vector driver support (optional):
+# - vector_signals: list of "Device:Signal" or CanapeVariable
+# - vector_task: task name for vector signals (default "cyclic")
+# - vector_sampling_time: sampling time (ms) for vector_task
 #
-# Usage:
-# with session.recorder(
-#       "ECU:Var1", "ECU:Var2",
-#       task="100ms", sampling_time=100,
-#       vector_signals=["VectorDev:Voltage", "VectorDev:Current"],
-#       vector_task="cyclic", vector_sampling_time=10,
-# ) as rec:
-#     y = rec["VectorDev:Voltage"].y
-#
+# Important: This version reads PHYSICAL values by default (matches CANape UI).
+#            Set prefer_raw=True in recorder(...) to read RAW samples instead.
 
 import os
 import time
@@ -108,15 +101,23 @@ class VectorSignalRef:
         return f"<VectorSignal {self.longname}>"
 
 
-def _get_signal_raw_preferred(mdf: MDF, name: str) -> Signal:
-    # Try to get RAW samples (no conversion applied)
-    try:
-        return mdf.get(name, raw=True)  # asammdf supports raw=True
-    except TypeError:
-        # Older asammdf: fall back to normal get
-        return mdf.get(name)
-    except Exception:
-        return mdf.get(name)
+def _get_signal_preferred(mdf: MDF, name: str, prefer_raw: bool = False) -> Signal:
+    """
+    Return Signal from MDF, preferring PHYSICAL (converted) values by default.
+    Set prefer_raw=True to force RAW (unconverted) samples.
+    """
+    if prefer_raw:
+        try:
+            return mdf.get(name, raw=True)
+        except Exception:
+            # Fallback to physical if RAW not available
+            return mdf.get(name)
+    else:
+        try:
+            return mdf.get(name)  # physical/converted
+        except Exception:
+            # Fallback to raw if physical retrieval fails
+            return mdf.get(name, raw=True)
 
 
 def _maybe_text_to_raw(samples: np.ndarray, signal: Signal) -> np.ndarray:
@@ -127,15 +128,12 @@ def _maybe_text_to_raw(samples: np.ndarray, signal: Signal) -> np.ndarray:
     # Try to invert enum/text mapping using conversion object
     conv = getattr(signal, "conversion", None)
     if conv is not None:
-        # Common attribute names across asammdf versions
         for attr in ("text_2_value", "text2value", "text_to_value", "value_map", "val_map"):
             mapping = getattr(conv, attr, None)
             if mapping:
                 def map_one(s):
-                    # exact
                     if s in mapping:
                         return mapping[s]
-                    # bytes -> str
                     if isinstance(s, (bytes, bytearray)):
                         try:
                             s2 = s.decode(errors="ignore")
@@ -143,34 +141,30 @@ def _maybe_text_to_raw(samples: np.ndarray, signal: Signal) -> np.ndarray:
                                 return mapping[s2]
                         except Exception:
                             pass
-                    # fallback: try numeric cast
                     try:
                         return float(s)
                     except Exception:
                         return np.nan
                 return np.array([map_one(s) for s in samples], dtype=float)
 
-    # Last resort: try best-effort float conversion
     try:
         return samples.astype(float)
     except Exception:
-        # keep as object; consumer can handle
         return samples
 
 
 class _SignalView:
-    def __init__(self, signal: Signal, display_name: Optional[str] = None, force_raw: bool = False):
+    def __init__(self, signal: Signal, display_name: Optional[str] = None, force_raw_text_to_numeric: bool = True):
         self._sig = signal
         self._name = display_name or signal.name
 
         xs = signal.timestamps
         ys = signal.samples
 
-        # Convert enum/text to raw numeric if needed or if forced
-        if force_raw or (hasattr(ys, "dtype") and ys.dtype.kind in ("O", "U", "S")):
+        # Convert enum/text to numeric if needed
+        if force_raw_text_to_numeric and (hasattr(ys, "dtype") and ys.dtype.kind in ("O", "U", "S")):
             ys = _maybe_text_to_raw(ys, signal)
 
-        # Store the arrays we will expose
         self._x = np.asarray(xs)
         self._y = np.asarray(ys)
 
@@ -202,13 +196,7 @@ class RecorderResult:
 
     Shortcuts:
       - rec.signals  -> list of recorded signal names (preserve recorder order)
-      - rec.values() -> list of per-signal objects each having attributes: name, x, y, data
-
-    Each element returned by values() is a _SignalView with:
-      - .name -> signal display name
-      - .x    -> numpy array of timestamps
-      - .y    -> numpy array of values
-      - .data -> tuple of (x,y) pairs for all samples
+      - rec.values() -> list of per-signal objects each having name, x, y, data
     """
     def __init__(
         self,
@@ -216,13 +204,15 @@ class RecorderResult:
         cleanup_items: List[Tuple[Any, str]],  # (task_com_object, channel_name)
         var_list: List[CanapeVariable],
         vector_refs: List[VectorSignalRef],
-        mdf_path: str
+        mdf_path: str,
+        prefer_raw: bool = False,
     ):
         self._app = app
         self._cleanup_items = cleanup_items
         self._vars = var_list
         self._vectors = vector_refs
         self.filepath = os.path.abspath(mdf_path)
+        self._prefer_raw = prefer_raw
 
         self._mdf: Optional[MDF] = None
         self._views_by_var: Dict[CanapeVariable, _SignalView] = {}
@@ -230,14 +220,14 @@ class RecorderResult:
         self._ordered_names: List[str] = []  # keep order consistent with input
 
     def _resolve_signal(self, mdf: MDF, expected_long: str, tail: str, names: List[str]) -> Optional[Signal]:
-        # 1) Try exact long name raw
+        # 1) Try exact long name
         try:
-            return _get_signal_raw_preferred(mdf, expected_long)
+            return _get_signal_preferred(mdf, expected_long, prefer_raw=self._prefer_raw)
         except Exception:
             pass
-        # 2) Try exact tail raw
+        # 2) Try exact tail
         try:
-            return _get_signal_raw_preferred(mdf, tail)
+            return _get_signal_preferred(mdf, tail, prefer_raw=self._prefer_raw)
         except Exception:
             pass
         # 3) Case-insensitive exact match
@@ -246,7 +236,7 @@ class RecorderResult:
             n = lower.get(cand.lower())
             if n:
                 try:
-                    return _get_signal_raw_preferred(mdf, n)
+                    return _get_signal_preferred(mdf, n, prefer_raw=self._prefer_raw)
                 except Exception:
                     pass
         # 4) Unique suffix ":Var" or ".Var"
@@ -255,7 +245,7 @@ class RecorderResult:
             matches = [n for n in names if n.endswith(suffix)]
             if len(matches) == 1:
                 try:
-                    return _get_signal_raw_preferred(mdf, matches[0])
+                    return _get_signal_preferred(mdf, matches[0], prefer_raw=self._prefer_raw)
                 except Exception:
                     pass
         return None
@@ -267,7 +257,7 @@ class RecorderResult:
         except Exception:
             names = []
 
-        # Build views for the calibration variables requested in the recorder
+        # Calibration variables
         for v in self._vars:
             sig = self._resolve_signal(self._mdf, v.longname, v.varname, names)
             if sig is not None:
@@ -276,7 +266,7 @@ class RecorderResult:
                 self._views_by_name[v.longname] = view
                 self._ordered_names.append(v.longname)
 
-        # Build views for the Vector driver signals added explicitly
+        # Vector driver signals
         for ref in self._vectors:
             expected_long = ref.longname
             sig = self._resolve_signal(self._mdf, expected_long, ref.signal_name, names)
@@ -289,7 +279,7 @@ class RecorderResult:
         for n in names:
             if n not in self._views_by_name:
                 try:
-                    sig = _get_signal_raw_preferred(self._mdf, n)
+                    sig = _get_signal_preferred(self._mdf, n, prefer_raw=self._prefer_raw)
                     self._views_by_name[n] = _SignalView(sig, display_name=n)
                 except Exception:
                     continue
@@ -301,7 +291,7 @@ class RecorderResult:
         except Exception:
             pass
 
-        # Cleanup: remove channels we added (iterate directly over COM objects; no hashing!)
+        # Cleanup: remove channels we added
         for task_obj, ch_name in self._cleanup_items:
             try:
                 task_obj.Channels.Remove(ch_name)
@@ -336,13 +326,6 @@ class RecorderResult:
         return list(self._ordered_names)
 
     def values(self) -> List[_SignalView]:
-        """
-        Returns a list of per-signal views. Each view has:
-          - .name (str)
-          - .x (numpy array)
-          - .y (numpy array)
-          - .data (tuple of (x, y) tuples)
-        """
         out: List[_SignalView] = []
         for name in self._ordered_names:
             view = self._views_by_name.get(name)
@@ -463,20 +446,15 @@ class CanapeAutomation:
         vector_signals: Optional[Iterable[Union[str, CanapeVariable]]] = None,
         vector_task: str = "cyclic",
         vector_sampling_time: Optional[int] = None,
+        prefer_raw: bool = False,  # set True to read raw samples from MF4
     ):
         """
         Start a measurement, add requested calibration variables into `task` (with `sampling_time`),
         and optionally add Vector driver signals into `vector_task` (with `vector_sampling_time`).
         The two groups are independent and can use different tasks/timing.
 
-        Examples:
-          with session.recorder(
-                "ECU:Var1", "ECU:Var2",
-                task="100ms", sampling_time=100,
-                vector_signals=["VectorDev:Voltage", "VectorDev:Current"],
-                vector_task="cyclic", vector_sampling_time=10,
-          ) as rec:
-              print(rec.signals)
+        prefer_raw: when False (default) reads PHYSICAL values (matches CANape UI);
+                    when True reads RAW samples (unconverted).
         """
         if not signals and not vector_signals:
             raise TypeError("Provide at least one normal signal or vector_signals entry.")
@@ -499,7 +477,7 @@ class CanapeAutomation:
         for v in var_list:
             cal_by_dev.setdefault(v.device_name, []).append(v)
 
-        # Track channels to clean up later as a simple list of tuples to avoid using unhashable COM objects as dict keys.
+        # Track channels to clean up later as a simple list of tuples
         cleanup_items: List[Tuple[Any, str]] = []  # (task_com_object, channel_name)
 
         # Configure normal calibration variables
@@ -530,7 +508,6 @@ class CanapeAutomation:
                     pass
 
         # Configure Vector driver signals (common task & sampling time for all)
-        # Group vector refs by device
         vec_by_dev: Dict[str, List[VectorSignalRef]] = {}
         for ref in vector_refs:
             vec_by_dev.setdefault(ref.device_name, []).append(ref)
@@ -549,7 +526,6 @@ class CanapeAutomation:
 
             for r in refs:
                 try:
-                    # Vector driver signals are typically available as measurement channels directly
                     vtask.Channels.Add(r.signal_name)
                     try:
                         vtask.Channels(r.signal_name).Save2MDF = True
@@ -576,7 +552,7 @@ class CanapeAutomation:
         except Exception:
             pass
 
-        rec = RecorderResult(self.app, cleanup_items, var_list, vector_refs, mdf_path)
+        rec = RecorderResult(self.app, cleanup_items, var_list, vector_refs, mdf_path, prefer_raw=prefer_raw)
         try:
             yield rec
         finally:
