@@ -120,37 +120,85 @@ def _get_signal_preferred(mdf: MDF, name: str, prefer_raw: bool = False) -> Sign
             return mdf.get(name, raw=True)
 
 
-def _maybe_text_to_raw(samples: np.ndarray, signal: Signal) -> np.ndarray:
+import re
+# ... keep your existing imports ...
+
+
+def _to_float_safe(val) -> float:
+    # Already numeric
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return float(val)
+    if val is None:
+        return np.nan
+    # Decode bytes
+    if isinstance(val, (bytes, bytearray)):
+        try:
+            val = val.decode("utf-8", errors="ignore")
+        except Exception:
+            return np.nan
+
+    s = str(val).strip().replace("\xa0", " ")  # strip NBSP
+    if s == "" or s.lower() in ("nan", "none", "null"):
+        return np.nan
+    # Booleans / common text tokens
+    low = s.lower()
+    if low in ("true", "on", "high", "yes"):
+        return 1.0
+    if low in ("false", "off", "low", "no"):
+        return 0.0
+
+    # Extract first numeric token (supports comma or dot decimal, scientific notation)
+    m = re.search(r"[-+]?\d+(?:[.,]\d+)?(?:[eE][-+]?\d+)?", s)
+    if m:
+        num = m.group(0).replace(",", ".")  # normalize decimal comma
+        try:
+            return float(num)
+        except Exception:
+            pass
+    return np.nan
+
+
+def _maybe_text_to_raw(samples: np.ndarray, signal) -> np.ndarray:
     # If already numeric, return as-is
     if hasattr(samples, "dtype") and samples.dtype.kind in ("i", "u", "f", "b"):
         return samples
 
-    # Try to invert enum/text mapping using conversion object
+    # Try to use conversion mapping (enum text -> numeric), then fall back to safe parse
     conv = getattr(signal, "conversion", None)
+    mapping = None
     if conv is not None:
         for attr in ("text_2_value", "text2value", "text_to_value", "value_map", "val_map"):
             mapping = getattr(conv, attr, None)
             if mapping:
-                def map_one(s):
-                    if s in mapping:
-                        return mapping[s]
-                    if isinstance(s, (bytes, bytearray)):
-                        try:
-                            s2 = s.decode(errors="ignore")
-                            if s2 in mapping:
-                                return mapping[s2]
-                        except Exception:
-                            pass
-                    try:
-                        return float(s)
-                    except Exception:
-                        return np.nan
-                return np.array([map_one(s) for s in samples], dtype=float)
+                break
 
-    try:
-        return samples.astype(float)
-    except Exception:
-        return samples
+    out = []
+    if mapping:
+        for s in samples:
+            # Direct mapping
+            if s in mapping:
+                v = mapping[s]
+                # Ensure numeric
+                v = _to_float_safe(v)
+                out.append(v)
+                continue
+            # Try decoded/normalized lookup
+            if isinstance(s, (bytes, bytearray)):
+                try:
+                    s2 = s.decode(errors="ignore")
+                except Exception:
+                    s2 = ""
+            else:
+                s2 = str(s)
+            v = mapping.get(s2, None)
+            if v is not None:
+                out.append(_to_float_safe(v))
+            else:
+                out.append(_to_float_safe(s))
+    else:
+        out = [_to_float_safe(s) for s in samples]
+
+    return np.array(out, dtype=float)
 
 
 class _SignalView:
