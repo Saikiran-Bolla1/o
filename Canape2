@@ -13,17 +13,20 @@
 #     V.data -> ((x0,y0), ..., (xn,yn))
 # - rec.signals -> list of all recorded signal names (as provided to the recorder)
 # - rec.values() -> list of objects having name, x, y, data
-# - Enum/text signals are converted to numeric whenever possible.
 #
 # Vector driver support (optional):
 # - vector_signals: list of "Device:Signal" or CanapeVariable
 # - vector_task: task name for vector signals (default "cyclic")
 # - vector_sampling_time: sampling time (ms) for vector_task
 #
-# Important: This version reads PHYSICAL values by default (matches CANape UI).
-#            Set prefer_raw=True in recorder(...) to read RAW samples instead.
+# Important:
+# - This version reads PHYSICAL values by default (matches CANape UI).
+# - If a channel is an enum/text and you want the NUMERIC enum VALUE instead of the enum NAME,
+#   pass prefer_enum_numeric=True to recorder(...). That will automatically re-read such channels RAW.
+# - If you want all channels in RAW form, pass prefer_raw=True.
 
 import os
+import re
 import time
 import win32com.client
 import numpy as np
@@ -110,18 +113,12 @@ def _get_signal_preferred(mdf: MDF, name: str, prefer_raw: bool = False) -> Sign
         try:
             return mdf.get(name, raw=True)
         except Exception:
-            # Fallback to physical if RAW not available
             return mdf.get(name)
     else:
         try:
             return mdf.get(name)  # physical/converted
         except Exception:
-            # Fallback to raw if physical retrieval fails
             return mdf.get(name, raw=True)
-
-
-import re
-# ... keep your existing imports ...
 
 
 def _to_float_safe(val) -> float:
@@ -158,7 +155,7 @@ def _to_float_safe(val) -> float:
     return np.nan
 
 
-def _maybe_text_to_raw(samples: np.ndarray, signal) -> np.ndarray:
+def _maybe_text_to_raw(samples: np.ndarray, signal: Signal) -> np.ndarray:
     # If already numeric, return as-is
     if hasattr(samples, "dtype") and samples.dtype.kind in ("i", "u", "f", "b"):
         return samples
@@ -167,10 +164,21 @@ def _maybe_text_to_raw(samples: np.ndarray, signal) -> np.ndarray:
     conv = getattr(signal, "conversion", None)
     mapping = None
     if conv is not None:
-        for attr in ("text_2_value", "text2value", "text_to_value", "value_map", "val_map"):
+        # Try common attribute names across asammdf versions
+        for attr in ("text_2_value", "text2value", "text_to_value", "value_map", "val_map", "mapping"):
             mapping = getattr(conv, attr, None)
             if mapping:
                 break
+        # If mapping looks like parallel arrays
+        if mapping is None:
+            # Heuristic: look for attributes that may store pairs
+            texts = getattr(conv, "texts", None) or getattr(conv, "labels", None)
+            values = getattr(conv, "values", None) or getattr(conv, "ids", None)
+            if texts is not None and values is not None:
+                try:
+                    mapping = {t: v for t, v in zip(texts, values)}
+                except Exception:
+                    mapping = None
 
     out = []
     if mapping:
@@ -178,9 +186,7 @@ def _maybe_text_to_raw(samples: np.ndarray, signal) -> np.ndarray:
             # Direct mapping
             if s in mapping:
                 v = mapping[s]
-                # Ensure numeric
-                v = _to_float_safe(v)
-                out.append(v)
+                out.append(_to_float_safe(v))
                 continue
             # Try decoded/normalized lookup
             if isinstance(s, (bytes, bytearray)):
@@ -202,7 +208,7 @@ def _maybe_text_to_raw(samples: np.ndarray, signal) -> np.ndarray:
 
 
 class _SignalView:
-    def __init__(self, signal: Signal, display_name: Optional[str] = None, force_raw_text_to_numeric: bool = True):
+    def __init__(self, signal: Signal, display_name: Optional[str] = None, force_text_to_numeric: bool = True):
         self._sig = signal
         self._name = display_name or signal.name
 
@@ -210,7 +216,7 @@ class _SignalView:
         ys = signal.samples
 
         # Convert enum/text to numeric if needed
-        if force_raw_text_to_numeric and (hasattr(ys, "dtype") and ys.dtype.kind in ("O", "U", "S")):
+        if force_text_to_numeric and (hasattr(ys, "dtype") and ys.dtype.kind in ("O", "U", "S")):
             ys = _maybe_text_to_raw(ys, signal)
 
         self._x = np.asarray(xs)
@@ -254,6 +260,7 @@ class RecorderResult:
         vector_refs: List[VectorSignalRef],
         mdf_path: str,
         prefer_raw: bool = False,
+        prefer_enum_numeric: bool = True,
     ):
         self._app = app
         self._cleanup_items = cleanup_items
@@ -261,73 +268,104 @@ class RecorderResult:
         self._vectors = vector_refs
         self.filepath = os.path.abspath(mdf_path)
         self._prefer_raw = prefer_raw
+        self._prefer_enum_numeric = prefer_enum_numeric
 
         self._mdf: Optional[MDF] = None
         self._views_by_var: Dict[CanapeVariable, _SignalView] = {}
         self._views_by_name: Dict[str, _SignalView] = {}
         self._ordered_names: List[str] = []  # keep order consistent with input
 
-    def _resolve_signal(self, mdf: MDF, expected_long: str, tail: str, names: List[str]) -> Optional[Signal]:
-        # 1) Try exact long name
+    def _resolve_signal(self, mdf: MDF, candidates: List[str]) -> Optional[Signal]:
+        # Try candidates in order with preference
+        for name in candidates:
+            try:
+                return _get_signal_preferred(mdf, name, prefer_raw=self._prefer_raw)
+            except Exception:
+                continue
+        # Case-insensitive exact match
         try:
-            return _get_signal_preferred(mdf, expected_long, prefer_raw=self._prefer_raw)
+            names = list(mdf.get_channel_names())
         except Exception:
-            pass
-        # 2) Try exact tail
-        try:
-            return _get_signal_preferred(mdf, tail, prefer_raw=self._prefer_raw)
-        except Exception:
-            pass
-        # 3) Case-insensitive exact match
+            names = []
         lower = {n.lower(): n for n in names}
-        for cand in (expected_long, tail):
+        for cand in candidates:
             n = lower.get(cand.lower())
             if n:
                 try:
                     return _get_signal_preferred(mdf, n, prefer_raw=self._prefer_raw)
                 except Exception:
                     pass
-        # 4) Unique suffix ":Var" or ".Var"
-        for sep in (":", "."):
-            suffix = f"{sep}{tail}"
-            matches = [n for n in names if n.endswith(suffix)]
-            if len(matches) == 1:
-                try:
-                    return _get_signal_preferred(mdf, matches[0], prefer_raw=self._prefer_raw)
-                except Exception:
-                    pass
+        # Unique suffix matches
+        for cand in candidates:
+            tail = cand.split(":", 1)[-1]
+            for sep in (":", "."):
+                suffix = f"{sep}{tail}"
+                matches = [n for n in names if n.endswith(suffix)]
+                if len(matches) == 1:
+                    try:
+                        return _get_signal_preferred(mdf, matches[0], prefer_raw=self._prefer_raw)
+                    except Exception:
+                        pass
         return None
+
+    def _maybe_upgrade_enum_to_raw(self, mdf: MDF, sig: Signal, candidates: List[str]) -> Signal:
+        """
+        If prefer_enum_numeric is True and the signal contains text samples, re-fetch RAW.
+        """
+        try:
+            ys = sig.samples
+            is_text = hasattr(ys, "dtype") and ys.dtype.kind in ("O", "U", "S")
+        except Exception:
+            is_text = False
+
+        if self._prefer_enum_numeric and is_text:
+            # Try to fetch RAW using the same candidate names
+            for name in candidates:
+                try:
+                    raw_sig = _get_signal_preferred(mdf, name, prefer_raw=True)
+                    return raw_sig
+                except Exception:
+                    continue
+        return sig
+
+    def _load_views_for_name(self, mdf: MDF, display_name: str, candidates: List[str]):
+        sig = self._resolve_signal(mdf, candidates)
+        if sig is None:
+            return
+        sig = self._maybe_upgrade_enum_to_raw(mdf, sig, candidates)
+        view = _SignalView(sig, display_name=display_name)
+        self._views_by_name[display_name] = view
+        self._ordered_names.append(display_name)
 
     def _load_views(self):
         self._mdf = MDF(self.filepath)
+
+        # Calibration variables
+        for v in self._vars:
+            candidates = [v.longname, v.varname]
+            sig = self._resolve_signal(self._mdf, candidates)
+            if sig is None:
+                continue
+            sig = self._maybe_upgrade_enum_to_raw(self._mdf, sig, candidates)
+            view = _SignalView(sig, display_name=v.longname)
+            self._views_by_var[v] = view
+            self._views_by_name[v.longname] = view
+            self._ordered_names.append(v.longname)
+
+        # Vector driver signals
+        for ref in self._vectors:
+            self._load_views_for_name(self._mdf, ref.longname, [ref.longname, ref.signal_name])
+
+        # Also allow access by raw MDF names
         try:
             names = list(self._mdf.get_channel_names())
         except Exception:
             names = []
-
-        # Calibration variables
-        for v in self._vars:
-            sig = self._resolve_signal(self._mdf, v.longname, v.varname, names)
-            if sig is not None:
-                view = _SignalView(sig, display_name=v.longname)
-                self._views_by_var[v] = view
-                self._views_by_name[v.longname] = view
-                self._ordered_names.append(v.longname)
-
-        # Vector driver signals
-        for ref in self._vectors:
-            expected_long = ref.longname
-            sig = self._resolve_signal(self._mdf, expected_long, ref.signal_name, names)
-            if sig is not None:
-                view = _SignalView(sig, display_name=expected_long)
-                self._views_by_name[expected_long] = view
-                self._ordered_names.append(expected_long)
-
-        # Also allow access by raw MDF names (in case user queries by that)
         for n in names:
             if n not in self._views_by_name:
                 try:
                     sig = _get_signal_preferred(self._mdf, n, prefer_raw=self._prefer_raw)
+                    sig = self._maybe_upgrade_enum_to_raw(self._mdf, sig, [n])
                     self._views_by_name[n] = _SignalView(sig, display_name=n)
                 except Exception:
                     continue
@@ -494,7 +532,8 @@ class CanapeAutomation:
         vector_signals: Optional[Iterable[Union[str, CanapeVariable]]] = None,
         vector_task: str = "cyclic",
         vector_sampling_time: Optional[int] = None,
-        prefer_raw: bool = False,  # set True to read raw samples from MF4
+        prefer_raw: bool = False,            # set True to read raw samples from MF4 for all channels
+        prefer_enum_numeric: bool = True,    # if True, enum/text channels are re-read RAW to get numeric enum values
     ):
         """
         Start a measurement, add requested calibration variables into `task` (with `sampling_time`),
@@ -502,7 +541,8 @@ class CanapeAutomation:
         The two groups are independent and can use different tasks/timing.
 
         prefer_raw: when False (default) reads PHYSICAL values (matches CANape UI);
-                    when True reads RAW samples (unconverted).
+                    when True reads RAW samples (unconverted) for all channels.
+        prefer_enum_numeric: when True (default) converts enum/text channels to their numeric value by re-reading RAW.
         """
         if not signals and not vector_signals:
             raise TypeError("Provide at least one normal signal or vector_signals entry.")
@@ -600,7 +640,15 @@ class CanapeAutomation:
         except Exception:
             pass
 
-        rec = RecorderResult(self.app, cleanup_items, var_list, vector_refs, mdf_path, prefer_raw=prefer_raw)
+        rec = RecorderResult(
+            self.app,
+            cleanup_items,
+            var_list,
+            vector_refs,
+            mdf_path,
+            prefer_raw=prefer_raw,
+            prefer_enum_numeric=prefer_enum_numeric,
+        )
         try:
             yield rec
         finally:
