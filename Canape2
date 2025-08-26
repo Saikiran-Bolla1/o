@@ -171,7 +171,6 @@ def _maybe_text_to_raw(samples: np.ndarray, signal: Signal) -> np.ndarray:
                 break
         # If mapping looks like parallel arrays
         if mapping is None:
-            # Heuristic: look for attributes that may store pairs
             texts = getattr(conv, "texts", None) or getattr(conv, "labels", None)
             values = getattr(conv, "values", None) or getattr(conv, "ids", None)
             if texts is not None and values is not None:
@@ -389,20 +388,41 @@ class RecorderResult:
         self._load_views()
 
     def __getitem__(self, key: Union[CanapeVariable, str]) -> _SignalView:
+        """
+        Access recorded signals by:
+          - CanapeVariable object (works for both ECU variables and Vector signals)
+          - "Device:Signal" string
+          - unique tail name (if unambiguous)
+        """
         if isinstance(key, CanapeVariable):
+            # First try by identity (ECU variables we tracked)
             view = self._views_by_var.get(key)
-            if view is None:
-                raise KeyError(f"No recorded data for {key.longname} in '{self.filepath}'")
-            return view
+            if view is not None:
+                return view
+            # Fallback: try by its long name (enables rec[var] for Vector driver signals)
+            longname = getattr(key, "longname", None)
+            if longname and longname in self._views_by_name:
+                return self._views_by_name[longname]
+            # As a last resort, try tail-based lookup
+            if longname:
+                tail = longname.split(":", 1)[-1]
+                matches = [n for n in self._views_by_name.keys()
+                           if n.endswith(":" + tail) or n.endswith("." + tail) or n == tail]
+                if len(matches) == 1:
+                    return self._views_by_name[matches[0]]
+            raise KeyError(f"No recorded data for {getattr(key, 'longname', repr(key))} in '{self.filepath}'")
+
         elif isinstance(key, str):
             if key in self._views_by_name:
                 return self._views_by_name[key]
             # Tail-only lookup if unique among the recorded names
             tail = key.split(":", 1)[-1]
-            matches = [n for n in self._views_by_name.keys() if n.endswith(":" + tail) or n.endswith("." + tail) or n == tail]
+            matches = [n for n in self._views_by_name.keys()
+                       if n.endswith(":" + tail) or n.endswith("." + tail) or n == tail]
             if len(matches) == 1:
                 return self._views_by_name[matches[0]]
             raise KeyError(f"No recorded data for '{key}' in '{self.filepath}'")
+
         else:
             raise TypeError("Key must be a CanapeVariable or 'Device:Variable' string.")
 
