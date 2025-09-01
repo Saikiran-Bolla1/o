@@ -2,11 +2,9 @@
 """
 Update and extend A2L files using symbol addresses from an ELF (with DWARF).
 
-Changes in this version:
-- Correctly evaluates DW_AT_data_member_location when encoded as DWARF exprloc (DW_OP_plus_uconst, DW_OP_constu, etc.).
-- Updates ADDRESS lines in addition to ECU_ADDRESS and VALUE inside both MEASUREMENT and CHARACTERISTIC blocks.
-- Falls back to updating decimal addresses if present (for ECU_ADDRESS/VALUE/ADDRESS).
-- Forces uppercase hex for all ECU_ADDRESS/ADDRESS/VALUE lines across the file.
+Fix: Correctly resolves struct member offsets using DW_AT_data_member_location
+with DWARF exprloc (DW_OP_plus_uconst, DW_OP_constu, etc.), so recursive
+members get proper addresses.
 
 Requires: pip install pyelftools
 """
@@ -20,12 +18,7 @@ from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
 from elftools.dwarf.dwarf_expr import DWARFExprParser
 
-# ----------------------------
-# DWARF / Symbol helpers
-# ----------------------------
-
 MAX_ARRAY = 32
-
 DW_ATE_ADDRESS        = 0x01
 DW_ATE_BOOLEAN        = 0x02
 DW_ATE_COMPLEX_FLOAT  = 0x03
@@ -36,7 +29,6 @@ DW_ATE_UNSIGNED       = 0x07
 DW_ATE_UNSIGNED_CHAR  = 0x08
 
 def get_symbols(elffile):
-    """Return {name: {'addr': int, 'size': int, 'kind': str}} for variables/functions in symbol tables."""
     out = {}
     for secname in ('.symtab', '.dynsym'):
         sec = elffile.get_section_by_name(secname)
@@ -54,7 +46,6 @@ def get_symbols(elffile):
     return out
 
 def resolve_typedefs(die):
-    """Follow DW_AT_type chain until a concrete type tag."""
     if die is None:
         return None
     seen = set()
@@ -72,7 +63,6 @@ def resolve_typedefs(die):
     return cur
 
 def base_type_info(base_die):
-    """Return (type_name, byte_size, encoding) for base/pointer/enum; else (unknown, size, None)."""
     if base_die is None:
         return ('unknown', None, None)
     if base_die.tag == 'DW_TAG_pointer_type':
@@ -92,7 +82,6 @@ def base_type_info(base_die):
     return ('unknown', int(bs.value) if bs else None, None)
 
 def array_len_first_dim(array_die) -> Optional[int]:
-    """Get first dimension length from DW_TAG_array_type."""
     for child in array_die.iter_children():
         if child.tag != 'DW_TAG_subrange_type':
             continue
@@ -147,26 +136,19 @@ def _decode_lit(op_name: str) -> Optional[int]:
         return None
 
 def _data_member_offset(member_die) -> int:
-    """
-    Return the byte offset of a struct/union member.
-    Handles constant and exprloc (DW_OP_plus_uconst, DW_OP_constu, DW_OP_plus/DW_OP_add).
-    """
     loc_attr = member_die.attributes.get('DW_AT_data_member_location')
     if not loc_attr:
         return 0
-
     cls = describe_form_class(loc_attr.form)
     if cls == 'constant':
         try:
             return int(loc_attr.value)
         except Exception:
             return 0
-
     if cls == 'exprloc':
         try:
             parser = DWARFExprParser(member_die.cu.dwarfinfo.structs)
             ops = parser.parse_expr(loc_attr.value)
-
             offset = 0
             pending_const: Optional[int] = None
             for op in ops:
@@ -194,11 +176,9 @@ def _data_member_offset(member_die) -> int:
             return int(offset)
         except Exception:
             return 0
-
     return 0
 
 def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter_list, filter_hits):
-    """Recursively collect members/arrays with full hierarchical names using {prefix}._i_ for arrays."""
     die = resolve_typedefs(die)
     if not die:
         if should_emit(prefix, filter_list, filter_hits):
@@ -362,10 +342,6 @@ def build_symbols_dict(elf_path: str, filter_list: Optional[List[str]]) -> Tuple
 
         return symbols_dict, unmatched
 
-# ----------------------------
-# Hex helpers (force uppercase)
-# ----------------------------
-
 def _parse_hex_to_int(addr_hex) -> Optional[int]:
     if isinstance(addr_hex, int):
         return addr_hex
@@ -387,10 +363,6 @@ def to_upper_hex(addr_hex: str) -> str:
         return str(addr_hex)
     return f"0x{n:X}"
 
-# ----------------------------
-# A2L parsing and updating
-# ----------------------------
-
 class A2LBlock:
     def __init__(self,
                  kind: str,
@@ -401,9 +373,9 @@ class A2LBlock:
                  addr_line_idx: Optional[int],
                  old_addr_int: Optional[int],
                  old_addr_hex: Optional[str]):
-        self.kind = kind  # "MEASUREMENT" or "CHARACTERISTIC"
+        self.kind = kind
         self.name = name
-        self.symbol = symbol  # SYMBOL_LINK if present, else block name
+        self.symbol = symbol
         self.begin_idx = begin_idx
         self.end_idx = end_idx
         self.addr_line_idx = addr_line_idx
@@ -414,20 +386,12 @@ MEAS_BEGIN_RE = re.compile(r'^\s*/begin\s+MEASUREMENT\s+(\S+)')
 CHAR_BEGIN_RE = re.compile(r'^\s*/begin\s+CHARACTERISTIC\s+(\S+)')
 SYMBOL_LINK_RE = re.compile(r'^\s*SYMBOL_LINK\s+"([^"]+)"')
 END_BLOCK_RE_TMPL = "/end {}"
-
-# Capture and normalize hex in place
 ECU_ADDRESS_RE = re.compile(r'^(\s*ECU_ADDRESS\s+)(0x[0-9A-Fa-f]+)(.*)$')
 VALUE_ADDR_RE  = re.compile(r'^(\s*VALUE\s+)(0x[0-9A-Fa-f]+)(.*)$')
 ADDRESS_RE     = re.compile(r'^(\s*ADDRESS\s+)(0x[0-9A-Fa-f]+)(.*)$')
-# Decimal fallback for any of the 3 keywords
 DEC_ANY_ADDR_RE = re.compile(r'^(\s*(?:ECU_ADDRESS|VALUE|ADDRESS)\s+)(\d+)(.*)$')
 
 def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
-    """
-    Parse A2L lines and return list of blocks with their symbol names and positions.
-    Captures the address line index and current address for delta computation.
-    Recognizes ECU_ADDRESS, VALUE, and ADDRESS within blocks (first found wins).
-    """
     blocks: List[A2LBlock] = []
     filters: List[str] = []
 
@@ -448,23 +412,18 @@ def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
             old_addr_hex: Optional[str] = None
             old_addr_int: Optional[int] = None
 
-            # find end of block
             j = i + 1
             end_idx = None
             while j < n:
                 l2 = lines[j]
-                # capture SYMBOL_LINK if present
                 m_sym = SYMBOL_LINK_RE.match(l2)
                 if m_sym:
                     symbol_name = m_sym.group(1).strip()
-
-                # capture first address line (any of the known keywords)
                 if addr_line_idx is None:
                     m = ECU_ADDRESS_RE.match(l2) or VALUE_ADDR_RE.match(l2) or ADDRESS_RE.match(l2) or DEC_ANY_ADDR_RE.match(l2)
                     if m:
                         addr_line_idx = j
                         old_addr_hex = m.group(2)
-                        # parse as hex if 0x, else int base 10
                         try:
                             if old_addr_hex.lower().startswith("0x"):
                                 old_addr_int = int(old_addr_hex, 16)
@@ -472,13 +431,12 @@ def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
                                 old_addr_int = int(old_addr_hex, 10)
                         except Exception:
                             old_addr_int = None
-
                 if l2.strip().lower() == END_BLOCK_RE_TMPL.format(kind.lower()):
                     end_idx = j
                     break
                 j += 1
             if end_idx is None:
-                end_idx = n - 1  # Unclosed block - treat until EOF
+                end_idx = n - 1
 
             blocks.append(A2LBlock(kind=kind, name=name, symbol=symbol_name,
                                    begin_idx=begin_idx, end_idx=end_idx,
@@ -497,9 +455,6 @@ def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
     return blocks, filters
 
 def force_uppercase_known_address_keywords(lines: List[str]) -> List[str]:
-    """
-    Ensure all ECU_ADDRESS, ADDRESS, and VALUE lines have uppercase hex for the address field.
-    """
     out: List[str] = []
     for line in lines:
         raw = line.rstrip("\n")
@@ -519,20 +474,9 @@ def force_uppercase_known_address_keywords(lines: List[str]) -> List[str]:
     return out
 
 def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[str, str]) -> Tuple[List[str], List[str]]:
-    """
-    Update the lines for each block using addr_map.
-
-    Recurring symbol handling:
-    - For symbols that appear in multiple blocks, compute each block's original delta
-      from the first occurrence's old address and apply that delta to the newly resolved base address.
-
-    Returns updated lines and a list of warnings for blocks without matches.
-    Also enforces uppercase hex formatting for ECU_ADDRESS/ADDRESS/VALUE lines across the file.
-    """
     out_lines = list(lines)
     warnings: List[str] = []
 
-    # Group blocks by symbol to compute deltas per symbol
     symbol_groups: Dict[str, List[A2LBlock]] = {}
     for b in blocks:
         symbol_groups.setdefault(b.symbol, []).append(b)
@@ -550,7 +494,6 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
                 warnings.append(f"Resolved address for symbol '{symbol}' is invalid: {addr_hex}")
             continue
 
-        # Determine reference old address (first block with an address)
         ref_old_int: Optional[int] = None
         for b in group:
             if b.old_addr_int is not None:
@@ -573,42 +516,32 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
 
             old = out_lines[b.addr_line_idx].rstrip("\n")
 
-            # Try all known patterns in order: ECU_ADDRESS, VALUE, ADDRESS, then decimal fallback
             m = ECU_ADDRESS_RE.match(old)
             if m:
                 new_line = f"{m.group(1)}{new_addr_hex}{m.group(3)}"
                 out_lines[b.addr_line_idx] = new_line + "\n"
                 continue
-
             m = VALUE_ADDR_RE.match(old)
             if m:
                 new_line = f"{m.group(1)}{new_addr_hex}{m.group(3)}"
                 out_lines[b.addr_line_idx] = new_line + "\n"
                 continue
-
             m = ADDRESS_RE.match(old)
             if m:
                 new_line = f"{m.group(1)}{new_addr_hex}{m.group(3)}"
                 out_lines[b.addr_line_idx] = new_line + "\n"
                 continue
-
             m = DEC_ANY_ADDR_RE.match(old)
             if m:
                 new_line = f"{m.group(1)}{new_addr_hex}{m.group(3)}"
                 out_lines[b.addr_line_idx] = new_line + "\n"
                 continue
 
-            # Could not match any address pattern on the recorded address line
             warnings.append(f"Could not update address line for symbol '{symbol}' (block {b.kind} {b.name}): '{old}'")
 
-    # After updates, ensure all known keywords have uppercase hex addresses
     out_lines = force_uppercase_known_address_keywords(out_lines)
 
     return out_lines, warnings
-
-# ----------------------------
-# Helpers to create new blocks and placement
-# ----------------------------
 
 def _guess_datatype_and_limits(meta: Optional[Dict[str, str]]) -> Tuple[str, str, str, str]:
     t = (meta or {}).get("type", "") if meta else ""
@@ -694,10 +627,6 @@ def _find_insert_position_after_kind(lines: List[str], blocks: List[A2LBlock], k
         return last_end + 1
     return len(lines)
 
-# ----------------------------
-# Public APIs
-# ----------------------------
-
 def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
     with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
@@ -769,7 +698,7 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
         print(f"Saved updated A2L to: {outputfile}")
         return
 
-    print(f"Adding {len(missing_symbols)} new {kind} block(s) for filtered symbols not present in A2L).")
+    print(f"Adding {len(missing_symbols)} new {kind} block(s) for filtered symbols not present in A2L.")
 
     insert_lines: List[str] = []
     for idx, name in enumerate(sorted(missing_symbols)):
@@ -800,10 +729,6 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
     with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
         f.writelines(updated_lines)
     print(f"Appended {len(missing_symbols)} new {kind} block(s) after last {kind} section and saved to: {outputfile}")
-
-# ----------------------------
-# CLI
-# ----------------------------
 
 def _main(argv: List[str]) -> int:
     if len(argv) < 2:
