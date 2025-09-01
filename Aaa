@@ -29,6 +29,10 @@ New in this version:
 - Recurring symbol handling: if multiple A2L blocks reference the same SYMBOL_LINK (or block name),
   each block’s new address is updated to base_resolved_address + original_delta_from_first_occurrence.
   This preserves distinct addresses among recurring blocks.
+- FIX: Correct member offsets in recursive traversal. DW_AT_data_member_location can be an
+  expression (exprloc), not only a constant. We now parse common DWARF expressions
+  (DW_OP_plus_uconst, DW_OP_constu/consts, DW_OP_litN) to compute member offsets.
+  This fixes the issue where all recursive elements had the same address.
 
 Notes:
 - Uses hierarchical symbol resolution (supports names like VarName._0_ and Var.Struct.Member).
@@ -44,6 +48,7 @@ from typing import List, Dict, Optional, Tuple, Set, Union
 
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
+from elftools.dwarf.dwarf_expr import DWARFExprParser
 
 # ----------------------------
 # DWARF / Symbol helpers
@@ -141,6 +146,220 @@ def dwarf_type_to_str(tname, tenc, tsize):
     if tenc == DW_ATE_SIGNED and tsize == 1: return "byte"
     if tenc == DW_ATE_BOOLEAN: return "bool"
     return tname
+
+# Decide if we should EMIT a row for a given fully-qualified name.
+# Also record which filter tokens actually matched a real symbol.
+def should_emit(name, filter_list, filter_hits):
+    if not filter_list:
+        return True
+    matched = False
+    for f in filter_list:
+        if name == f or name.startswith(f + ".") or name.startswith(f + "._"):
+            matched = True
+            if filter_hits is not None and f in filter_hits:
+                filter_hits[f] += 1
+    return matched
+
+# Decide if we should TRAVERSE a top-level symbol for potential descendants.
+# Note: traversal does NOT count as a "hit"; we only count actual emitted names.
+def should_traverse(name, filter_list):
+    if not filter_list:
+        return True
+    for f in filter_list:
+        if name == f or name.startswith(f + ".") or name.startswith(f + "._"):
+            return True
+        if f.startswith(name + ".") or f.startswith(name + "._"):
+            return True
+    return False
+
+def _get_member_offset(member_die, dwarfinfo) -> int:
+    """
+    Robustly compute DW_AT_data_member_location offset.
+    Handles:
+      - constant form
+      - exprloc with common ops: DW_OP_plus_uconst, DW_OP_constu/consts, DW_OP_litN
+    Returns 0 when unknown (safe default for unions/bitfields where offset may be 0).
+    """
+    loc = member_die.attributes.get('DW_AT_data_member_location')
+    if not loc:
+        return 0
+    fcls = describe_form_class(loc.form)
+    if fcls == 'constant':
+        try:
+            return int(loc.value)
+        except Exception:
+            return 0
+    if fcls == 'exprloc':
+        try:
+            parser = DWARFExprParser(dwarfinfo.structs)
+            ops = parser.parse_expr(loc.value or b'')
+            # Prefer explicit plus_uconst if present
+            for op in ops:
+                if op.op_name == 'DW_OP_plus_uconst' and op.args:
+                    return int(op.args[0])
+            # Fallback: constu/consts literal
+            for op in ops:
+                if op.op_name in ('DW_OP_constu', 'DW_OP_consts') and op.args:
+                    return int(op.args[0])
+            # Literal small constants (DW_OP_lit0..DW_OP_lit31)
+            if ops and ops[0].op_name.startswith('DW_OP_lit'):
+                try:
+                    return int(ops[0].op_name.replace('DW_OP_lit', ''))
+                except Exception:
+                    pass
+        except Exception:
+            # If parsing fails, fall back to 0
+            return 0
+    # Other classes (e.g., loclist) shouldn't appear for members; default to 0.
+    return 0
+
+def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter_list, filter_hits, dwarfinfo):
+    """Recursively collect members/arrays with full hierarchical names using {prefix}._i_ for arrays."""
+    die = resolve_typedefs(die)
+    if not die:
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), "unknown", "", "unknown"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "unknown",
+                "byte_size": "",
+                "kind": "unknown"
+            }
+        return
+
+    tag = die.tag
+
+    if tag == 'DW_TAG_array_type':
+        elem_die = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
+        elem_die = resolve_typedefs(elem_die)
+        etname, esize, etenc = base_type_info(elem_die)
+        n = array_len_first_dim(die) or 0
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), f"array[{n}]", esize if esize else "", "array"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": f"array[{n}]",
+                "byte_size": esize if esize else "",
+                "kind": "array"
+            }
+        n_print = min(n, MAX_ARRAY)
+        for i in range(n_print):
+            eaddr = base_addr + i * (esize if esize else 1)
+            array_elem_prefix = f"{prefix}._{i}_"
+            if elem_die and elem_die.tag in ('DW_TAG_structure_type', 'DW_TAG_array_type'):
+                collect_dwarf_struct_vars(array_elem_prefix, eaddr, elem_die, rows, symbols_dict, filter_list, filter_hits, dwarfinfo)
+            else:
+                if should_emit(array_elem_prefix, filter_list, filter_hits):
+                    row = [array_elem_prefix, hex(eaddr), dwarf_type_to_str(etname, etenc, esize), esize if esize else "", "array_elem"]
+                    rows.append(row)
+                    symbols_dict[array_elem_prefix] = {
+                        "address": hex(eaddr),
+                        "type": dwarf_type_to_str(etname, etenc, esize),
+                        "byte_size": esize if esize else "",
+                        "kind": "array_elem"
+                    }
+        return
+
+    if tag == 'DW_TAG_structure_type':
+        # record the struct itself if needed
+        _, tsize, _ = base_type_info(die)
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "struct",
+                "byte_size": tsize if tsize else "",
+                "kind": "struct"
+            }
+        for child in die.iter_children():
+            if child.tag != 'DW_TAG_member':
+                continue
+            mname_attr = child.attributes.get('DW_AT_name')
+            mname = mname_attr.value.decode('utf-8', 'ignore') if mname_attr else '<anon>'
+            off = _get_member_offset(child, dwarfinfo)
+            mt = child.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in child.attributes else None
+            if not mt:
+                continue
+            collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr + off, mt, rows, symbols_dict, filter_list, filter_hits, dwarfinfo)
+        return
+
+    # leaf/base types
+    tname, tsize, tenc = base_type_info(die)
+    if should_emit(prefix, filter_list, filter_hits):
+        row = [prefix, hex(base_addr), dwarf_type_to_str(tname, tenc, tsize), tsize if tsize else "", "variable"]
+        rows.append(row)
+        symbols_dict[prefix] = {
+            "address": hex(base_addr),
+            "type": dwarf_type_to_str(tname, tenc, tsize),
+            "byte_size": tsize if tsize else "",
+            "kind": "variable"
+        }
+
+def build_symbols_dict(elf_path: str, filter_list: Optional[List[str]]) -> Tuple[Dict[str, Dict[str, str]], Set[str]]:
+    """
+    Use the collector logic to build a symbols_dict filtered by filter_list.
+    Returns (symbols_dict, missing_filters)
+    """
+    with open(elf_path, 'rb') as f:
+        elf = ELFFile(f)
+        symbols = get_symbols(elf)
+
+        if not elf.has_dwarf_info():
+            raise RuntimeError("No DWARF info found in ELF file.")
+
+        if filter_list and len(filter_list) > 0:
+            print("Filters provided:", ", ".join(filter_list))
+        else:
+            print("No filters provided; processing all symbols.")
+
+        dwarfinfo = elf.get_dwarf_info()
+        rows = []  # not writing CSV here, but keep for parity
+        symbols_dict: Dict[str, Dict[str, str]] = {}
+        filter_hits = {f: 0 for f in (filter_list or [])}
+
+        for name, meta in sorted(symbols.items(), key=lambda kv: kv[1]['addr']):
+            if filter_list and not should_traverse(name, filter_list):
+                continue
+            addr = meta['addr']
+            found = False
+            for cu in dwarfinfo.iter_CUs():
+                for die in cu.iter_DIEs():
+                    if die.tag != 'DW_TAG_variable':
+                        continue
+                    n = die.attributes.get('DW_AT_name')
+                    if not n:
+                        continue
+                    vname = n.value.decode('utf-8', 'ignore')
+                    if vname == name:
+                        tdie = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
+                        if tdie:
+                            collect_dwarf_struct_vars(name, addr, tdie, rows, symbols_dict, filter_list, filter_hits, dwarfinfo)
+                        else:
+                            if should_emit(name, filter_list, filter_hits):
+                                symbols_dict[name] = {
+                                    "address": hex(addr),
+                                    "type": "unknown",
+                                    "byte_size": "",
+                                    "kind": "unknown"
+                                }
+                        found = True
+                        break
+                if found:
+                    break
+
+        unmatched = {f for f, c in filter_hits.items() if c == 0}
+        if filter_list:
+            if unmatched:
+                print("Warning: the following filters matched no symbols:")
+                for f in unmatched:
+                    print(f" - {f}")
+            else:
+                print("All filters matched at least one symbol.")
+
+        return symbols_dict, unmatched
 
 # ----------------------------
 # Hex helpers (force uppercase)
@@ -339,7 +558,10 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
                 ref_old_int = b.old_addr_int
                 break
 
+        # If we have multiple blocks and at least one has an old address, we'll apply deltas.
         multi = len(group) > 1 and ref_old_int is not None
+        if multi:
+            pass
 
         for b in group:
             if b.addr_line_idx is None:
