@@ -29,6 +29,8 @@ New in this version:
 - Recurring symbol handling: if multiple A2L blocks reference the same SYMBOL_LINK (or block name),
   each block’s new address is updated to base_resolved_address + original_delta_from_first_occurrence.
   This preserves distinct addresses among recurring blocks.
+- Fix: Properly evaluate DW_AT_data_member_location when encoded as a DWARF exprloc (e.g., DW_OP_plus_uconst),
+  so recursive struct/array members get distinct addresses (not all equal to the base).
 
 Notes:
 - Uses hierarchical symbol resolution (supports names like VarName._0_ and Var.Struct.Member).
@@ -44,6 +46,7 @@ from typing import List, Dict, Optional, Tuple, Set, Union
 
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import describe_form_class
+from elftools.dwarf.dwarf_expr import DWARFExprParser  # NEW: for exprloc offsets
 
 # ----------------------------
 # DWARF / Symbol helpers
@@ -167,6 +170,90 @@ def should_traverse(name, filter_list):
             return True
     return False
 
+def _decode_lit(op_name: str) -> Optional[int]:
+    """Extract value from DW_OP_litN op names."""
+    if not op_name.startswith('DW_OP_lit'):
+        return None
+    try:
+        return int(op_name[len('DW_OP_lit'):])
+    except Exception:
+        return None
+
+def _data_member_offset(member_die) -> int:
+    """
+    Return the byte offset of a struct/union member.
+
+    Handles both:
+    - DW_AT_data_member_location with a constant form
+    - DW_AT_data_member_location with an exprloc form (e.g., DW_OP_plus_uconst, DW_OP_constu + DW_OP_plus)
+
+    Returns 0 if it cannot be determined.
+    """
+    loc_attr = member_die.attributes.get('DW_AT_data_member_location')
+    if not loc_attr:
+        return 0
+
+    cls = describe_form_class(loc_attr.form)
+    if cls == 'constant':
+        try:
+            return int(loc_attr.value)
+        except Exception:
+            return 0
+
+    if cls == 'exprloc':
+        try:
+            parser = DWARFExprParser(member_die.cu.dwarfinfo.structs)
+            ops = parser.parse_expr(loc_attr.value)
+
+            offset = 0
+            pending_const: Optional[int] = None
+
+            for op in ops:
+                name = op.op_name
+
+                # Common, simplest case
+                if name == 'DW_OP_plus_uconst':
+                    try:
+                        offset += int(op.args[0])
+                    except Exception:
+                        pass
+                    continue
+
+                # Constants that may be later added via DW_OP_plus/DW_OP_add
+                if name in (
+                    'DW_OP_constu', 'DW_OP_const1u', 'DW_OP_const2u',
+                    'DW_OP_const4u', 'DW_OP_const8u'
+                ):
+                    try:
+                        pending_const = int(op.args[0])
+                    except Exception:
+                        pending_const = None
+                    continue
+
+                lit_val = _decode_lit(name)
+                if lit_val is not None:
+                    pending_const = lit_val
+                    continue
+
+                if name in ('DW_OP_plus', 'DW_OP_add'):
+                    if pending_const is not None:
+                        offset += pending_const
+                        pending_const = None
+                    continue
+
+                # Other ops (DW_OP_deref, DW_OP_stack_value, etc.) are not expected here for member offsets.
+
+            # In some compilers, the expression can just be a single const
+            if offset == 0 and pending_const is not None:
+                offset += pending_const
+
+            return int(offset)
+        except Exception:
+            return 0
+
+    # Unhandled form class
+    return 0
+
 def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter_list, filter_hits):
     """Recursively collect members/arrays with full hierarchical names using {prefix}._i_ for arrays."""
     die = resolve_typedefs(die)
@@ -234,14 +321,37 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
                 continue
             mname_attr = child.attributes.get('DW_AT_name')
             mname = mname_attr.value.decode('utf-8', 'ignore') if mname_attr else '<anon>'
-            loc = child.attributes.get('DW_AT_data_member_location')
-            off = 0
-            if loc and describe_form_class(loc.form) == 'constant':
-                off = int(loc.value)
+
+            # NEW: correctly compute member offset even when exprloc is used
+            off = _data_member_offset(child)
+
             mt = child.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in child.attributes else None
             if not mt:
                 continue
             collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr + off, mt, rows, symbols_dict, filter_list, filter_hits)
+        return
+
+    if tag == 'DW_TAG_union_type':
+        # Unions share the same address for all members (offset 0), but we still enumerate members.
+        _, tsize, _ = base_type_info(die)
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), "union", tsize if tsize else "", "union"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "union",
+                "byte_size": tsize if tsize else "",
+                "kind": "union"
+            }
+        for child in die.iter_children():
+            if child.tag != 'DW_TAG_member':
+                continue
+            mname_attr = child.attributes.get('DW_AT_name')
+            mname = mname_attr.value.decode('utf-8', 'ignore') if mname_attr else '<anon>'
+            mt = child.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in child.attributes else None
+            if not mt:
+                continue
+            collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr, mt, rows, symbols_dict, filter_list, filter_hits)
         return
 
     # leaf/base types
@@ -518,9 +628,6 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
 
         # If we have multiple blocks and at least one has an old address, we'll apply deltas.
         multi = len(group) > 1 and ref_old_int is not None
-        if multi:
-            # Optional: comment in warnings to indicate delta application
-            pass
 
         for b in group:
             if b.addr_line_idx is None:
@@ -771,7 +878,7 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
     #    Skip container-only nodes (struct/array); include leaves like variables and array elements.
     missing_symbols = [
         name for name, meta in symbols_dict.items()
-        if name not in existing_symbols and meta.get("kind") not in ("struct", "array")
+        if name not in existing_symbols and meta.get("kind") not in ("struct", "array", "union")
     ]
 
     if not missing_symbols:
