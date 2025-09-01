@@ -2,21 +2,17 @@
 """
 Update and extend A2L files using symbol addresses from an ELF (with DWARF).
 
-Key fix for your case:
-- Correctly resolves struct member offsets when compilers encode DW_AT_data_member_location
-  as:
-  - exprloc (DW_OP_plus_uconst, DW_OP_constu, DW_OP_plus, etc.)
-  - old DWARF block forms (DW_FORM_block{1,2,4}): many embedded toolchains (DWARFv2) use this
-  - implicit_const (DW_FORM_implicit_const)
-  - bitfield attributes (DW_AT_data_bit_offset / DW_AT_bit_offset): we convert bits to bytes
+Highlights
+- Correct member offsets for recursive struct/array traversal (handles DW_AT_data_member_location as constant, exprloc, block*, implicit_const, and bit offsets).
+- Updates ECU_ADDRESS, ADDRESS, and VALUE (hex or decimal) in MEASUREMENT/CHARACTERISTIC blocks.
+- Adds ALL filtered symbols by default, including containers (struct, array, union) such as:
+  ErrStoreMgr, ErrStoreMgr._0_, ErrStoreMgr._0_.StandardFaultDataSet, and all nested leaves.
+- Preserves recurring-symbol deltas among multiple A2L blocks with the same SYMBOL_LINK.
+- Uppercases all hex addresses it touches.
 
-Other features:
-- Updates ECU_ADDRESS, ADDRESS, and VALUE inside both MEASUREMENT/CHARACTERISTIC blocks.
-- Falls back to decimal address update if a line uses decimal instead of hex.
-- Forces uppercase hex for all ECU_ADDRESS/ADDRESS/VALUE across the file.
-- Preserves per-block deltas when the same symbol recurs in multiple A2L blocks.
-- addvariable can append missing filtered symbols as MEASUREMENT or CHARACTERISTIC.
-- Supports hierarchical/array names (e.g., Var._0_.Member).
+Configure behavior
+- By default, addvariable includes containers (struct/array/union) in new blocks.
+- To revert to old behavior (leaves only), set env A2L_INCLUDE_CONTAINERS=0 or pass CLI flag --leaves-only.
 
 Requires: pip install pyelftools
 """
@@ -35,6 +31,7 @@ from elftools.dwarf.dwarf_expr import DWARFExprParser
 # Config / Debug
 # ----------------------------
 A2L_DEBUG = os.environ.get("A2L_DEBUG", "0") not in ("0", "", "false", "False")
+DEFAULT_INCLUDE_CONTAINERS = os.environ.get("A2L_INCLUDE_CONTAINERS", "1") not in ("0", "", "false", "False")
 
 # ----------------------------
 # DWARF / Symbol helpers
@@ -171,14 +168,10 @@ def _data_member_offset(member_die) -> int:
 
     Handles:
     - DW_AT_data_member_location class 'constant' or 'implicit_const'
-    - DW_AT_data_member_location class 'exprloc'
-    - Older DWARF: 'block' forms for location expressions (DW_FORM_block*)
+    - DW_AT_data_member_location class 'exprloc' or 'block' (DWARF v2 encodings)
     - Bitfields via DW_AT_data_bit_offset / DW_AT_bit_offset -> add bits//8
     """
-    # Prefer explicit byte offset from data_member_location
     loc_attr = member_die.attributes.get('DW_AT_data_member_location')
-
-    # Some compilers also provide bit offsets for bitfields
     bit_off_attr = member_die.attributes.get('DW_AT_data_bit_offset') or member_die.attributes.get('DW_AT_bit_offset')
     bit_extra = 0
     if bit_off_attr is not None:
@@ -188,18 +181,15 @@ def _data_member_offset(member_die) -> int:
             bit_extra = 0
 
     if not loc_attr:
-        return bit_extra  # At least return whole-byte portion of bit offset if available
+        return bit_extra
 
     cls = describe_form_class(loc_attr.form)
-
-    # Constant (includes DW_FORM_implicit_const in pyelftools)
     if cls == 'constant':
         try:
             return int(loc_attr.value) + bit_extra
         except Exception:
             return bit_extra
 
-    # exprloc or (DWARF2) block-encoded location expressions
     if cls in ('exprloc', 'block'):
         try:
             parser = DWARFExprParser(member_die.cu.dwarfinfo.structs)
@@ -211,7 +201,6 @@ def _data_member_offset(member_die) -> int:
             for op in ops:
                 name = op.op_name
 
-                # The common case: base + plus_uconst
                 if name == 'DW_OP_plus_uconst':
                     try:
                         offset += int(op.args[0])
@@ -219,7 +208,6 @@ def _data_member_offset(member_die) -> int:
                         pass
                     continue
 
-                # Stack constants that may later be added with DW_OP_plus/DW_OP_add
                 if name in (
                     'DW_OP_constu', 'DW_OP_const1u', 'DW_OP_const2u',
                     'DW_OP_const4u', 'DW_OP_const8u',
@@ -232,22 +220,17 @@ def _data_member_offset(member_die) -> int:
                         pending_const = None
                     continue
 
-                # Literal constants DW_OP_litN
                 lit_val = _decode_lit(name)
                 if lit_val is not None:
                     pending_const = lit_val
                     continue
 
-                # Combine with plus/add
                 if name in ('DW_OP_plus', 'DW_OP_add'):
                     if pending_const is not None:
                         offset += pending_const
                         pending_const = None
                     continue
 
-                # Ignore other ops (not expected for member offsets): deref, piece, etc.
-
-            # Expression might just be a single const
             if offset == 0 and pending_const is not None:
                 offset += pending_const
 
@@ -261,7 +244,6 @@ def _data_member_offset(member_die) -> int:
                 print(f"[A2L_DEBUG] Failed to parse member offset expr (form={form}): {e}")
             return bit_extra
 
-    # Unhandled form class; fall back to any bit offset contribution
     if A2L_DEBUG:
         try:
             form = str(loc_attr.form)
@@ -321,7 +303,6 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
         return
 
     if tag == 'DW_TAG_structure_type':
-        # record the struct itself if needed
         _, tsize, _ = base_type_info(die)
         if should_emit(prefix, filter_list, filter_hits):
             row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
@@ -640,7 +621,6 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
                 ref_old_int = b.old_addr_int
                 break
 
-        # If we have multiple blocks and at least one has an old address, apply deltas.
         multi = len(group) > 1 and ref_old_int is not None
 
         for b in group:
@@ -648,7 +628,6 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
                 warnings.append(f"No address line found to update for symbol '{symbol}' (block {b.kind} {b.name}).")
                 continue
 
-            # Compute delta if applicable
             delta = 0
             if multi and b.old_addr_int is not None and ref_old_int is not None:
                 delta = b.old_addr_int - ref_old_int
@@ -699,7 +678,12 @@ def _guess_datatype_and_limits(meta: Optional[Dict[str, str]]) -> Tuple[str, str
     Guess A2L data keywords and limit ranges from symbol metadata.
     Returns tuple:
       (meas_datatype, char_deposit, lower, upper)
+    For container nodes (struct/array/union), prefer ULONG width.
     """
+    kind = (meta or {}).get("kind", "")
+    if kind in ("struct", "array", "union"):
+        return "ULONG", "ULong_Value", "0", "4294967295"
+
     t = (meta or {}).get("type", "") if meta else ""
     t = (t or "").lower()
     # Defaults
@@ -842,7 +826,7 @@ def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
         f.writelines(updated_lines)
     print(f"Saved updated A2L to: {newa2l}")
 
-def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vartype: str, outputfile: str) -> None:
+def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vartype: str, outputfile: str, include_containers: Optional[bool] = None) -> None:
     """
     Add new variables (ALL filtered, missing from A2L) and update all existing addresses.
 
@@ -850,10 +834,21 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
     - MEASUREMENT additions are inserted right after the last existing MEASUREMENT block.
     - CHARACTERISTIC additions are inserted right after the last existing CHARACTERISTIC block.
     - Ensure exactly one blank line between new blocks, and one blank line before the first inserted block if needed.
+
+    Parameters:
+    - olda2l: path to existing A2L file
+    - elf: path to ELF file (with DWARF)
+    - variablename: a symbol filter or list of filters (supports members/array elements like Var._0_)
+    - vartype: 'characteristic' or 'measurement' (case-insensitive) used for ALL new blocks appended
+    - outputfile: path to write updated A2L
+    - include_containers: include struct/array/union nodes as A2L entries (default: env A2L_INCLUDE_CONTAINERS, default True)
     """
     kind = (vartype or "").strip().upper()
     if kind not in ("CHARACTERISTIC", "MEASUREMENT"):
         raise ValueError("vartype must be 'characteristic' or 'measurement'")
+
+    if include_containers is None:
+        include_containers = DEFAULT_INCLUDE_CONTAINERS
 
     with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
@@ -871,6 +866,7 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
     print(f"Starting 'addvariable' with {len(filters)} filter token(s).")
     if extra_filters:
         print("- Added filter token(s):", ", ".join(extra_filters))
+    print(f"- include_containers = {include_containers}")
 
     # Resolve all symbols for these filters
     symbols_dict, missing_filters = build_symbols_dict(elf, filters)
@@ -884,11 +880,16 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
         print("Warning:", w)
 
     # 2) Append ALL filtered symbols that are not already present in the A2L
-    #    Skip container-only nodes (struct/array/union); include leaves like variables and array elements.
-    missing_symbols = [
-        name for name, meta in symbols_dict.items()
-        if name not in existing_symbols and meta.get("kind") not in ("struct", "array", "union")
-    ]
+    if include_containers:
+        missing_symbols = [
+            name for name in symbols_dict.keys()
+            if name not in existing_symbols
+        ]
+    else:
+        missing_symbols = [
+            name for name, meta in symbols_dict.items()
+            if name not in existing_symbols and meta.get("kind") not in ("struct", "array", "union")
+        ]
 
     if not missing_symbols:
         print("No new filtered symbols to add; only addresses were updated.")
@@ -920,7 +921,6 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
             insert_idx += 1
         else:
             # If there are multiple blank lines, collapse to a single one
-            # Remove extra blank lines directly before insert_idx leaving one
             k = insert_idx - 1
             while k - 1 >= 0 and updated_lines[k - 1].strip() == "":
                 del updated_lines[k - 1]
@@ -945,15 +945,15 @@ def _main(argv: List[str]) -> int:
     if len(argv) < 2:
         print(f"Usage:\n"
               f"  {argv[0]} update <olda2l> <elf> <newa2l>\n"
-              f"  {argv[0]} add <olda2l> <elf> <variablename|list> <characteristic|measurement> <outputfile>\n\n"
+              f"  {argv[0]} add <olda2l> <elf> <variablename|list> <characteristic|measurement> <outputfile> [--leaves-only|--include-containers]\n\n"
               f"Notes:\n"
-              f"- 'add' updates addresses for existing blocks AND appends ALL filtered symbols missing from the A2L.\n"
+              f"- 'add' updates addresses for existing blocks AND appends filtered symbols missing from the A2L.\n"
               f"- Filters = all symbols referenced in the A2L + provided variablename(s).\n"
-              f"- variablename can be a comma-separated list (A,B,C) or a JSON-like list string (e.g., [\"A\",\"B\"]).\n"
-              f"- New MEASUREMENT/CHARACTERISTIC blocks are inserted right after the last block of the same kind.\n"
+              f"- variablename can be comma-separated (A,B,C) or a JSON-like list string (e.g., [\"A\",\"B\"]).\n"
+              f"- New blocks are inserted right after the last block of the same kind.\n"
               f"- All ECU_ADDRESS/ADDRESS/VALUE addresses are emitted in uppercase hex.\n"
               f"- Recurring symbols: per-block address deltas relative to the first occurrence are preserved on update.\n"
-              f"- Set A2L_DEBUG=1 to print debug info when parsing member offsets.")
+              f"- By default, containers (struct/array/union) are included; use --leaves-only or A2L_INCLUDE_CONTAINERS=0 to skip them.")
         return 1
 
     cmd = argv[1].lower()
@@ -967,11 +967,17 @@ def _main(argv: List[str]) -> int:
 
     if cmd == "add":
         if len(argv) < 7:
-            print(f"Usage: {argv[0]} add <olda2l> <elf> <variablename|list> <characteristic|measurement> <outputfile>")
+            print(f"Usage: {argv[0]} add <olda2l> <elf> <variablename|list> <characteristic|measurement> <outputfile> [--leaves-only|--include-containers]")
             return 1
         _, _, olda2l, elf, variablename_arg, vartype, outputfile = argv[:7]
+        flags = set(a.lower() for a in argv[7:])
+        include_containers = DEFAULT_INCLUDE_CONTAINERS
+        if "--leaves-only" in flags:
+            include_containers = False
+        if "--include-containers" in flags:
+            include_containers = True
         variablename_list = _normalize_variablename_input(variablename_arg)
-        addvariable(olda2l, elf, variablename_list, vartype, outputfile)
+        addvariable(olda2l, elf, variablename_list, vartype, outputfile, include_containers=include_containers)
         return 0
 
     print(f"Unknown command: {cmd}")
