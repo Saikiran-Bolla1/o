@@ -26,6 +26,9 @@ New in this version:
   after the last existing MEASUREMENT block; CHARACTERISTIC blocks are inserted immediately
   after the last existing CHARACTERISTIC block. One blank line is kept between each new block
   and there is one blank line before the first inserted block if needed.
+- Recurring symbol handling: if multiple A2L blocks reference the same SYMBOL_LINK (or block name),
+  each block’s new address is updated to base_resolved_address + original_delta_from_first_occurrence.
+  This preserves distinct addresses among recurring blocks.
 
 Notes:
 - Uses hierarchical symbol resolution (supports names like VarName._0_ and Var.Struct.Member).
@@ -217,7 +220,8 @@ def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter
         # record the struct itself if needed
         _, tsize, _ = base_type_info(die)
         if should_emit(prefix, filter_list, filter_hits):
-            row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
+            row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"
+            ]
             rows.append(row)
             symbols_dict[prefix] = {
                 "address": hex(base_addr),
@@ -349,13 +353,23 @@ def to_upper_hex(addr_hex: str) -> str:
 # ----------------------------
 
 class A2LBlock:
-    def __init__(self, kind: str, name: str, symbol: str, begin_idx: int, end_idx: int, addr_line_idx: Optional[int]):
+    def __init__(self,
+                 kind: str,
+                 name: str,
+                 symbol: str,
+                 begin_idx: int,
+                 end_idx: int,
+                 addr_line_idx: Optional[int],
+                 old_addr_int: Optional[int],
+                 old_addr_hex: Optional[str]):
         self.kind = kind  # "MEASUREMENT" or "CHARACTERISTIC"
         self.name = name
         self.symbol = symbol  # SYMBOL_LINK if present, else block name
         self.begin_idx = begin_idx
         self.end_idx = end_idx
         self.addr_line_idx = addr_line_idx
+        self.old_addr_int = old_addr_int
+        self.old_addr_hex = old_addr_hex
 
 MEAS_BEGIN_RE = re.compile(r'^\s*/begin\s+MEASUREMENT\s+(\S+)')
 CHAR_BEGIN_RE = re.compile(r'^\s*/begin\s+CHARACTERISTIC\s+(\S+)')
@@ -372,6 +386,7 @@ def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
     Parse A2L lines and return list of blocks with their symbol names and positions.
     Also return a list of symbols (filters) to look up.
     Preference: use SYMBOL_LINK if available, otherwise the block name.
+    Additionally captures the current address value (if present) for delta computation.
     """
     blocks: List[A2LBlock] = []
     filters: List[str] = []
@@ -390,6 +405,8 @@ def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
             begin_idx = i
             symbol_name = name
             addr_line_idx: Optional[int] = None
+            old_addr_hex: Optional[str] = None
+            old_addr_int: Optional[int] = None
 
             # find end of block
             j = i + 1
@@ -401,13 +418,19 @@ def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
                 if m_sym:
                     symbol_name = m_sym.group(1).strip()
 
-                # capture address line
+                # capture address line and current address
                 if kind == "MEASUREMENT":
-                    if ECU_ADDRESS_RE.match(l2):
+                    m_addr = ECU_ADDRESS_RE.match(l2)
+                    if m_addr:
                         addr_line_idx = j
+                        old_addr_hex = m_addr.group(2)
+                        old_addr_int = _parse_hex_to_int(old_addr_hex)
                 else:  # CHARACTERISTIC
-                    if VALUE_ADDR_RE.match(l2):
+                    m_addr = VALUE_ADDR_RE.match(l2)
+                    if m_addr:
                         addr_line_idx = j
+                        old_addr_hex = m_addr.group(2)
+                        old_addr_int = _parse_hex_to_int(old_addr_hex)
 
                 if l2.strip().lower() == END_BLOCK_RE_TMPL.format(kind.lower()):
                     end_idx = j
@@ -418,7 +441,9 @@ def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
 
             blocks.append(A2LBlock(kind=kind, name=name, symbol=symbol_name,
                                    begin_idx=begin_idx, end_idx=end_idx,
-                                   addr_line_idx=addr_line_idx))
+                                   addr_line_idx=addr_line_idx,
+                                   old_addr_int=old_addr_int,
+                                   old_addr_hex=old_addr_hex))
 
             if symbol_name not in filters:
                 filters.append(symbol_name)
@@ -455,46 +480,84 @@ def force_uppercase_known_address_keywords(lines: List[str]) -> List[str]:
 def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[str, str]) -> Tuple[List[str], List[str]]:
     """
     Update the lines for each block using addr_map.
+
+    Recurring symbol handling:
+    - For symbols that appear in multiple blocks, we compute each block's original delta
+      from the first occurrence's old address and apply that delta to the newly resolved base address.
+
     Returns updated lines and a list of warnings for blocks without matches.
     Also forces uppercase hex formatting for ECU_ADDRESS/ADDRESS/VALUE lines across the file.
     """
     out_lines = list(lines)
     warnings: List[str] = []
 
+    # Group blocks by symbol to compute deltas per symbol
+    symbol_groups: Dict[str, List[A2LBlock]] = {}
     for b in blocks:
-        addr_hex = addr_map.get(b.symbol)
+        symbol_groups.setdefault(b.symbol, []).append(b)
+
+    for symbol, group in symbol_groups.items():
+        addr_hex = addr_map.get(symbol)
         if not addr_hex:
-            warnings.append(f"No address found for symbol '{b.symbol}' (block {b.kind} {b.name}).")
+            for b in group:
+                warnings.append(f"No address found for symbol '{symbol}' (block {b.kind} {b.name}).")
             continue
 
-        if b.addr_line_idx is None:
-            warnings.append(f"No address line found to update for symbol '{b.symbol}' (block {b.kind} {b.name}).")
+        base_new_int = _parse_hex_to_int(addr_hex)
+        if base_new_int is None:
+            for b in group:
+                warnings.append(f"Resolved address for symbol '{symbol}' is invalid: {addr_hex}")
             continue
 
-        old = out_lines[b.addr_line_idx].rstrip("\n")
-        addr_hex_up = to_upper_hex(addr_hex)
+        # Determine reference old address (first block with an address)
+        ref_old_int: Optional[int] = None
+        for b in group:
+            if b.old_addr_int is not None:
+                ref_old_int = b.old_addr_int
+                break
 
-        if b.kind == "MEASUREMENT":
-            # Replace ECU_ADDRESS hex
-            m = ECU_ADDRESS_RE.match(old)
-            if m:
-                new_line = f"{m.group(1)}{addr_hex_up}{m.group(3)}"
-            else:
-                # fallback
-                new_line = re.sub(r'^(\s*ECU_ADDRESS\s+)(0x[0-9A-Fa-f]+)',
-                                  lambda mm: mm.group(1) + addr_hex_up,
-                                  old)
-        else:
-            # Replace VALUE hex
-            m = VALUE_ADDR_RE.match(old)
-            if m:
-                new_line = f"{m.group(1)}{addr_hex_up}{m.group(3)}"
-            else:
-                new_line = re.sub(r'^(\s*VALUE\s+)(0x[0-9A-Fa-f]+)',
-                                  lambda mm: mm.group(1) + addr_hex_up,
-                                  old)
+        # If we have multiple blocks and at least one has an old address, we'll apply deltas.
+        multi = len(group) > 1 and ref_old_int is not None
+        if multi:
+            # Optional: comment in warnings to indicate delta application
+            pass
 
-        out_lines[b.addr_line_idx] = new_line + "\n"
+        for b in group:
+            if b.addr_line_idx is None:
+                warnings.append(f"No address line found to update for symbol '{symbol}' (block {b.kind} {b.name}).")
+                continue
+
+            # Compute delta if applicable
+            delta = 0
+            if multi and b.old_addr_int is not None and ref_old_int is not None:
+                delta = b.old_addr_int - ref_old_int
+
+            new_addr_int = base_new_int + delta
+            new_addr_hex = f"0x{new_addr_int:X}"
+
+            old = out_lines[b.addr_line_idx].rstrip("\n")
+
+            if b.kind == "MEASUREMENT":
+                # Replace ECU_ADDRESS hex
+                m = ECU_ADDRESS_RE.match(old)
+                if m:
+                    new_line = f"{m.group(1)}{new_addr_hex}{m.group(3)}"
+                else:
+                    # fallback
+                    new_line = re.sub(r'^(\s*ECU_ADDRESS\s+)(0x[0-9A-Fa-f]+)',
+                                      lambda mm: mm.group(1) + new_addr_hex,
+                                      old)
+            else:
+                # Replace VALUE hex
+                m = VALUE_ADDR_RE.match(old)
+                if m:
+                    new_line = f"{m.group(1)}{new_addr_hex}{m.group(3)}"
+                else:
+                    new_line = re.sub(r'^(\s*VALUE\s+)(0x[0-9A-Fa-f]+)',
+                                      lambda mm: mm.group(1) + new_addr_hex,
+                                      old)
+
+            out_lines[b.addr_line_idx] = new_line + "\n"
 
     # After updates, ensure all known keywords have uppercase hex addresses
     out_lines = force_uppercase_known_address_keywords(out_lines)
@@ -622,6 +685,8 @@ def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
     resolve addresses from elf (DWARF + symtab) using the collector with filtering,
     and write updated a2l to newa2l.
     All ECU_ADDRESS/ADDRESS/VALUE lines use uppercase hex for addresses.
+    Recurring symbols (same SYMBOL_LINK appearing multiple times) preserve their original
+    per-block deltas relative to the first occurrence.
     """
     with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
@@ -697,7 +762,7 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
     addr_map = {name: to_upper_hex(meta["address"]) for name, meta in symbols_dict.items()}
     print(f"Resolved {len(addr_map)} addresses from ELF.")
 
-    # 1) Update addresses for existing blocks
+    # 1) Update addresses for existing blocks (with recurring symbol delta handling)
     updated_lines, warnings = update_a2l_lines(lines, blocks, addr_map)
     for w in warnings:
         print("Warning:", w)
@@ -770,7 +835,8 @@ def _main(argv: List[str]) -> int:
               f"- Filters = all symbols referenced in the A2L + provided variablename(s).\n"
               f"- variablename can be a comma-separated list (A,B,C) or a JSON-like list string (e.g., [\"A\",\"B\"]).\n"
               f"- New MEASUREMENT/CHARACTERISTIC blocks are inserted right after the last block of the same kind.\n"
-              f"- All ECU_ADDRESS/ADDRESS/VALUE addresses are emitted in uppercase hex.")
+              f"- All ECU_ADDRESS/ADDRESS/VALUE addresses are emitted in uppercase hex.\n"
+              f"- Recurring symbols: per-block address deltas relative to the first occurrence are preserved on update.")
         return 1
 
     cmd = argv[1].lower()
