@@ -1,0 +1,212 @@
+def mergea2l(a2l_files: Union[str, List[str]], outputfile: str, elf: Optional[str] = None) -> None:
+    """
+    Merge MEASUREMENT and CHARACTERISTIC blocks from multiple A2L files.
+
+    Behavior:
+    - Uses the first A2L file as the base.
+    - Appends missing MEASUREMENT blocks from subsequent files immediately after the last MEASUREMENT in the first file.
+    - Appends missing CHARACTERISTIC blocks after the last CHARACTERISTIC in the first file.
+    - Dedupe strategy:
+        - If the same SYMBOL_LINK appears as both MEASUREMENT and CHARACTERISTIC in any input,
+          prefer CHARACTERISTIC and remove all MEASUREMENT blocks for that symbol from the result.
+        - For the same (kind, symbol) pair, keep existing blocks from the base and do not add duplicates from later files.
+    - Ensures exactly one blank line between inserted blocks and a single blank line before the first inserted block per kind.
+    - Forces uppercase hex formatting for ECU_ADDRESS/ADDRESS/VALUE lines.
+    - If an ELF is provided, resolves addresses for all symbols present in the merged file and updates them.
+
+    Parameters:
+    - a2l_files: list of input A2L file paths (first is base).
+    - outputfile: path to write merged A2L.
+    - elf: optional path to ELF file with DWARF for address updates.
+    """
+    # Normalize a2l_files to a list
+    if isinstance(a2l_files, (str,)):
+        a2l_files = [a2l_files]
+    a2l_files = [p for p in a2l_files if str(p).strip()]
+
+    if len(a2l_files) < 1:
+        raise ValueError("At least one A2L file must be provided to merge.")
+
+    # Load all files up-front so we can compute global preferences
+    files_data: List[Tuple[str, List[str], List[A2LBlock]]] = []
+    for idx, path in enumerate(a2l_files):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception as e:
+            raise RuntimeError(f"Failed to read A2L file '{path}': {e}")
+
+        blocks, _ = parse_a2l_blocks(lines)
+        files_data.append((path, lines, blocks))
+
+    # Build the global set of symbols that appear as CHARACTERISTIC anywhere
+    char_symbols: Set[str] = set()
+    for _, _, blocks in files_data:
+        for b in blocks:
+            if b.kind == "CHARACTERISTIC":
+                char_symbols.add(b.symbol)
+
+    # Use first file as base
+    base_path, base_lines, base_blocks = files_data[0]
+    print(f"Using base A2L: {base_path}")
+
+    # 1) In the base file, remove any MEASUREMENT blocks whose symbol is in char_symbols
+    #    (prefer CHARACTERISTIC if both exist anywhere).
+    to_delete: List[Tuple[int, int, str]] = []
+    for b in base_blocks:
+        if b.kind == "MEASUREMENT" and b.symbol in char_symbols:
+            to_delete.append((b.begin_idx, b.end_idx, b.symbol))
+
+    if to_delete:
+        print(f"Removing {len(to_delete)} base MEASUREMENT block(s) that conflict with CHARACTERISTIC presence.")
+        # Delete from the end to keep indexes valid
+        for begin, end, sym in sorted(to_delete, key=lambda t: t[0], reverse=True):
+            del base_lines[begin:end + 1]
+        # Re-parse after deletions
+        base_blocks, _ = parse_a2l_blocks(base_lines)
+
+    # Track what exists in base after cleanup
+    existing_pairs: Set[Tuple[str, str]] = {(b.kind, b.symbol) for b in base_blocks}
+    existing_symbols_by_kind = {
+        "MEASUREMENT": {b.symbol for b in base_blocks if b.kind == "MEASUREMENT"},
+        "CHARACTERISTIC": {b.symbol for b in base_blocks if b.kind == "CHARACTERISTIC"},
+    }
+
+    # 2) From subsequent files, prepare additions with rules:
+    #    - If symbol is in char_symbols: only add CHARACTERISTIC (skip MEASUREMENT).
+    #    - Else, add MEASUREMENT if not already present.
+    #    - Avoid duplicates of the same (kind, symbol) already in base or queued to add.
+    additions_char: Dict[str, List[str]] = {}
+    additions_meas: Dict[str, List[str]] = {}
+
+    for path, lines, blocks in files_data[1:]:
+        print(f"Scanning A2L file for merge: {path}")
+        for b in blocks:
+            block_lines = lines[b.begin_idx:b.end_idx + 1]
+            sym = b.symbol
+
+            # If symbol is globally a CHARACTERISTIC somewhere, prefer CHARACTERISTIC
+            if sym in char_symbols:
+                if b.kind != "CHARACTERISTIC":
+                    # skip measurements for this symbol
+                    continue
+                # Add CHARACTERISTIC if not already present in base or queued
+                if ("CHARACTERISTIC", sym) in existing_pairs or sym in additions_char:
+                    continue
+                additions_char[sym] = block_lines
+            else:
+                # Not globally a characteristic: allow measurements
+                if b.kind != "MEASUREMENT":
+                    # If we see a CHARACTERISTIC here but it wasn't in char_symbols, add it to char_symbols and prefer it
+                    # going forward; also remove any queued measurement for this symbol.
+                    char_symbols.add(sym)
+                    # Remove queued measurement if any
+                    if sym in additions_meas:
+                        del additions_meas[sym]
+                    # Add this characteristic if not present already
+                    if ("CHARACTERISTIC", sym) not in existing_pairs and sym not in additions_char:
+                        additions_char[sym] = block_lines
+                    continue
+
+                # It's a MEASUREMENT and not globally a characteristic
+                if ("MEASUREMENT", sym) in existing_pairs or sym in additions_meas:
+                    continue
+                additions_meas[sym] = block_lines
+
+    # If discovering new CHARACTERISTICs in later files caused some base MEASUREMENTS
+    # to conflict (rare since we already scanned all files first), ensure base is clean:
+    # Remove base MEASUREMENTS whose symbol is now in updated char_symbols but still present.
+    if additions_char:
+        # recompute due to potential char_symbols growth in loop above
+        if char_symbols:
+            base_blocks, _ = parse_a2l_blocks(base_lines)
+            to_delete2: List[Tuple[int, int, str]] = []
+            for b in base_blocks:
+                if b.kind == "MEASUREMENT" and b.symbol in char_symbols:
+                    # remove only if no CHARACTERISTIC already exists in base for this symbol
+                    if ("CHARACTERISTIC", b.symbol) in existing_pairs:
+                        to_delete2.append((b.begin_idx, b.end_idx, b.symbol))
+            if to_delete2:
+                print(f"Removing {len(to_delete2)} additional base MEASUREMENT block(s) due to newly preferred CHARACTERISTIC.")
+                for begin, end, sym in sorted(to_delete2, key=lambda t: t[0], reverse=True):
+                    del base_lines[begin:end + 1]
+                base_blocks, _ = parse_a2l_blocks(base_lines)
+                existing_pairs = {(b.kind, b.symbol) for b in base_blocks}
+
+    # Build insertion payloads (one blank line between blocks)
+    added_meas_blocks: List[List[str]] = list(additions_meas.values())
+    added_char_blocks: List[List[str]] = list(additions_char.values())
+
+    # Insert MEASUREMENT blocks first (per requirement: add measurements at the end of measurements in the 1st A2L)
+    if added_meas_blocks:
+        print(f"Adding {len(added_meas_blocks)} MEASUREMENT block(s) to base A2L.")
+        insert_lines_meas: List[str] = []
+        for idx, bl in enumerate(added_meas_blocks):
+            insert_lines_meas.extend(bl)
+            if idx != len(added_meas_blocks) - 1:
+                insert_lines_meas.append("\n")
+
+        insert_idx_meas = _find_insert_position_after_kind(base_lines, base_blocks, "MEASUREMENT")
+        if insert_idx_meas > 0:
+            if base_lines[insert_idx_meas - 1].strip() != "":
+                base_lines[insert_idx_meas:insert_idx_meas] = ["\n"]
+                insert_idx_meas += 1
+            else:
+                k = insert_idx_meas - 1
+                while k - 1 >= 0 and base_lines[k - 1].strip() == "":
+                    del base_lines[k - 1]
+                    insert_idx_meas -= 1
+                    k -= 1
+        base_lines[insert_idx_meas:insert_idx_meas] = insert_lines_meas
+        # Re-parse to refresh indexes for CHARACTERISTIC insertion
+        base_blocks, _ = parse_a2l_blocks(base_lines)
+
+    # Insert CHARACTERISTIC blocks
+    if added_char_blocks:
+        print(f"Adding {len(added_char_blocks)} CHARACTERISTIC block(s) to base A2L.")
+        insert_lines_char: List[str] = []
+        for idx, bl in enumerate(added_char_blocks):
+            insert_lines_char.extend(bl)
+            if idx != len(added_char_blocks) - 1:
+                insert_lines_char.append("\n")
+
+        insert_idx_char = _find_insert_position_after_kind(base_lines, base_blocks, "CHARACTERISTIC")
+        if insert_idx_char > 0:
+            if base_lines[insert_idx_char - 1].strip() != "":
+                base_lines[insert_idx_char:insert_idx_char] = ["\n"]
+                insert_idx_char += 1
+            else:
+                k = insert_idx_char - 1
+                while k - 1 >= 0 and base_lines[k - 1].strip() == "":
+                    del base_lines[k - 1]
+                    insert_idx_char -= 1
+                    k -= 1
+        base_lines[insert_idx_char:insert_idx_char] = insert_lines_char
+
+    # Normalize hex formatting for known address keywords
+    base_lines = force_uppercase_known_address_keywords(base_lines)
+
+    # Optional: update addresses using ELF
+    if elf:
+        print(f"Updating addresses in merged A2L using ELF: {elf}")
+        merged_blocks, filters = parse_a2l_blocks(base_lines)
+        if not filters:
+            print("No symbols found to update in merged A2L.")
+        else:
+            try:
+                symbols_dict, missing_filters = build_symbols_dict(elf, filters)
+                addr_map = {name: to_upper_hex(meta["address"]) for name, meta in symbols_dict.items()}
+                base_lines, warnings = update_a2l_lines(base_lines, merged_blocks, addr_map)
+                for w in warnings:
+                    print("Warning:", w)
+                if missing_filters:
+                    print("These A2L symbols were not found in ELF/DWARF:")
+                    for s in sorted(missing_filters):
+                        print(f" - {s}")
+            except Exception as e:
+                print(f"Warning: Failed to update addresses from ELF: {e}")
+
+    with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
+        f.writelines(base_lines)
+
+    print(f"Merged A2L saved to: {outputfile}")
