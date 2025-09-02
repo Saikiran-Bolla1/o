@@ -1,0 +1,1776 @@
+#!/usr/bin/env python3
+"""
+Update, extend, and merge A2L files using symbol addresses from an ELF (with DWARF).
+
+Implemented functionality
+- Update addresses in MEASUREMENT/CHARACTERISTIC:
+  - Updates the first occurrence of ECU_ADDRESS, ADDRESS, or VALUE (hex or decimal).
+  - Normalizes all touched hex addresses to uppercase.
+  - Ensures ECU_ADDRESS_EXTENSION exists (inserts 'ECU_ADDRESS_EXTENSION 0x0' after the address line if missing) and normalizes it if present.
+- Preserve existing data types in existing blocks (we do not rewrite types in-place).
+- Add variables by cloning a template from the file (preserves IF_DATA, LINK_MAP, DISPLAY, FORMAT, etc.).
+  - If no template exists, synthesize a minimal block using canonical A2L type inference from DWARF;
+    if type cannot be inferred, defaults to UBYTE (configurable via env A2L_TYPE_FALLBACK).
+  - Template selection is based on richness (IF_DATA, LINK_MAP, size), and the selected template origin (line range) is reported.
+- Nested content updates:
+  - LINK_MAP/MAP anywhere in the block (case-insensitive): set the quoted symbol and first numeric literal to the new address.
+  - IF_DATA CANAPE_EXT:
+      * Update LINK_MAP/MAP inside CANAPE_EXT as above.
+      * Update DISPLAY to "DISPLAY 0 <min> <max>", where color=0 and min/max inferred from the variable type.
+      * If DISPLAY is missing, insert it just before '/end IF_DATA'.
+- EXTENDED_LIMITS for CHARACTERISTIC:
+  - If present, update to inferred min/max.
+  - If missing, insert it only if other CHARACTERISTIC blocks in the file already use EXTENDED_LIMITS.
+- Case-insensitive parsing for: /begin, /end, SYMBOL_LINK, ECU_ADDRESS, ADDRESS, VALUE, ECU_ADDRESS_EXTENSION,
+  LINK_MAP, MAP, DISPLAY, EXTENDED_LIMITS.
+- Recurring symbol delta: when the same symbol appears in multiple blocks with different original addresses,
+  we preserve each block's offset relative to the first occurrence.
+- Preference rule: if a symbol exists as both MEASUREMENT and CHARACTERISTIC, keep CHARACTERISTIC (applied in update, add, and merge).
+- Merge multiple A2L files with optional address updates from an ELF, applying the same patching.
+
+New: Template- and change-reporting
+- Every change is recorded with line numbers: address updates, LINK_MAP/MAP rewrites, DISPLAY updates/insertions,
+  EXTENDED_LIMITS updates/insertions, ECU_ADDRESS_EXTENSION insert/normalize, added/removed blocks, and template selection.
+- Reports are printed to stdout and can also be saved to a file with --report <path>.
+- Dry-run mode (--dry-run) shows intended changes and report without writing output A2L files.
+
+Requires: pip install pyelftools
+"""
+
+import sys
+import re
+import ast
+import os
+from typing import List, Dict, Optional, Tuple, Set, Union, Any
+
+from elftools.elf.elffile import ELFFile
+from elftools.dwarf.descriptions import describe_form_class
+from elftools.dwarf.dwarf_expr import DWARFExprParser
+
+# ----------------------------
+# Config / Debug
+# ----------------------------
+A2L_DEBUG = os.environ.get("A2L_DEBUG", "0") not in ("0", "", "false", "False")
+DEFAULT_INCLUDE_CONTAINERS = os.environ.get("A2L_INCLUDE_CONTAINERS", "1") not in ("0", "", "false", "False")
+# Safer fallback type when synthesizing a new block with unknown type (avoid CANape popups)
+A2L_TYPE_FALLBACK = os.environ.get("A2L_TYPE_FALLBACK", "UBYTE").upper()
+
+# ----------------------------
+# DWARF / Symbol helpers
+# ----------------------------
+
+MAX_ARRAY = 32
+
+DW_ATE_ADDRESS        = 0x01
+DW_ATE_BOOLEAN        = 0x02
+DW_ATE_COMPLEX_FLOAT  = 0x03
+DW_ATE_FLOAT          = 0x04
+DW_ATE_SIGNED         = 0x05
+DW_ATE_SIGNED_CHAR    = 0x06
+DW_ATE_UNSIGNED       = 0x07
+DW_ATE_UNSIGNED_CHAR  = 0x08
+
+def get_symbols(elffile):
+    """Return {name: {'addr': int, 'size': int, 'kind': str}} for variables/functions in symbol tables."""
+    out = {}
+    for secname in ('.symtab', '.dynsym'):
+        sec = elffile.get_section_by_name(secname)
+        if not sec or not hasattr(sec, "iter_symbols"):
+            continue
+        for s in sec.iter_symbols():
+            name = s.name
+            if not name:
+                continue
+            addr = int(s['st_value'] or 0)
+            size = int(s['st_size'] or 0)
+            st_type = s['st_info']['type']
+            kind = st_type.lower() if isinstance(st_type, str) else str(st_type).lower()
+            out[name] = {'addr': addr, 'size': size, 'kind': kind}
+    return out
+
+def resolve_typedefs(die):
+    """Follow DW_AT_type chain until a concrete type tag."""
+    if die is None:
+        return None
+    seen = set()
+    cur = die
+    while cur and cur.offset not in seen:
+        seen.add(cur.offset)
+        if cur.tag in ('DW_TAG_base_type', 'DW_TAG_pointer_type',
+                       'DW_TAG_array_type', 'DW_TAG_structure_type', 'DW_TAG_union_type',
+                       'DW_TAG_enumeration_type'):
+            return cur
+        if 'DW_AT_type' in cur.attributes:
+            cur = cur.get_DIE_from_attribute('DW_AT_type')
+        else:
+            break
+    return cur
+
+def base_type_info(base_die):
+    """Return (type_name, byte_size, encoding) for base/pointer/enum; else (unknown, size, None)."""
+    if base_die is None:
+        return ('unknown', None, None)
+    if base_die.tag == 'DW_TAG_pointer_type':
+        bs = base_die.attributes.get('DW_AT_byte_size')
+        return ('pointer', int(bs.value) if bs else None, None)
+    if base_die.tag == 'DW_TAG_base_type':
+        nm = base_die.attributes.get('DW_AT_name')
+        bs = base_die.attributes.get('DW_AT_byte_size')
+        enc = base_die.attributes.get('DW_AT_encoding')
+        return (nm.value.decode('utf-8', 'ignore') if nm else 'unknown',
+                int(bs.value) if bs else None,
+                int(enc.value) if enc else None)
+    if base_die.tag == 'DW_TAG_enumeration_type':
+        bs = base_die.attributes.get('DW_AT_byte_size')
+        return ('enum', int(bs.value) if bs else None, DW_ATE_SIGNED)
+    bs = base_die.attributes.get('DW_AT_byte_size')
+    return ('unknown', int(bs.value) if bs else None, None)
+
+def array_len_first_dim(array_die) -> Optional[int]:
+    """Get first dimension length from DW_TAG_array_type."""
+    for child in array_die.iter_children():
+        if child.tag != 'DW_TAG_subrange_type':
+            continue
+        cnt = child.attributes.get('DW_AT_count')
+        if cnt:
+            return int(cnt.value)
+        ub = child.attributes.get('DW_AT_upper_bound')
+        lb = child.attributes.get('DW_AT_lower_bound')
+        if ub and lb:
+            return int(ub.value) - int(lb.value) + 1
+        if ub:
+            return int(ub.value) + 1
+    return None
+
+# ----------------------------
+# Canonical A2L type mapping and limits
+# ----------------------------
+
+A2L_CANONICAL_TYPES = {
+    "UBYTE", "SBYTE", "UWORD", "SWORD", "ULONG", "SLONG",
+    "A_UINT64", "A_INT64", "FLOAT32_IEEE", "FLOAT64_IEEE"
+}
+
+A2L_LIMITS = {
+    "UBYTE": ("0", "255"),
+    "SBYTE": ("-128", "127"),
+    "UWORD": ("0", "65535"),
+    "SWORD": ("-32768", "32767"),
+    "ULONG": ("0", "4294967295"),
+    "SLONG": ("-2147483648", "2147483647"),
+    "A_UINT64": ("0", "18446744073709551615"),
+    "A_INT64": ("-9223372036854775808", "9223372036854775807"),
+    "FLOAT32_IEEE": ("-3.402823e+38", "3.402823e+38"),
+    "FLOAT64_IEEE": ("-1.7976931348623157e+308", "1.7976931348623157e+308"),
+}
+
+# Common DWARF/C synonyms -> canonical A2L
+A2L_TYPE_SYNONYMS = {
+    # 8-bit
+    "unsigned char": "UBYTE",
+    "uint8": "UBYTE",
+    "u8": "UBYTE",
+    "ubyte": "UBYTE",
+    "bool": "UBYTE",
+    "_bool": "UBYTE",
+    "signed char": "SBYTE",
+    "int8": "SBYTE",
+    "byte": "SBYTE",
+    "s8": "SBYTE",
+    # 16-bit
+    "unsigned short": "UWORD",
+    "uint16": "UWORD",
+    "u16": "UWORD",
+    "ushort": "UWORD",
+    "signed short": "SWORD",
+    "int16": "SWORD",
+    "short": "SWORD",
+    "s16": "SWORD",
+    # 32-bit integer
+    "unsigned int": "ULONG",
+    "unsigned long": "ULONG",
+    "uint32": "ULONG",
+    "u32": "ULONG",
+    "signed int": "SLONG",
+    "int32": "SLONG",
+    "long": "SLONG",
+    "int": "SLONG",
+    "s32": "SLONG",
+    # 64-bit integer
+    "unsigned long long": "A_UINT64",
+    "uint64": "A_UINT64",
+    "u64": "A_UINT64",
+    "long long unsigned int": "A_UINT64",
+    "signed long long": "A_INT64",
+    "int64": "A_INT64",
+    "long long": "A_INT64",
+    "s64": "A_INT64",
+    # floats
+    "float": "FLOAT32_IEEE",
+    "double": "FLOAT64_IEEE",
+    "float32": "FLOAT32_IEEE",
+    "float64": "FLOAT64_IEEE",
+}
+
+def canonical_a2l_type(tname: Optional[str], tenc: Optional[int], tsize: Optional[int]) -> str:
+    """Convert DWARF base type (name/encoding/size) to canonical A2L type keyword."""
+    if tenc == DW_ATE_UNSIGNED:
+        if tsize == 1: return "UBYTE"
+        if tsize == 2: return "UWORD"
+        if tsize == 4: return "ULONG"
+        if tsize == 8: return "A_UINT64"
+    if tenc in (DW_ATE_SIGNED, DW_ATE_SIGNED_CHAR):
+        if tsize == 1: return "SBYTE"
+        if tsize == 2: return "SWORD"
+        if tsize == 4: return "SLONG"
+        if tsize == 8: return "A_INT64"
+    if tenc == DW_ATE_BOOLEAN:
+        return "UBYTE"
+    if tenc == DW_ATE_FLOAT:
+        if tsize == 4: return "FLOAT32_IEEE"
+        if tsize == 8: return "FLOAT64_IEEE"
+
+    n = (tname or "").strip().lower()
+    if n in A2L_TYPE_SYNONYMS:
+        return A2L_TYPE_SYNONYMS[n]
+    if "unsigned" in n and "long long" in n: return "A_UINT64"
+    if ("long long" in n) or ("int64" in n): return "A_INT64"
+    if "unsigned" in n and ("long" in n or "int" in n) and ("short" not in n): return "ULONG"
+    if ("long" in n or "int" in n) and ("short" not in n): return "SLONG"
+    if "short" in n and "unsigned" in n: return "UWORD"
+    if "short" in n: return "SWORD"
+    if "char" in n and "unsigned" in n: return "UBYTE"
+    if "char" in n: return "SBYTE"
+    if "float" in n and "64" in n or "double" in n: return "FLOAT64_IEEE"
+    if "float" in n: return "FLOAT32_IEEE"
+    return A2L_TYPE_FALLBACK
+
+def dwarf_type_to_str(tname, tenc, tsize):
+    """Adapter: return canonical A2L type keyword."""
+    return canonical_a2l_type(tname, tenc, tsize)
+
+# ----------------------------
+# Hex helpers (force uppercase)
+# ----------------------------
+
+def _parse_hex_to_int(addr_hex) -> Optional[int]:
+    if isinstance(addr_hex, int):
+        return addr_hex
+    if not isinstance(addr_hex, str):
+        return None
+    s = addr_hex.strip()
+    try:
+        if s.lower().startswith("0x"):
+            return int(s, 16)
+        return int(s, 16)
+    except Exception:
+        return None
+
+def to_upper_hex(addr_hex: str) -> str:
+    """Normalize any hex string like '0x1a2b' to '0x1A2B'. Accepts int as well."""
+    n = _parse_hex_to_int(addr_hex)
+    if n is None:
+        if isinstance(addr_hex, str) and addr_hex.strip().lower().startswith("0x"):
+            return "0x" + addr_hex.strip()[2:].upper()
+        return str(addr_hex)
+    return f"0x{n:X}"
+
+# ----------------------------
+# Change logging/reporting
+# ----------------------------
+
+class ChangeLog:
+    def __init__(self):
+        self.events: List[Dict[str, Any]] = []
+
+    def add(self, etype: str, **data):
+        evt = {"type": etype}
+        evt.update(data)
+        self.events.append(evt)
+
+    def summary_counts(self) -> Dict[str, int]:
+        c: Dict[str, int] = {}
+        for e in self.events:
+            c[e["type"]] = c.get(e["type"], 0) + 1
+        return c
+
+    def __str.event_line(self, e: Dict[str, Any]) -> str:
+        t = e.get("type", "")
+        if t == "update_address":
+            return f"[update_address] {e.get('kind')} {e.get('name')} (sym={e.get('symbol')}) line {e.get('line')}: {e.get('old')} -> {e.get('new')}"
+        if t == "ensure_ecu_address_extension":
+            return f"[ECU_ADDRESS_EXTENSION] {e.get('action')} at line {e.get('line')} for {e.get('kind')} {e.get('name')} (sym={e.get('symbol')})"
+        if t == "rewrite_link_map":
+            return f"[LINK_MAP/MAP] line {e.get('line')} rewritten for {e.get('kind')} {e.get('name')} (sym={e.get('symbol')})"
+        if t == "update_display":
+            return f"[DISPLAY] updated at line {e.get('line')} for {e.get('kind')} {e.get('name')} (sym={e.get('symbol')})"
+        if t == "insert_display":
+            return f"[DISPLAY] inserted at line {e.get('line')} for {e.get('kind')} {e.get('name')} (sym={e.get('symbol')})"
+        if t == "update_extended_limits":
+            return f"[EXTENDED_LIMITS] updated at line {e.get('line')} for {e.get('kind')} {e.get('name')} (sym={e.get('symbol')})"
+        if t == "insert_extended_limits":
+            return f"[EXTENDED_LIMITS] inserted at line {e.get('line')} for {e.get('kind')} {e.get('name')} (sym={e.get('symbol')})"
+        if t == "add_block":
+            src = e.get("template_origin", "synthesized")
+            return f"[ADD] {e.get('kind')} {e.get('name')} (sym={e.get('symbol')}) inserted at {e.get('insert_at')} using template {src}"
+        if t == "remove_block":
+            return f"[REMOVE] {e.get('kind')} {e.get('name')} (sym={e.get('symbol')}): {e.get('reason')}"
+        if t == "select_template":
+            return f"[TEMPLATE] selected for {e.get('kind')}: lines {e.get('begin')}..{e.get('end')}"
+        return f"[{t}] {e}"
+
+    def format_report(self) -> str:
+        lines: List[str] = []
+        lines.append("A2L Update Report")
+        lines.append("=" * 72)
+        # Summary
+        lines.append("Summary:")
+        counts = self.summary_counts()
+        if counts:
+            for k in sorted(counts.keys()):
+                lines.append(f"- {k}: {counts[k]}")
+        else:
+            lines.append("- No changes recorded.")
+        lines.append("")
+        # Detailed events
+        lines.append("Detailed changes:")
+        if not self.events:
+            lines.append("(none)")
+        else:
+            for e in self.events:
+                lines.append(self.__str.event_line(e))
+        lines.append("")
+        lines.append("Notes:")
+        lines.append("- Line numbers refer to the file at the moment of change; insertions may shift later lines.")
+        lines.append("- Template origins are reported as line ranges from which new blocks were cloned.")
+        return "\n".join(lines)
+
+    def write_report(self, path: str):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.format_report())
+        except Exception as e:
+            print(f"Warning: failed to write report to '{path}': {e}")
+
+# ----------------------------
+# A2L parsing and updating
+# ----------------------------
+
+class A2LBlock:
+    def __init__(self,
+                 kind: str,
+                 name: str,
+                 symbol: str,
+                 begin_idx: int,
+                 end_idx: int,
+                 addr_line_idx: Optional[int],
+                 old_addr_int: Optional[int],
+                 old_addr_hex: Optional[str]):
+        self.kind = kind  # "MEASUREMENT" or "CHARACTERISTIC"
+        self.name = name
+        self.symbol = symbol  # SYMBOL_LINK if present, else block name
+        self.begin_idx = begin_idx
+        self.end_idx = end_idx
+        self.addr_line_idx = addr_line_idx
+        self.old_addr_int = old_addr_int
+        self.old_addr_hex = old_addr_hex
+
+MEAS_BEGIN_RE = re.compile(r'^\s*/begin\s+MEASUREMENT\s+(\S+)', re.IGNORECASE)
+CHAR_BEGIN_RE = re.compile(r'^\s*/begin\s+CHARACTERISTIC\s+(\S+)', re.IGNORECASE)
+SYMBOL_LINK_RE = re.compile(r'^\s*SYMBOL_LINK\s+"([^"]+)"', re.IGNORECASE)
+END_LINE_RE = re.compile(r'^\s*/end\s+([A-Za-z_]+)\b', re.IGNORECASE)
+
+# Address-bearing lines
+ECU_ADDRESS_RE = re.compile(r'^(\s*ECU_ADDRESS\s+)(0x[0-9A-Fa-f]+|\d+)(.*)$', re.IGNORECASE)
+VALUE_ADDR_RE  = re.compile(r'^(\s*VALUE\s+)(0x[0-9A-Fa-f]+|\d+)(.*)$', re.IGNORECASE)
+ADDRESS_RE     = re.compile(r'^(\s*ADDRESS\s+)(0x[0-9A-Fa-f]+|\d+)(.*)$', re.IGNORECASE)
+DEC_ANY_ADDR_RE = re.compile(r'^(\s*(?:ECU_ADDRESS|VALUE|ADDRESS)\s+)(\d+)(.*)$', re.IGNORECASE)
+# Extension line
+ECU_ADDRESS_EXTENSION_RE = re.compile(r'^(\s*ECU_ADDRESS_EXTENSION\s+)(0x[0-9A-Fa-f]+|\d+)(.*)$', re.IGNORECASE)
+
+# LINK_MAP / MAP anywhere
+LINK_OR_MAP_FIND_RE    = re.compile(r'\b(LINK_MAP|MAP)\b', re.IGNORECASE)
+NUM_LITERAL_RE         = re.compile(r'(0x[0-9A-Fa-f]+|\b-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)')
+
+# IF_DATA CANAPE_EXT scoping
+IFDATA_CANAPE_BEGIN_RE = re.compile(r'^\s*/begin\s+IF_DATA\s+CANAPE_EXT\b', re.IGNORECASE)
+IFDATA_END_RE          = re.compile(r'^\s*/end\s+IF_DATA\b', re.IGNORECASE)
+
+# DISPLAY inside CANAPE_EXT: DISPLAY <color> <min> <max>
+DISPLAY_RE = re.compile(r'^(\s*DISPLAY\s+)(\S+)(\s+)(\S+)(\s+)(\S+)(.*)$', re.IGNORECASE)
+
+# EXTENDED_LIMITS at CHARACTERISTIC level
+EXTENDED_LIMITS_RE = re.compile(r'^(\s*EXTENDED_LIMITS\s+)(\S+)(\s+)(\S+)(.*)$', re.IGNORECASE)
+
+def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
+    """Parse blocks and collect address line index and symbol name (SYMBOL_LINK or block name)."""
+    blocks: List[A2LBlock] = []
+    filters: List[str] = []
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        m_meas = MEAS_BEGIN_RE.match(line)
+        m_char = CHAR_BEGIN_RE.match(line)
+
+        if m_meas or m_char:
+            kind = "MEASUREMENT" if m_meas else "CHARACTERISTIC"
+            name = (m_meas or m_char).group(1)
+            begin_idx = i
+            symbol_name = name
+            addr_line_idx: Optional[int] = None
+            old_addr_hex: Optional[str] = None
+            old_addr_int: Optional[int] = None
+
+            j = i + 1
+            end_idx = None
+            while j < n:
+                l2 = lines[j]
+                m_sym = SYMBOL_LINK_RE.match(l2)
+                if m_sym:
+                    symbol_name = m_sym.group(1).strip()
+
+                if addr_line_idx is None:
+                    m = ECU_ADDRESS_RE.match(l2) or VALUE_ADDR_RE.match(l2) or ADDRESS_RE.match(l2) or DEC_ANY_ADDR_RE.match(l2)
+                    if m:
+                        addr_line_idx = j
+                        old_addr_hex = m.group(2)
+                        try:
+                            if isinstance(old_addr_hex, str) and old_addr_hex.lower().startswith("0x"):
+                                old_addr_int = int(old_addr_hex, 16)
+                            else:
+                                old_addr_int = int(old_addr_hex, 10)
+                        except Exception:
+                            old_addr_int = None
+
+                m_end = END_LINE_RE.match(l2)
+                if m_end and m_end.group(1).lower() == kind.lower():
+                    end_idx = j
+                    break
+                j += 1
+            if end_idx is None:
+                end_idx = n - 1
+
+            blocks.append(A2LBlock(kind=kind, name=name, symbol=symbol_name,
+                                   begin_idx=begin_idx, end_idx=end_idx,
+                                   addr_line_idx=addr_line_idx,
+                                   old_addr_int=old_addr_int,
+                                   old_addr_hex=old_addr_hex))
+            if symbol_name not in filters:
+                filters.append(symbol_name)
+            i = end_idx + 1
+            continue
+
+        i += 1
+
+    return blocks, filters
+
+def force_uppercase_known_address_keywords(lines: List[str]) -> List[str]:
+    """Uppercase hex for ECU_ADDRESS/ADDRESS/VALUE/ECU_ADDRESS_EXTENSION fields across file; preserve spacing and casing."""
+    out: List[str] = []
+    for line in lines:
+        raw = line.rstrip("\n")
+        m = ECU_ADDRESS_RE.match(raw)
+        if m:
+            out.append(f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"); continue
+        m = ADDRESS_RE.match(raw)
+        if m:
+            out.append(f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"); continue
+        m = VALUE_ADDR_RE.match(raw)
+        if m:
+            out.append(f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"); continue
+        m = ECU_ADDRESS_EXTENSION_RE.match(raw)
+        if m:
+            out.append(f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"); continue
+        out.append(line)
+    return out
+
+# ----------------------------
+# LINK_MAP / MAP rewriting
+# ----------------------------
+
+def _rewrite_link_or_map_line(raw: str, symbol: str, addr_hex_up: str) -> Optional[str]:
+    """Rewrite LINK_MAP/MAP line: first quoted symbol and first numeric literal to provided symbol/address."""
+    m = LINK_OR_MAP_FIND_RE.search(raw)
+    if not m:
+        return None
+    key_end = m.end()
+    prefix = raw[:key_end]
+    tail = raw[key_end:]
+    changed = False
+
+    # Replace first quoted symbol
+    q1 = tail.find('"')
+    if q1 != -1:
+        q2 = tail.find('"', q1 + 1)
+        if q2 != -1:
+            tail = tail[:q1] + f'"{symbol}"' + tail[q2 + 1:]
+            changed = True
+
+    # Replace first numeric literal (hex/dec/float)
+    tail2, nsubs = NUM_LITERAL_RE.subn(addr_hex_up, tail, count=1)
+    if nsubs > 0:
+        changed = True
+        tail = tail2
+
+    return (prefix + tail) if changed else None
+
+def _patch_link_map_anywhere_in_block(out_lines: List[str], begin_idx: int, end_idx: int, symbol: str, addr_hex_up: str, log: Optional[ChangeLog], kind: str, name: str):
+    """Rewrite LINK_MAP/MAP entries anywhere inside [begin_idx, end_idx] inclusive (case-insensitive)."""
+    for li in range(begin_idx, end_idx + 1):
+        raw = out_lines[li].rstrip("\n")
+        if not LINK_OR_MAP_FIND_RE.search(raw):
+            continue
+        new_raw = _rewrite_link_or_map_line(raw, symbol, addr_hex_up)
+        if new_raw is not None:
+            out_lines[li] = new_raw + "\n"
+            if log:
+                log.add("rewrite_link_map", kind=kind, name=name, symbol=symbol, line=li)
+
+# ----------------------------
+# IF_DATA CANAPE_EXT patching helpers
+# ----------------------------
+
+def _patch_extended_limits_in_block(out_lines: List[str], begin_idx: int, end_idx: int, lower: Optional[str], upper: Optional[str], log: Optional[ChangeLog], kind: str, name: str, symbol: str) -> bool:
+    """Update EXTENDED_LIMITS if present; return True if found."""
+    found = False
+    if lower is None or upper is None:
+        return False
+    for li in range(begin_idx, end_idx + 1):
+        raw = out_lines[li].rstrip("\n")
+        m = EXTENDED_LIMITS_RE.match(raw)
+        if m:
+            out_lines[li] = f"{m.group(1)}{lower}{m.group(3)}{upper}{m.group(5)}\n"
+            found = True
+            if log:
+                log.add("update_extended_limits", kind=kind, name=name, symbol=symbol, line=li)
+    return found
+
+def _ensure_extended_limits_in_characteristic(out_lines: List[str], begin_idx: int, end_idx: int, lower: Optional[str], upper: Optional[str], log: Optional[ChangeLog], kind: str, name: str, symbol: str) -> None:
+    """Insert EXTENDED_LIMITS after VALUE if missing in CHARACTERISTIC."""
+    if lower is None or upper is None:
+        return
+    # Already present?
+    for li in range(begin_idx, end_idx + 1):
+        if EXTENDED_LIMITS_RE.match(out_lines[li].rstrip("\n")):
+            return
+    # Find VALUE line
+    value_idx = None
+    value_indent = ""
+    for li in range(begin_idx, end_idx + 1):
+        raw = out_lines[li].rstrip("\n")
+        m = VALUE_ADDR_RE.match(raw)
+        if m:
+            value_idx = li
+            value_indent = re.match(r'^(\s*)', raw).group(1) if re.match(r'^(\s*)', raw) else ""
+            break
+    # Insert after VALUE or at block start+1
+    insert_at = value_idx + 1 if value_idx is not None else begin_idx + 1
+    out_lines[insert_at:insert_at] = [f"{value_indent}EXTENDED_LIMITS {lower} {upper}\n"]
+    if log:
+        log.add("insert_extended_limits", kind=kind, name=name, symbol=symbol, line=insert_at)
+
+def _patch_canape_ext_in_block(out_lines: List[str], begin_idx: int, end_idx: int, symbol: str, addr_hex_up: str, lower: Optional[str], upper: Optional[str], log: Optional[ChangeLog], kind: str, name: str) -> None:
+    """
+    Inside /begin IF_DATA CANAPE_EXT ... /end IF_DATA:
+    - Update LINK_MAP/MAP (symbol + base address).
+    - Update DISPLAY to 'DISPLAY 0 <min> <max>'.
+    - If DISPLAY is missing, insert it before '/end IF_DATA'.
+    """
+    in_canape = False
+    have_display = False
+    canape_begin_idx = -1
+    for li in range(begin_idx, end_idx + 1):
+        raw = out_lines[li].rstrip("\n")
+
+        if IFDATA_CANAPE_BEGIN_RE.match(raw):
+            in_canape = True
+            have_display = False
+            canape_begin_idx = li
+            continue
+        if in_canape and IFDATA_END_RE.match(raw):
+            if not have_display and (lower is not None and upper is not None):
+                # Insert DISPLAY before this '/end IF_DATA'
+                indent = ""
+                for sj in range(canape_begin_idx + 1, li):
+                    indent_match = re.match(r'^(\s*)', out_lines[sj])
+                    if indent_match:
+                        indent = indent_match.group(1)
+                        break
+                out_lines[li:li] = [f"{indent}DISPLAY 0 {lower} {upper}\n"]
+                if log:
+                    log.add("insert_display", kind=kind, name=name, symbol=symbol, line=li)
+                li += 1
+                end_idx += 1
+            in_canape = False
+            continue
+        if not in_canape:
+            continue
+
+        # LINK_MAP / MAP
+        if LINK_OR_MAP_FIND_RE.search(raw):
+            new_raw = _rewrite_link_or_map_line(raw, symbol, addr_hex_up)
+            if new_raw is not None:
+                out_lines[li] = new_raw + "\n"
+                if log:
+                    log.add("rewrite_link_map", kind=kind, name=name, symbol=symbol, line=li)
+                continue
+
+        # DISPLAY
+        m = DISPLAY_RE.match(raw)
+        if m and (lower is not None and upper is not None):
+            out_lines[li] = f"{m.group(1)}0{m.group(3)}{lower}{m.group(5)}{upper}{m.group(7)}\n"
+            have_display = True
+            if log:
+                log.add("update_display", kind=kind, name=name, symbol=symbol, line=li)
+
+def _ensure_ecu_address_extension(out_lines: List[str], b: A2LBlock, default_ext_hex: str, log: Optional[ChangeLog]) -> None:
+    """Ensure ECU_ADDRESS_EXTENSION line exists just after the address line; normalize if present."""
+    # Look for existing extension in block
+    for li in range(b.begin_idx, b.end_idx + 1):
+        raw = out_lines[li].rstrip("\n")
+        m = ECU_ADDRESS_EXTENSION_RE.match(raw)
+        if m:
+            # normalize casing
+            out_lines[li] = f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"
+            if log:
+                log.add("ensure_ecu_address_extension", action="normalized", kind=b.kind, name=b.name, symbol=b.symbol, line=li)
+            return
+    # Not found: add after address line if we have one
+    if b.addr_line_idx is not None and 0 <= b.addr_line_idx < len(out_lines):
+        addr_line = out_lines[b.addr_line_idx].rstrip("\n")
+        indent_match = re.match(r'^(\s*)', addr_line)
+        indent = indent_match.group(1) if indent_match else ""
+        insert_at = b.addr_line_idx + 1
+        out_lines[insert_at:insert_at] = [f"{indent}ECU_ADDRESS_EXTENSION {default_ext_hex}\n"]
+        if log:
+            log.add("ensure_ecu_address_extension", action="inserted", kind=b.kind, name=b.name, symbol=b.symbol, line=insert_at)
+
+# ----------------------------
+# Limits inference from block content
+# ----------------------------
+
+def _infer_limits_for_block(out_lines: List[str], begin_idx: int, end_idx: int) -> Tuple[Optional[str], Optional[str]]:
+    TYPE_TOKEN_RE = re.compile(r'\b(UBYTE|SBYTE|UWORD|SWORD|ULONG|SLONG|A_UINT64|A_INT64|FLOAT32_IEEE|FLOAT64_IEEE)\b', re.IGNORECASE)
+    for li in range(begin_idx, end_idx + 1):
+        raw = out_lines[li]
+        m = TYPE_TOKEN_RE.search(raw)
+        if m:
+            t = m.group(1).upper()
+            lim = A2L_LIMITS.get(t)
+            if lim:
+                return lim[0], lim[1]
+    return None, None
+
+def _file_uses_extended_limits(lines: List[str]) -> bool:
+    """Return True if at least one CHARACTERISTIC block contains EXTENDED_LIMITS."""
+    blocks, _ = parse_a2l_blocks(lines)
+    for b in blocks:
+        if b.kind != "CHARACTERISTIC":
+            continue
+        for i in range(b.begin_idx, b.end_idx + 1):
+            if EXTENDED_LIMITS_RE.match(lines[i].rstrip("\n")):
+                return True
+    return False
+
+# ----------------------------
+# Update A2L lines (addresses + ECU_ADDRESS_EXTENSION + LINK_MAP/MAP + CANAPE_EXT DISPLAY + EXTENDED_LIMITS)
+# ----------------------------
+
+def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[str, str], uses_ext_limits: bool, log: Optional[ChangeLog] = None) -> Tuple[List[str], List[str]]:
+    """
+    Update base address lines and patch ECU_ADDRESS_EXTENSION, LINK_MAP/MAP anywhere in block,
+    IF_DATA CANAPE_EXT DISPLAY, and EXTENDED_LIMITS for CHARACTERISTIC.
+    - EXTENDED_LIMITS is updated if present.
+    - EXTENDED_LIMITS is inserted only if uses_ext_limits is True (i.e., other CHARACTERISTICs already use it).
+    """
+    out_lines = list(lines)
+    warnings: List[str] = []
+
+    # Group by symbol for delta handling
+    symbol_groups: Dict[str, List[A2LBlock]] = {}
+    for b in blocks:
+        symbol_groups.setdefault(b.symbol, []).append(b)
+
+    for symbol, group in symbol_groups.items():
+        addr_hex = addr_map.get(symbol)
+        if not addr_hex:
+            for b in group:
+                warnings.append(f"No address found for symbol '{symbol}' (block {b.kind} {b.name}).")
+            continue
+
+        base_new_int = _parse_hex_to_int(addr_hex)
+        if base_new_int is None:
+            for b in group:
+                warnings.append(f"Resolved address for symbol '{symbol}' is invalid: {addr_hex}")
+            continue
+
+        # ref old for delta
+        ref_old_int: Optional[int] = None
+        for b in group:
+            if b.old_addr_int is not None:
+                ref_old_int = b.old_addr_int
+                break
+
+        multi = len(group) > 1 and ref_old_int is not None
+
+        for b in group:
+            # Infer limits from block contents for DISPLAY/EXTENDED_LIMITS
+            lower_infer, upper_infer = _infer_limits_for_block(out_lines, b.begin_idx, b.end_idx)
+
+            # Compute new address (preserve per-block delta)
+            new_addr_int = base_new_int
+            if multi and b.old_addr_int is not None and ref_old_int is not None:
+                new_addr_int = base_new_int + (b.old_addr_int - ref_old_int)
+            new_addr_hex = f"0x{new_addr_int:X}"
+            new_addr_hex_up = to_upper_hex(new_addr_hex)
+
+            # Update primary address line (ECU_ADDRESS / VALUE / ADDRESS)
+            if b.addr_line_idx is not None:
+                old = out_lines[b.addr_line_idx].rstrip("\n")
+                m = ECU_ADDRESS_RE.match(old) or VALUE_ADDR_RE.match(old) or ADDRESS_RE.match(old) or DEC_ANY_ADDR_RE.match(old)
+                if m:
+                    out_lines[b.addr_line_idx] = f"{m.group(1)}{new_addr_hex}{m.group(3)}\n"
+                    if log:
+                        log.add("update_address", kind=b.kind, name=b.name, symbol=b.symbol, line=b.addr_line_idx, old=m.group(2), new=new_addr_hex)
+                else:
+                    warnings.append(f"Could not update address line for symbol '{symbol}' (block {b.kind} {b.name}): '{old}'")
+            else:
+                warnings.append(f"No address line found to update for symbol '{symbol}' (block {b.kind} {b.name}).")
+
+            # Ensure ECU_ADDRESS_EXTENSION exists/normalized
+            _ensure_ecu_address_extension(out_lines, b, default_ext_hex="0x0", log=log)
+
+            # Patch LINK_MAP/MAP anywhere in the block
+            _patch_link_map_anywhere_in_block(out_lines, b.begin_idx, b.end_idx, b.symbol, new_addr_hex_up, log, b.kind, b.name)
+
+            # Patch CANAPE_EXT content (DISPLAY + LINK_MAP/MAP within the scope)
+            _patch_canape_ext_in_block(out_lines, b.begin_idx, b.end_idx, b.symbol, new_addr_hex_up, lower_infer, upper_infer, log, b.kind, b.name)
+
+            # Patch or (conditionally) insert EXTENDED_LIMITS for CHARACTERISTIC
+            if b.kind == "CHARACTERISTIC":
+                found = _patch_extended_limits_in_block(out_lines, b.begin_idx, b.end_idx, lower_infer, upper_infer, log, b.kind, b.name, b.symbol)
+                if not found and uses_ext_limits:
+                    _ensure_extended_limits_in_characteristic(out_lines, b.begin_idx, b.end_idx, lower_infer, upper_infer, log, b.kind, b.name, b.symbol)
+
+    # Normalize hex formatting
+    out_lines = force_uppercase_known_address_keywords(out_lines)
+    return out_lines, warnings
+
+# ----------------------------
+# Preference rule (CHAR over MEAS)
+# ----------------------------
+
+def _enforce_prefer_characteristic_inplace(lines: List[str], log: Optional[ChangeLog] = None) -> List[str]:
+    """Remove MEASUREMENTs for symbols that also exist as CHARACTERISTIC in same file."""
+    blocks, _ = parse_a2l_blocks(lines)
+    char_symbols = {b.symbol for b in blocks if b.kind == "CHARACTERISTIC"}
+    to_delete: List[Tuple[int, int, str, str]] = []
+    for b in blocks:
+        if b.kind == "MEASUREMENT" and b.symbol in char_symbols:
+            to_delete.append((b.begin_idx, b.end_idx, b.name, b.symbol))
+    if not to_delete:
+        return lines
+    for begin, end, name, symbol in sorted(to_delete, key=lambda t: t[0], reverse=True):
+        if log:
+            log.add("remove_block", kind="MEASUREMENT", name=name, symbol=symbol, reason="Duplicate symbol exists as CHARACTERISTIC")
+        del lines[begin:end + 1]
+    return lines
+
+# ----------------------------
+# Helpers to create new blocks and placement
+# ----------------------------
+
+def _guess_datatype_and_limits(meta: Optional[Dict[str, str]]) -> Tuple[str, str, str, str]:
+    """Guess canonical type and limits from DWARF metadata or fallbacks."""
+    kind = (meta or {}).get("kind", "")
+    if kind in ("struct", "array", "union"):
+        return "ULONG", "ULONG", "0", "4294967295"
+
+    meta_type = ((meta or {}).get("type", "") or "").strip()
+    a2l_type = None
+    if meta_type:
+        mt_low = meta_type.lower()
+        if meta_type.upper() in A2L_CANONICAL_TYPES:
+            a2l_type = meta_type.upper()
+        elif mt_low in A2L_TYPE_SYNONYMS:
+            a2l_type = A2L_TYPE_SYNONYMS[mt_low]
+    if not a2l_type:
+        tname = (meta or {}).get("type_name") or meta_type
+        tsize = (meta or {}).get("byte_size")
+        a2l_type = canonical_a2l_type(tname, None, tsize if isinstance(tsize, int) else None)
+
+    lower, upper = A2L_LIMITS.get(a2l_type, A2L_LIMITS.get(A2L_TYPE_FALLBACK, ("0", "255")))
+    return a2l_type, a2l_type, lower, upper
+
+def _select_block_templates(lines: List[str]) -> Dict[str, Dict[str, Union[List[str], int]]]:
+    """Pick one template per kind; prefer blocks with IF_DATA or LINK_MAP/MAP. Returns {kind: {'lines': [...], 'begin': int, 'end': int}}."""
+    blocks, _ = parse_a2l_blocks(lines)
+    candidates: Dict[str, List[Tuple[int, int, int]]] = {"MEASUREMENT": [], "CHARACTERISTIC": []}
+    for b in blocks:
+        bl = lines[b.begin_idx:b.end_idx + 1]
+        text_lower = "".join(bl).lower()
+        score = 0
+        if "if_data" in text_lower: score += 2
+        if "link_map" in text_lower or " map " in text_lower: score += 1
+        score += len(bl) // 5
+        candidates[b.kind].append((score, b.begin_idx, b.end_idx))
+    templates: Dict[str, Dict[str, Union[List[str], int]]] = {}
+    for kind in ("MEASUREMENT", "CHARACTERISTIC"):
+        if candidates[kind]:
+            score, begin, end = sorted(candidates[kind], key=lambda t: (-t[0], t[1]))[0]
+            templates[kind] = {"lines": list(lines[begin:end + 1]), "begin": begin, "end": end}
+    return templates
+
+def _render_new_block_minimal(variablename: str, kind: str, addr_hex_up: str, a2l_type: str, lower: str, upper: str, uses_ext_limits: bool) -> List[str]:
+    """Fallback renderer when no template exists."""
+    lines: List[str] = []
+    if kind == "MEASUREMENT":
+        lines.extend([
+            f'/begin MEASUREMENT {variablename} ""\n',
+            f'  {a2l_type} NO_COMPU_METHOD 0 0 {upper}\n',
+            f'  ECU_ADDRESS {addr_hex_up}\n',
+            f'  ECU_ADDRESS_EXTENSION 0x0\n',
+            f'  SYMBOL_LINK "{variablename}" 0\n',
+            f'/end MEASUREMENT\n',
+        ])
+    else:
+        lines.extend([
+            f'/begin CHARACTERISTIC {variablename} ""\n',
+            f'  VALUE {addr_hex_up} {a2l_type} 0 NO_COMPU_METHOD 0 {upper}\n',
+            f'  ECU_ADDRESS_EXTENSION 0x0\n',
+        ])
+        if uses_ext_limits:
+            lines.append(f'  EXTENDED_LIMITS {lower} {upper}\n')
+        lines.extend([
+            f'  SYMBOL_LINK "{variablename}" 0\n',
+            f'/end CHARACTERISTIC\n',
+        ])
+    return lines
+
+def _render_from_template(kind: str, variablename: str, addr_hex_up: str, template_lines: List[str], lower: str, upper: str, uses_ext_limits: bool) -> List[str]:
+    """
+    Clone a template and replace:
+      - /begin line name
+      - SYMBOL_LINK quoted name
+      - first ECU_ADDRESS/ADDRESS/VALUE occurrence with addr_hex_up (types in template are preserved)
+      - ensure ECU_ADDRESS_EXTENSION (insert after address if missing)
+      - inside IF_DATA CANAPE_EXT:
+          - LINK_MAP/MAP symbol+address
+          - DISPLAY -> 'DISPLAY 0 <lower> <upper>' (insert if missing)
+      - EXTENDED_LIMITS: update or insert (insert only if uses_ext_limits=True)
+      - also rewrite LINK_MAP/MAP anywhere in the block
+    """
+    if not template_lines:
+        return _render_new_block_minimal(variablename, kind, addr_hex_up, A2L_TYPE_FALLBACK, lower, upper, uses_ext_limits)
+
+    cloned = [l for l in template_lines]
+    name_re = re.compile(rf'^(\s*/begin\s+{kind}\s+)(\S+)(.*)$', re.IGNORECASE)
+
+    # /begin line
+    for i, l in enumerate(cloned):
+        m = name_re.match(l)
+        if m:
+            newl = f"{m.group(1)}{variablename}{m.group(3)}"
+            cloned[i] = newl if newl.endswith("\n") else newl + "\n"
+            break
+
+    # SYMBOL_LINK line
+    for i, l in enumerate(cloned):
+        m = SYMBOL_LINK_RE.match(l)
+        if m:
+            q1 = l.find('"'); q2 = l.find('"', q1 + 1)
+            if q1 != -1 and q2 != -1:
+                cloned[i] = f'{l[:q1]}"{variablename}"{l[q2+1:]}'
+            break
+
+    # Address line and remember its index + indent
+    addr_idx = None
+    addr_indent = ""
+    for i, l in enumerate(cloned):
+        raw = l.rstrip("\n")
+        m = ECU_ADDRESS_RE.match(raw) or VALUE_ADDR_RE.match(raw) or ADDRESS_RE.match(raw) or DEC_ANY_ADDR_RE.match(raw)
+        if m:
+            addr_idx = i
+            addr_indent = re.match(r'^(\s*)', raw).group(1) if re.match(r'^(\s*)', raw) else ""
+            cloned[i] = f"{m.group(1)}{addr_hex_up}{m.group(3)}\n"
+            break
+
+    # EXTENDED_LIMITS: update or conditional insert (CHARACTERISTIC)
+    ext_present = False
+    for i in range(len(cloned)):
+        raw = cloned[i].rstrip("\n")
+        m = EXTENDED_LIMITS_RE.match(raw)
+        if m:
+            cloned[i] = f"{m.group(1)}{lower}{m.group(3)}{upper}{m.group(5)}\n"
+            ext_present = True
+    if kind == "CHARACTERISTIC" and not ext_present and uses_ext_limits:
+        insert_at = (addr_idx + 1) if addr_idx is not None else 0
+        cloned[insert_at:insert_at] = [f"{addr_indent}EXTENDED_LIMITS {lower} {upper}\n"]
+        if addr_idx is not None and insert_at <= addr_idx:
+            addr_idx += 1
+
+    # Ensure ECU_ADDRESS_EXTENSION present/normalized
+    ext_found = False
+    for i in range(len(cloned)):
+        raw = cloned[i].rstrip("\n")
+        m = ECU_ADDRESS_EXTENSION_RE.match(raw)
+        if m:
+            cloned[i] = f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"
+            ext_found = True
+            break
+    if not ext_found and addr_idx is not None:
+        cloned.insert(addr_idx + 1, f"{addr_indent}ECU_ADDRESS_EXTENSION 0x0\n")
+
+    # Rewrite LINK_MAP/MAP anywhere
+    for i in range(len(cloned)):
+        raw = cloned[i].rstrip("\n")
+        if LINK_OR_MAP_FIND_RE.search(raw):
+            new_raw = _rewrite_link_or_map_line(raw, variablename, addr_hex_up)
+            if new_raw is not None:
+                cloned[i] = new_raw + "\n"
+
+    # Inside CANAPE_EXT: enforce DISPLAY
+    in_canape = False
+    have_display = False
+    canape_begin_idx = -1
+    for i in range(len(cloned)):
+        raw = cloned[i].rstrip("\n")
+        if IFDATA_CANAPE_BEGIN_RE.match(raw):
+            in_canape = True
+            have_display = False
+            canape_begin_idx = i
+            continue
+        if in_canape and IFDATA_END_RE.match(raw):
+            if not have_display:
+                indent = ""
+                for sj in range(canape_begin_idx + 1, i):
+                    indent_match = re.match(r'^(\s*)', cloned[sj])
+                    if indent_match:
+                        indent = indent_match.group(1)
+                        break
+                cloned[i:i] = [f"{indent}DISPLAY 0 {lower} {upper}\n"]
+                i += 1
+            in_canape = False
+            continue
+        if not in_canape:
+            continue
+
+        # Update DISPLAY if present
+        m = DISPLAY_RE.match(raw)
+        if m:
+            cloned[i] = f"{m.group(1)}0{m.group(3)}{lower}{m.group(5)}{upper}{m.group(7)}\n"
+            have_display = True
+
+    # Normalize hex casing within block
+    cloned = force_uppercase_known_address_keywords(cloned)
+    return cloned
+
+def _normalize_variablename_input(variablename: Union[str, List[str]]) -> List[str]:
+    """Accept lists, comma-separated, json-like list string, or single string. Deduplicate preserving order."""
+    names: List[str] = []
+    if isinstance(variablename, (list, tuple, set)):
+        names = [str(x).strip() for x in variablename if str(x).strip()]
+    elif isinstance(variablename, str):
+        s = variablename.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, (list, tuple, set)):
+                    names = [str(x).strip() for x in parsed if str(x).strip()]
+                else:
+                    names = [s]
+            except Exception:
+                names = [p.strip() for p in s.strip("[]").split(",") if p.strip()]
+        elif "," in s:
+            names = [p.strip() for p in s.split(",") if p.strip()]
+        elif s:
+            names = [s]
+    seen = set(); uniq = []
+    for n in names:
+        if n not in seen:
+            seen.add(n); uniq.append(n)
+    return uniq
+
+def _find_insert_position_after_kind(lines: List[str], blocks: List[A2LBlock], kind: str) -> int:
+    """Insert after last block of kind."""
+    last_end = -1
+    for b in blocks:
+        if b.kind == kind and b.end_idx > last_end:
+            last_end = b.end_idx
+    return (last_end + 1) if last_end >= 0 else len(lines)
+
+# ----------------------------
+# Public APIs
+# ----------------------------
+
+def Updatea2l(olda2l: str, elf: str, newa2l: str, report_path: Optional[str] = None, dry_run: bool = False) -> None:
+    """Update addresses; patch ECU_ADDRESS_EXTENSION, LINK_MAP/MAP, IF_DATA CANAPE_EXT DISPLAY; update/conditionally insert EXTENDED_LIMITS; save."""
+    log = ChangeLog()
+
+    with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    # Enforce preference (keep CHARACTERISTIC if duplicate)
+    lines = _enforce_prefer_characteristic_inplace(lines, log=log)
+
+    blocks, filters = parse_a2l_blocks(lines)
+    if not blocks:
+        print("No MEASUREMENT or CHARACTERISTIC blocks found in A2L.")
+    else:
+        print(f"Found {len(blocks)} blocks to process.")
+    if filters:
+        print("Symbols to resolve from ELF:")
+        for s in filters:
+            print(f" - {s}")
+
+    symbols_dict, missing_filters = build_symbols_dict(elf, filters)
+    addr_map = {name: to_upper_hex(meta["address"]) for name, meta in symbols_dict.items()}
+    print(f"Resolved {len(addr_map)} symbol addresses from ELF/DWARF.")
+
+    # Decide whether EXTENDED_LIMITS should be inserted (only if already used somewhere in file)
+    uses_ext_limits = _file_uses_extended_limits(lines)
+
+    updated_lines, warnings = update_a2l_lines(lines, blocks, addr_map, uses_ext_limits, log=log)
+    for w in warnings:
+        print("Warning:", w)
+    if missing_filters:
+        print("These A2L symbols were not found in ELF/DWARF:")
+        for s in sorted(missing_filters):
+            print(f" - {s}")
+
+    updated_lines = _enforce_prefer_characteristic_inplace(updated_lines, log=log)
+    updated_lines = force_uppercase_known_address_keywords(updated_lines)
+
+    # Reporting
+    report_txt = log.format_report()
+    print("\n--- Change Report ---")
+    print(report_txt)
+    if report_path:
+        log.write_report(report_path)
+        print(f"Report written to: {report_path}")
+
+    if dry_run:
+        print("Dry-run: not writing updated A2L file.")
+        return
+
+    with open(newa2l, "w", encoding="utf-8", errors="ignore") as f:
+        f.writelines(updated_lines)
+    print(f"Saved updated A2L to: {newa2l}")
+
+def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vartype: str, outputfile: str, include_containers: Optional[bool] = None, report_path: Optional[str] = None, dry_run: bool = False) -> None:
+    """
+    Add new variables and update all existing addresses.
+    While adding:
+      - Clone a template block (if available) to follow syntax, including IF_DATA CANAPE_EXT.
+      - Replace LINK_MAP/MAP anywhere (symbol + address).
+      - In CANAPE_EXT, ensure/update DISPLAY (color 0, min/max per type).
+      - Update/conditionally insert EXTENDED_LIMITS (CHARACTERISTIC): insert only if other CHARACTERISTICs already have it.
+      - Ensure ECU_ADDRESS_EXTENSION is present.
+    Report includes: template selection lines, inserted positions, and any inserted/updated nested items.
+    """
+    log = ChangeLog()
+
+    kind = (vartype or "").strip().upper()
+    if kind not in ("CHARACTERISTIC", "MEASUREMENT"):
+        raise ValueError("vartype must be 'characteristic' or 'measurement'")
+    if include_containers is None:
+        include_containers = DEFAULT_INCLUDE_CONTAINERS
+
+    with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+    lines = _enforce_prefer_characteristic_inplace(lines, log=log)
+
+    blocks, filters = parse_a2l_blocks(lines)
+
+    extra_filters = _normalize_variablename_input(variablename)
+    for tok in extra_filters:
+        if tok not in filters:
+            filters.append(tok)
+
+    print(f"Starting 'addvariable' with {len(filters)} filter token(s).")
+    if extra_filters:
+        print("- Added filter token(s):", ", ".join(extra_filters))
+    print(f"- include_containers = {include_containers}")
+
+    symbols_dict, missing_filters = build_symbols_dict(elf, filters)
+    addr_map = {name: to_upper_hex(meta["address"]) for name, meta in symbols_dict.items()}
+    print(f"Resolved {len(addr_map)} addresses from ELF.")
+    if missing_filters:
+        print("Warning: unmatched filters:", ", ".join(sorted(missing_filters)))
+
+    # Determine policy for EXTENDED_LIMITS insertion from the original file
+    uses_ext_limits_before = _file_uses_extended_limits(lines)
+
+    # Update existing blocks first
+    updated_lines, warnings = update_a2l_lines(lines, blocks, addr_map, uses_ext_limits_before, log=log)
+    for w in warnings:
+        print("Warning:", w)
+
+    # Refresh parse after updates
+    blocks, _ = parse_a2l_blocks(updated_lines)
+
+    existing_pairs = {(b.kind, b.symbol) for b in blocks}
+
+    # Determine add candidates
+    if include_containers:
+        candidates = list(symbols_dict.keys())
+    else:
+        candidates = [n for n, meta in symbols_dict.items() if meta.get("kind") not in ("struct", "array", "union")]
+
+    to_add = []
+    for name in candidates:
+        if (kind, name) in existing_pairs:
+            continue
+        if kind == "MEASUREMENT" and ("CHARACTERISTIC", name) in existing_pairs:
+            continue
+        to_add.append(name)
+
+    # CHARACTERISTIC wins (remove existing MEASUREMENT for same symbol)
+    if kind == "CHARACTERISTIC":
+        to_remove: List[Tuple[int, int]] = []
+        for b in blocks:
+            if b.kind == "MEASUREMENT" and b.symbol in set(to_add):
+                to_remove.append((b.begin_idx, b.end_idx))
+                log.add("remove_block", kind="MEASUREMENT", name=b.name, symbol=b.symbol, reason="Replaced by new CHARACTERISTIC addition")
+        for begin, end in sorted(to_remove, key=lambda t: t[0], reverse=True):
+            del updated_lines[begin:end + 1]
+        blocks, _ = parse_a2l_blocks(updated_lines)
+
+    # Re-evaluate whether EXTENDED_LIMITS is used (after update/removals)
+    uses_ext_limits_after = _file_uses_extended_limits(updated_lines)
+
+    # Build insertion payload
+    templates = _select_block_templates(updated_lines)
+    tmpl_info = templates.get(kind)
+    if tmpl_info:
+        log.add("select_template", kind=kind, begin=tmpl_info["begin"], end=tmpl_info["end"])
+
+    insert_lines: List[str] = []
+
+    for idx, name in enumerate(sorted(to_add)):
+        meta = symbols_dict.get(name, {})
+        a2l_type, _, lower, upper = _guess_datatype_and_limits(meta)
+        addr_hex_up = to_upper_hex(meta.get("address", "0x0"))
+
+        if tmpl_info:
+            block_lines = _render_from_template(kind, name, addr_hex_up, tmpl_info["lines"], lower, upper, uses_ext_limits_after)
+            template_origin = f"{tmpl_info['begin']}..{tmpl_info['end']}"
+        else:
+            block_lines = _render_new_block_minimal(name, kind, addr_hex_up, a2l_type, lower, upper, uses_ext_limits_after)
+            template_origin = "synthesized"
+
+        # We'll note the insertion point later when we know index
+        insert_lines.extend(block_lines)
+        if idx != len(to_add) - 1:
+            insert_lines.append("\n")
+
+        # Temporarily store event; we'll update insert_at after we decide index
+        log.add("add_block", kind=kind, name=name, symbol=name, insert_at="(pending)", template_origin=template_origin)
+
+    if not insert_lines:
+        print("No new filtered symbols to add; only addresses were updated.")
+        updated_lines = _enforce_prefer_characteristic_inplace(updated_lines, log=log)
+        updated_lines = force_uppercase_known_address_keywords(updated_lines)
+
+        # Report
+        report_txt = log.format_report()
+        print("\n--- Change Report ---")
+        print(report_txt)
+        if report_path:
+            log.write_report(report_path)
+            print(f"Report written to: {report_path}")
+
+        if dry_run:
+            print("Dry-run: not writing output file.")
+            return
+
+        with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
+            f.writelines(updated_lines)
+        print(f"Saved updated A2L to: {outputfile}")
+        return
+
+    # Insert after last block of that kind
+    insert_idx = _find_insert_position_after_kind(updated_lines, blocks, kind)
+    if insert_idx > 0:
+        prev = updated_lines[insert_idx - 1]
+        if prev.strip() != "":
+            updated_lines[insert_idx:insert_idx] = ["\n"]; insert_idx += 1
+        else:
+            k = insert_idx - 1
+            while k - 1 >= 0 and updated_lines[k - 1].strip() == "":
+                del updated_lines[k - 1]; insert_idx -= 1; k -= 1
+    updated_lines[insert_idx:insert_idx] = insert_lines
+
+    # Patch the previously added "add_block" events with actual insert index (best effort; one event per new symbol in order)
+    next_line = insert_idx
+    event_i = 0
+    for e in log.events:
+        if e["type"] == "add_block" and e["insert_at"] == "(pending)":
+            e["insert_at"] = next_line
+            # Estimate block length to advance pointer (until next '/end KIND')
+            # We'll scan from 'next_line' to find end line
+            # This is best-effort; sufficient for reporting "place to add".
+            nlines = len(updated_lines)
+            j = next_line
+            end_pat = END_LINE_RE
+            while j < nlines:
+                if end_pat.match(updated_lines[j]):
+                    j += 1
+                    break
+                j += 1
+            next_line = j
+            event_i += 1
+
+    updated_lines = _enforce_prefer_characteristic_inplace(updated_lines, log=log)
+    updated_lines = force_uppercase_known_address_keywords(updated_lines)
+
+    # Report
+    report_txt = log.format_report()
+    print("\n--- Change Report ---")
+    print(report_txt)
+    if report_path:
+        log.write_report(report_path)
+        print(f"Report written to: {report_path}")
+
+    if dry_run:
+        print("Dry-run: not writing output file.")
+        return
+
+    with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
+        f.writelines(updated_lines)
+    print(f"Appended {len(to_add)} new {kind} block(s) after last {kind} section and saved to: {outputfile}")
+
+def mergea2l(a2l_files: Union[str, List[str]], outputfile: str, elf: Optional[str] = None, report_path: Optional[str] = None, dry_run: bool = False) -> None:
+    """
+    Merge A2L files into the first one; avoid duplicates; prefer CHARACTERISTIC; append MEASUREMENTs after last MEASUREMENT.
+    Optionally update addresses; ECU_ADDRESS_EXTENSION, LINK_MAP/MAP, CANAPE_EXT DISPLAY, and EXTENDED_LIMITS are patched as in Updatea2l.
+    - EXTENDED_LIMITS insertion policy follows the merged file usage (we only insert if it already exists somewhere in CHARACTERISTICs).
+    Reports added/removed blocks and all nested changes when ELF update is applied.
+    """
+    log = ChangeLog()
+
+    if isinstance(a2l_files, str):
+        a2l_files = [a2l_files]
+    a2l_files = [p for p in a2l_files if str(p).strip()]
+    if len(a2l_files) < 1:
+        raise ValueError("At least one A2L file must be provided to merge.")
+
+    files_data: List[Tuple[str, List[str], List[A2LBlock]]] = []
+    for path in a2l_files:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        blocks, _ = parse_a2l_blocks(lines)
+        files_data.append((path, lines, blocks))
+
+    base_path, base_lines, base_blocks = files_data[0]
+    print(f"Using base A2L: {base_path}")
+    base_lines = _enforce_prefer_characteristic_inplace(base_lines, log=log)
+    base_blocks, _ = parse_a2l_blocks(base_lines)
+
+    existing_pairs: Set[Tuple[str, str]] = {(b.kind, b.symbol) for b in base_blocks}
+    char_symbols: Set[str] = set()
+    for _, _, blocks in files_data:
+        for b in blocks:
+            if b.kind == "CHARACTERISTIC":
+                char_symbols.add(b.symbol)
+
+    added_meas_blocks: List[List[str]] = []
+    added_char_blocks: List[List[str]] = []
+
+    for path, lines, blocks in files_data[1:]:
+        print(f"Scanning A2L file for merge: {path}")
+        for b in blocks:
+            key = (b.kind, b.symbol)
+            if key in existing_pairs: continue
+            if b.symbol in char_symbols and b.kind == "MEASUREMENT": continue
+            block_lines = lines[b.begin_idx:b.end_idx + 1]
+            if b.kind == "MEASUREMENT":
+                added_meas_blocks.append(block_lines)
+                log.add("add_block", kind="MEASUREMENT", name=b.name, symbol=b.symbol, insert_at="(pending from merge)", template_origin=f"{path}:{b.begin_idx}..{b.end_idx}")
+            else:
+                added_char_blocks.append(block_lines)
+                log.add("add_block", kind="CHARACTERISTIC", name=b.name, symbol=b.symbol, insert_at="(pending from merge)", template_origin=f"{path}:{b.begin_idx}..{b.end_idx}")
+            existing_pairs.add(key)
+
+    # Insert measurements
+    if added_meas_blocks:
+        print(f"Adding {len(added_meas_blocks)} MEASUREMENT block(s) to base A2L.")
+        payload: List[str] = []
+        for idx, bl in enumerate(added_meas_blocks):
+            payload.extend(bl)
+            if idx != len(added_meas_blocks) - 1:
+                payload.append("\n")
+        insert_idx = _find_insert_position_after_kind(base_lines, base_blocks, "MEASUREMENT")
+        if insert_idx > 0:
+            if base_lines[insert_idx - 1].strip() != "":
+                base_lines[insert_idx:insert_idx] = ["\n"]; insert_idx += 1
+            else:
+                k = insert_idx - 1
+                while k - 1 >= 0 and base_lines[k - 1].strip() == "":
+                    del base_lines[k - 1]; insert_idx -= 1; k -= 1
+        base_lines[insert_idx:insert_idx] = payload
+        base_blocks, _ = parse_a2l_blocks(base_lines)
+
+    # Insert characteristics
+    if added_char_blocks:
+        print(f"Adding {len(added_char_blocks)} CHARACTERISTIC block(s) to base A2L.")
+        payload: List[str] = []
+        for idx, bl in enumerate(added_char_blocks):
+            payload.extend(bl)
+            if idx != len(added_char_blocks) - 1:
+                payload.append("\n")
+        insert_idx = _find_insert_position_after_kind(base_lines, base_blocks, "CHARACTERISTIC")
+        if insert_idx > 0:
+            if base_lines[insert_idx - 1].strip() != "":
+                base_lines[insert_idx:insert_idx] = ["\n"]; insert_idx += 1
+            else:
+                k = insert_idx - 1
+                while k - 1 >= 0 and base_lines[k - 1].strip() == "":
+                    del base_lines[k - 1]; insert_idx -= 1; k -= 1
+        base_lines[insert_idx:insert_idx] = payload
+
+    # Normalize known address keywords (includes ECU_ADDRESS_EXTENSION)
+    base_lines = force_uppercase_known_address_keywords(base_lines)
+
+    # Optional address update (applies same patching as Updatea2l)
+    if elf:
+        print(f"Updating addresses in merged A2L using ELF: {elf}")
+        merged_blocks, filters = parse_a2l_blocks(base_lines)
+        if filters:
+            try:
+                symbols_dict, missing_filters = build_symbols_dict(elf, filters)
+                addr_map = {name: to_upper_hex(meta["address"]) for name, meta in symbols_dict.items()}
+                uses_ext_limits = _file_uses_extended_limits(base_lines)
+                base_lines, warnings = update_a2l_lines(base_lines, merged_blocks, addr_map, uses_ext_limits, log=log)
+                for w in warnings:
+                    print("Warning:", w)
+                if missing_filters:
+                    print("These A2L symbols were not found in ELF/DWARF:")
+                    for s in sorted(missing_filters):
+                        print(f" - {s}")
+            except Exception as e:
+                print(f"Warning: Failed to update addresses from ELF: {e}")
+        else:
+            print("No symbols found to update in merged A2L.")
+
+    # Report
+    report_txt = log.format_report()
+    print("\n--- Change Report ---")
+    print(report_txt)
+    if report_path:
+        log.write_report(report_path)
+        print(f"Report written to: {report_path}")
+
+    if dry_run:
+        print("Dry-run: not writing merged A2L.")
+        return
+
+    with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
+        f.writelines(base_lines)
+    print(f"Merged A2L saved to: {outputfile}")
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def _main(argv: List[str]) -> int:
+    if len(argv) < 2:
+        print(f"Usage:\n"
+              f"  {argv[0]} update <olda2l> <elf> <newa2l> [--report <path>] [--dry-run]\n"
+              f"  {argv[0]} add <olda2l> <elf> <variablename|list> <characteristic|measurement> <outputfile> [--leaves-only|--include-containers] [--report <path>] [--dry-run]\n"
+              f"  {argv[0]} merge <outputfile> <a2l1> [<a2l2> ...] [--elf <elf>] [--report <path>] [--dry-run]\n\n"
+              f"Notes:\n"
+              f"- Updates address lines; ensures ECU_ADDRESS_EXTENSION; rewrites LINK_MAP/MAP anywhere in block.\n"
+              f"- IF_DATA CANAPE_EXT: ensures DISPLAY 0 <min> <max> (insert if missing) and updates LINK_MAP/MAP.\n"
+              f"- CHARACTERISTIC EXTENDED_LIMITS: updated if present; inserted only if other CHARACTERISTICs already use it.\n"
+              f"- Existing data types are preserved; new blocks infer type from DWARF (fallback {A2L_TYPE_FALLBACK}).\n"
+              f"- Preference: if a symbol exists as both MEASUREMENT and CHARACTERISTIC, CHARACTERISTIC is kept.\n"
+              f"- Reporting: use --report to write a detailed change report; --dry-run to avoid writing output files.")
+        return 1
+
+    cmd = argv[1].lower()
+
+    if cmd == "update":
+        if len(argv) < 5:
+            print(f"Usage: {argv[0]} update <olda2l> <elf> <newa2l> [--report <path>] [--dry-run]")
+            return 1
+        olda2l = argv[2]
+        elf = argv[3]
+        newa2l = argv[4]
+        # parse optional flags
+        report_path = None
+        dry_run = False
+        i = 5
+        while i < len(argv):
+            a = argv[i]
+            if a == "--report" and i + 1 < len(argv):
+                report_path = argv[i + 1]; i += 2; continue
+            if a == "--dry-run":
+                dry_run = True; i += 1; continue
+            i += 1
+        Updatea2l(olda2l, elf, newa2l, report_path=report_path, dry_run=dry_run)
+        return 0
+
+    if cmd == "add":
+        if len(argv) < 7:
+            print(f"Usage: {argv[0]} add <olda2l> <elf> <variablename|list> <characteristic|measurement> <outputfile> [--leaves-only|--include-containers] [--report <path>] [--dry-run]")
+            return 1
+        olda2l = argv[2]
+        elf = argv[3]
+        variablename_arg = argv[4]
+        vartype = argv[5]
+        outputfile = argv[6]
+        flags = set()
+        report_path = None
+        dry_run = False
+        i = 7
+        include_containers = DEFAULT_INCLUDE_CONTAINERS
+        while i < len(argv):
+            a = argv[i].lower()
+            if a == "--leaves-only":
+                include_containers = False; i += 1; continue
+            if a == "--include-containers":
+                include_containers = True; i += 1; continue
+            if a == "--report" and i + 1 < len(argv):
+                report_path = argv[i + 1]; i += 2; continue
+            if a == "--dry-run":
+                dry_run = True; i += 1; continue
+            i += 1
+        variablename_list = _normalize_variablename_input(variablename_arg)
+        addvariable(olda2l, elf, variablename_list, vartype, outputfile, include_containers=include_containers, report_path=report_path, dry_run=dry_run)
+        return 0
+
+    if cmd == "merge":
+        if len(argv) < 4:
+            print(f"Usage: {argv[0]} merge <outputfile> <a2l1> [<a2l2> ...] [--elf <elf>] [--report <path>] [--dry-run]")
+            return 1
+        args = argv[2:]
+        elf_path: Optional[str] = None
+        report_path: Optional[str] = None
+        dry_run = False
+        # parse flags --elf and --report and --dry-run
+        i = 0
+        a2l_files: List[str] = []
+        outputfile = args[0]
+        i = 1
+        while i < len(args):
+            a = args[i]
+            if a == "--elf" and i + 1 < len(args):
+                elf_path = args[i + 1]; i += 2; continue
+            if a == "--report" and i + 1 < len(args):
+                report_path = args[i + 1]; i += 2; continue
+            if a == "--dry-run":
+                dry_run = True; i += 1; continue
+            a2l_files.append(a)
+            i += 1
+        if not a2l_files:
+            print(f"Usage: {argv[0]} merge <outputfile> <a2l1> [<a2l2> ...] [--elf <elf>] [--report <path>] [--dry-run]")
+            return 1
+        mergea2l(a2l_files, outputfile, elf=elf_path, report_path=report_path, dry_run=dry_run)
+        return 0
+
+    print(f"Unknown command: {cmd}")
+    return 1
+
+# ----------------------------
+# Symbol collection and ELF/DWARF integration
+# ----------------------------
+
+def collect_dwarf_struct_vars(prefix, base_addr, die, rows, symbols_dict, filter_list, filter_hits):
+    """Recursively collect members/arrays with full hierarchical names using {prefix}._i_ for arrays."""
+    die = resolve_typedefs(die)
+    if not die:
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), "unknown", "", "unknown"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "unknown",
+                "byte_size": "",
+                "kind": "unknown"
+            }
+        return
+
+    tag = die.tag
+
+    if tag == 'DW_TAG_array_type':
+        elem_die = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
+        elem_die = resolve_typedefs(elem_die)
+        etname, esize, etenc = base_type_info(elem_die)
+        n = array_len_first_dim(die) or 0
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), f"array[{n}]", esize if esize else "", "array"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": f"array[{n}]",
+                "byte_size": esize if esize else "",
+                "kind": "array"
+            }
+        n_print = min(n, MAX_ARRAY)
+        for i in range(n_print):
+            elem_size = esize if esize else 1
+            eaddr = base_addr + i * elem_size
+            array_elem_prefix = f"{prefix}._{i}_"
+            if elem_die and elem_die.tag in ('DW_TAG_structure_type', 'DW_TAG_array_type', 'DW_TAG_union_type'):
+                collect_dwarf_struct_vars(array_elem_prefix, eaddr, elem_die, rows, symbols_dict, filter_list, filter_hits)
+            else:
+                if should_emit(array_elem_prefix, filter_list, filter_hits):
+                    a2l_type = canonical_a2l_type(etname, etenc, esize)
+                    row = [array_elem_prefix, hex(eaddr), a2l_type, esize if esize else "", "array_elem"]
+                    rows.append(row)
+                    symbols_dict[array_elem_prefix] = {
+                        "address": hex(eaddr),
+                        "type": a2l_type,
+                        "byte_size": esize if esize else "",
+                        "kind": "array_elem"
+                    }
+        return
+
+    if tag == 'DW_TAG_structure_type':
+        _, tsize, _ = base_type_info(die)
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), "struct", tsize if tsize else "", "struct"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "struct",
+                "byte_size": tsize if tsize else "",
+                "kind": "struct"
+            }
+        for child in die.iter_children():
+            if child.tag != 'DW_TAG_member':
+                continue
+            mname_attr = child.attributes.get('DW_AT_name')
+            mname = mname_attr.value.decode('utf-8', 'ignore') if mname_attr else '<anon>'
+            off = _data_member_offset(child)
+            mt = child.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in child.attributes else None
+            if not mt:
+                continue
+            collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr + off, mt, rows, symbols_dict, filter_list, filter_hits)
+        return
+
+    if tag == 'DW_TAG_union_type':
+        _, tsize, _ = base_type_info(die)
+        if should_emit(prefix, filter_list, filter_hits):
+            row = [prefix, hex(base_addr), "union", tsize if tsize else "", "union"]
+            rows.append(row)
+            symbols_dict[prefix] = {
+                "address": hex(base_addr),
+                "type": "union",
+                "byte_size": tsize if tsize else "",
+                "kind": "union"
+            }
+        for child in die.iter_children():
+            if child.tag != 'DW_TAG_member':
+                continue
+            mname_attr = child.attributes.get('DW_AT_name')
+            mname = mname_attr.value.decode('utf-8', 'ignore') if mname_attr else '<anon>'
+            mt = child.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in child.attributes else None
+            if not mt:
+                continue
+            collect_dwarf_struct_vars(f"{prefix}.{mname}", base_addr, mt, rows, symbols_dict, filter_list, filter_hits)
+        return
+
+    # leaf/base types
+    tname, tsize, tenc = base_type_info(die)
+    if should_emit(prefix, filter_list, filter_hits):
+        a2l_type = canonical_a2l_type(tname, tenc, tsize)
+        row = [prefix, hex(base_addr), a2l_type, tsize if tsize else "", "variable"]
+        rows.append(row)
+        symbols_dict[prefix] = {
+            "address": hex(base_addr),
+            "type": a2l_type,
+            "byte_size": tsize if tsize else "",
+            "kind": "variable"
+        }
+
+def should_emit(name, filter_list, filter_hits):
+    """Decide if we should EMIT a row for a given fully-qualified name."""
+    if not filter_list:
+        return True
+    matched = False
+    for f in filter_list:
+        if name == f or name.startswith(f + ".") or name.startswith(f + "._"):
+            matched = True
+            if filter_hits is not None and f in filter_hits:
+                filter_hits[f] += 1
+    return matched
+
+def should_traverse(name, filter_list):
+    """Decide if we should TRAVERSE a top-level symbol for potential descendants."""
+    if not filter_list:
+        return True
+    for f in filter_list:
+        if name == f or name.startswith(f + ".") or name.startswith(f + "._"):
+            return True
+        if f.startswith(name + ".") or f.startswith(name + "._"):
+            return True
+    return False
+
+def _decode_lit(op_name: str) -> Optional[int]:
+    """Extract literal value from DW_OP_litN op names."""
+    if not op_name.startswith('DW_OP_lit'):
+        return None
+    try:
+        return int(op_name[len('DW_OP_lit'):])
+    except Exception:
+        return None
+
+def _data_member_offset(member_die) -> int:
+    """
+    Return the byte offset of a struct/union member.
+
+    Handles:
+    - DW_AT_data_member_location class 'constant' or 'implicit_const'
+    - DW_AT_data_member_location class 'exprloc' or 'block'
+    - Bitfields via DW_AT_data_bit_offset / DW_AT_bit_offset -> add bits//8
+    """
+    loc_attr = member_die.attributes.get('DW_AT_data_member_location')
+    bit_off_attr = member_die.attributes.get('DW_AT_data_bit_offset') or member_die.attributes.get('DW_AT_bit_offset')
+    bit_extra = 0
+    if bit_off_attr is not None:
+        try:
+            bit_extra = int(bit_off_attr.value) // 8
+        except Exception:
+            bit_extra = 0
+
+    if not loc_attr:
+        return bit_extra
+
+    cls = describe_form_class(loc_attr.form)
+    if cls == 'constant':
+        try:
+            return int(loc_attr.value) + bit_extra
+        except Exception:
+            return bit_extra
+
+    if cls in ('exprloc', 'block'):
+        try:
+            parser = DWARFExprParser(member_die.cu.dwarfinfo.structs)
+            ops = parser.parse_expr(loc_attr.value)
+
+            offset = 0
+            pending_const: Optional[int] = None
+
+            for op in ops:
+                name = op.op_name
+
+                if name == 'DW_OP_plus_uconst':
+                    try:
+                        offset += int(op.args[0])
+                    except Exception:
+                        pass
+                    continue
+
+                if name in (
+                    'DW_OP_constu', 'DW_OP_const1u', 'DW_OP_const2u',
+                    'DW_OP_const4u', 'DW_OP_const8u',
+                    'DW_OP_consts', 'DW_OP_const1s', 'DW_OP_const2s',
+                    'DW_OP_const4s', 'DW_OP_const8s'
+                ):
+                    try:
+                        pending_const = int(op.args[0])
+                    except Exception:
+                        pending_const = None
+                    continue
+
+                lit_val = _decode_lit(name)
+                if lit_val is not None:
+                    pending_const = lit_val
+                    continue
+
+                if name in ('DW_OP_plus', 'DW_OP_add'):
+                    if pending_const is not None:
+                        offset += pending_const
+                        pending_const = None
+                    continue
+
+            if offset == 0 and pending_const is not None:
+                offset += pending_const
+
+            return int(offset) + bit_extra
+        except Exception as e:
+            if A2L_DEBUG:
+                try:
+                    form = str(loc_attr.form)
+                except Exception:
+                    form = "<unknown>"
+                print(f"[A2L_DEBUG] Failed to parse member offset expr (form={form}): {e}")
+            return bit_extra
+
+    if A2L_DEBUG:
+        try:
+            form = str(loc_attr.form)
+        except Exception:
+            form = "<unknown>"
+        print(f"[A2L_DEBUG] Unhandled data_member_location class '{cls}' (form={form}), using bit_extra={bit_extra}")
+    return bit_extra
+
+def build_symbols_dict(elf_path: str, filter_list: Optional[List[str]]) -> Tuple[Dict[str, Dict[str, str]], Set[str]]:
+    """
+    Use the collector logic to build a symbols_dict filtered by filter_list.
+    Returns (symbols_dict, missing_filters)
+    """
+    with open(elf_path, 'rb') as f:
+        elf = ELFFile(f)
+        symbols = get_symbols(elf)
+
+        if not elf.has_dwarf_info():
+            raise RuntimeError("No DWARF info found in ELF file.")
+
+        if filter_list and len(filter_list) > 0:
+            print("Filters provided:", ", ".join(filter_list))
+        else:
+            print("No filters provided; processing all symbols.")
+
+        dwarfinfo = elf.get_dwarf_info()
+        rows = []
+        symbols_dict: Dict[str, Dict[str, str]] = {}
+        filter_hits = {f: 0 for f in (filter_list or [])}
+
+        for name, meta in sorted(symbols.items(), key=lambda kv: kv[1]['addr']):
+            if filter_list and not should_traverse(name, filter_list):
+                continue
+            addr = meta['addr']
+            found = False
+            for cu in dwarfinfo.iter_CUs():
+                for die in cu.iter_DIEs():
+                    if die.tag != 'DW_TAG_variable':
+                        continue
+                    n = die.attributes.get('DW_AT_name')
+                    if not n:
+                        continue
+                    vname = n.value.decode('utf-8', 'ignore')
+                    if vname == name:
+                        tdie = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
+                        if tdie:
+                            collect_dwarf_struct_vars(name, addr, tdie, rows, symbols_dict, filter_list, filter_hits)
+                        else:
+                            if should_emit(name, filter_list, filter_hits):
+                                symbols_dict[name] = {
+                                    "address": hex(addr),
+                                    "type": "unknown",
+                                    "byte_size": "",
+                                    "kind": "unknown"
+                                }
+                        found = True
+                        break
+                if found:
+                    break
+
+        unmatched = {f for f, c in filter_hits.items() if c == 0}
+        if filter_list:
+            if unmatched:
+                print("Warning: the following filters matched no symbols:")
+                for f in unmatched:
+                    print(f" - {f}")
+            else:
+                print("All filters matched at least one symbol.")
+
+        return symbols_dict, unmatched
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv))
