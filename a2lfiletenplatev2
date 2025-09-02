@@ -294,7 +294,7 @@ class ChangeLog:
             c[e["type"]] = c.get(e["type"], 0) + 1
         return c
 
-    def __str.event_line(self, e: Dict[str, Any]) -> str:
+    def _event_line(self, e: Dict[str, Any]) -> str:
         t = e.get("type", "")
         if t == "update_address":
             return f"[update_address] {e.get('kind')} {e.get('name')} (sym={e.get('symbol')}) line {e.get('line')}: {e.get('old')} -> {e.get('new')}"
@@ -338,7 +338,7 @@ class ChangeLog:
             lines.append("(none)")
         else:
             for e in self.events:
-                lines.append(self.__str.event_line(e))
+                lines.append(self._event_line(e))
         lines.append("")
         lines.append("Notes:")
         lines.append("- Line numbers refer to the file at the moment of change; insertions may shift later lines.")
@@ -351,6 +351,9 @@ class ChangeLog:
                 f.write(self.format_report())
         except Exception as e:
             print(f"Warning: failed to write report to '{path}': {e}")
+
+    def __str__(self) -> str:
+        return self.format_report()
 
 # ----------------------------
 # A2L parsing and updating
@@ -1205,13 +1208,10 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
 
     # Patch the previously added "add_block" events with actual insert index (best effort; one event per new symbol in order)
     next_line = insert_idx
-    event_i = 0
     for e in log.events:
         if e["type"] == "add_block" and e["insert_at"] == "(pending)":
             e["insert_at"] = next_line
             # Estimate block length to advance pointer (until next '/end KIND')
-            # We'll scan from 'next_line' to find end line
-            # This is best-effort; sufficient for reporting "place to add".
             nlines = len(updated_lines)
             j = next_line
             end_pat = END_LINE_RE
@@ -1221,7 +1221,6 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
                     break
                 j += 1
             next_line = j
-            event_i += 1
 
     updated_lines = _enforce_prefer_characteristic_inplace(updated_lines, log=log)
     updated_lines = force_uppercase_known_address_keywords(updated_lines)
@@ -1422,7 +1421,6 @@ def _main(argv: List[str]) -> int:
         variablename_arg = argv[4]
         vartype = argv[5]
         outputfile = argv[6]
-        flags = set()
         report_path = None
         dry_run = False
         i = 7
