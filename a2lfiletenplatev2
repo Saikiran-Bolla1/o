@@ -6,7 +6,7 @@ Implemented functionality
 - Update addresses in MEASUREMENT/CHARACTERISTIC:
   - Updates the first occurrence of ECU_ADDRESS, ADDRESS, or VALUE (hex or decimal).
   - Normalizes all touched hex addresses to uppercase.
-  - Ensures ECU_ADDRESS_EXTENSION exists (inserts 'ECU_ADDRESS_EXTENSION 0x0' after the address line if missing) and normalizes it if present.
+  - ECU_ADDRESS_EXTENSION: normalize casing/value if present; DO NOT insert if missing.
 - Preserve existing data types in existing blocks (we do not rewrite types in-place).
 - Add variables by cloning a template from the file (preserves IF_DATA, LINK_MAP, DISPLAY, FORMAT, etc.).
   - If no template exists, synthesize a minimal block using canonical A2L type inference from DWARF;
@@ -30,7 +30,7 @@ Implemented functionality
 
 New: Template- and change-reporting
 - Every change is recorded with line numbers: address updates, LINK_MAP/MAP rewrites, DISPLAY updates/insertions,
-  EXTENDED_LIMITS updates/insertions, ECU_ADDRESS_EXTENSION insert/normalize, added/removed blocks, and template selection.
+  EXTENDED_LIMITS updates/insertions, ECU_ADDRESS_EXTENSION normalization, added/removed blocks, and template selection.
 - Reports are printed to stdout and can also be saved to a file with --report <path>.
 - Dry-run mode (--dry-run) shows intended changes and report without writing output A2L files.
 
@@ -629,26 +629,20 @@ def _patch_canape_ext_in_block(out_lines: List[str], begin_idx: int, end_idx: in
                 log.add("update_display", kind=kind, name=name, symbol=symbol, line=li)
 
 def _ensure_ecu_address_extension(out_lines: List[str], b: A2LBlock, default_ext_hex: str, log: Optional[ChangeLog]) -> None:
-    """Ensure ECU_ADDRESS_EXTENSION line exists just after the address line; normalize if present."""
-    # Look for existing extension in block
+    """
+    Normalize ECU_ADDRESS_EXTENSION if present; DO NOT insert if missing.
+    Note: default_ext_hex is ignored; kept for signature compatibility.
+    """
+    # Look for existing extension in block; normalize if found
     for li in range(b.begin_idx, b.end_idx + 1):
         raw = out_lines[li].rstrip("\n")
         m = ECU_ADDRESS_EXTENSION_RE.match(raw)
         if m:
-            # normalize casing
             out_lines[li] = f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"
             if log:
                 log.add("ensure_ecu_address_extension", action="normalized", kind=b.kind, name=b.name, symbol=b.symbol, line=li)
             return
-    # Not found: add after address line if we have one
-    if b.addr_line_idx is not None and 0 <= b.addr_line_idx < len(out_lines):
-        addr_line = out_lines[b.addr_line_idx].rstrip("\n")
-        indent_match = re.match(r'^(\s*)', addr_line)
-        indent = indent_match.group(1) if indent_match else ""
-        insert_at = b.addr_line_idx + 1
-        out_lines[insert_at:insert_at] = [f"{indent}ECU_ADDRESS_EXTENSION {default_ext_hex}\n"]
-        if log:
-            log.add("ensure_ecu_address_extension", action="inserted", kind=b.kind, name=b.name, symbol=b.symbol, line=insert_at)
+    # If not found, do nothing (no insertion)
 
 # ----------------------------
 # Limits inference from block content
@@ -683,8 +677,8 @@ def _file_uses_extended_limits(lines: List[str]) -> bool:
 
 def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[str, str], uses_ext_limits: bool, log: Optional[ChangeLog] = None) -> Tuple[List[str], List[str]]:
     """
-    Update base address lines and patch ECU_ADDRESS_EXTENSION, LINK_MAP/MAP anywhere in block,
-    IF_DATA CANAPE_EXT DISPLAY, and EXTENDED_LIMITS for CHARACTERISTIC.
+    Update base address lines and patch ECU_ADDRESS_EXTENSION (normalize if present),
+    LINK_MAP/MAP anywhere in block, IF_DATA CANAPE_EXT DISPLAY, and EXTENDED_LIMITS for CHARACTERISTIC.
     - EXTENDED_LIMITS is updated if present.
     - EXTENDED_LIMITS is inserted only if uses_ext_limits is True (i.e., other CHARACTERISTICs already use it).
     """
@@ -742,7 +736,7 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
             else:
                 warnings.append(f"No address line found to update for symbol '{symbol}' (block {b.kind} {b.name}).")
 
-            # Ensure ECU_ADDRESS_EXTENSION exists/normalized
+            # Normalize ECU_ADDRESS_EXTENSION if present (do not insert)
             _ensure_ecu_address_extension(out_lines, b, default_ext_hex="0x0", log=log)
 
             # Patch LINK_MAP/MAP anywhere in the block
@@ -827,14 +821,13 @@ def _select_block_templates(lines: List[str]) -> Dict[str, Dict[str, Union[List[
     return templates
 
 def _render_new_block_minimal(variablename: str, kind: str, addr_hex_up: str, a2l_type: str, lower: str, upper: str, uses_ext_limits: bool) -> List[str]:
-    """Fallback renderer when no template exists."""
+    """Fallback renderer when no template exists. Does not insert ECU_ADDRESS_EXTENSION."""
     lines: List[str] = []
     if kind == "MEASUREMENT":
         lines.extend([
             f'/begin MEASUREMENT {variablename} ""\n',
             f'  {a2l_type} NO_COMPU_METHOD 0 0 {upper}\n',
             f'  ECU_ADDRESS {addr_hex_up}\n',
-            f'  ECU_ADDRESS_EXTENSION 0x0\n',
             f'  SYMBOL_LINK "{variablename}" 0\n',
             f'/end MEASUREMENT\n',
         ])
@@ -842,7 +835,6 @@ def _render_new_block_minimal(variablename: str, kind: str, addr_hex_up: str, a2
         lines.extend([
             f'/begin CHARACTERISTIC {variablename} ""\n',
             f'  VALUE {addr_hex_up} {a2l_type} 0 NO_COMPU_METHOD 0 {upper}\n',
-            f'  ECU_ADDRESS_EXTENSION 0x0\n',
         ])
         if uses_ext_limits:
             lines.append(f'  EXTENDED_LIMITS {lower} {upper}\n')
@@ -858,7 +850,7 @@ def _render_from_template(kind: str, variablename: str, addr_hex_up: str, templa
       - /begin line name
       - SYMBOL_LINK quoted name
       - first ECU_ADDRESS/ADDRESS/VALUE occurrence with addr_hex_up (types in template are preserved)
-      - ensure ECU_ADDRESS_EXTENSION (insert after address if missing)
+      - ECU_ADDRESS_EXTENSION: normalize if present; do not insert if missing
       - inside IF_DATA CANAPE_EXT:
           - LINK_MAP/MAP symbol+address
           - DISPLAY -> 'DISPLAY 0 <lower> <upper>' (insert if missing)
@@ -914,17 +906,13 @@ def _render_from_template(kind: str, variablename: str, addr_hex_up: str, templa
         if addr_idx is not None and insert_at <= addr_idx:
             addr_idx += 1
 
-    # Ensure ECU_ADDRESS_EXTENSION present/normalized
-    ext_found = False
+    # ECU_ADDRESS_EXTENSION: normalize if present; do not insert if missing
     for i in range(len(cloned)):
         raw = cloned[i].rstrip("\n")
         m = ECU_ADDRESS_EXTENSION_RE.match(raw)
         if m:
             cloned[i] = f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"
-            ext_found = True
             break
-    if not ext_found and addr_idx is not None:
-        cloned.insert(addr_idx + 1, f"{addr_indent}ECU_ADDRESS_EXTENSION 0x0\n")
 
     # Rewrite LINK_MAP/MAP anywhere
     for i in range(len(cloned)):
@@ -1009,7 +997,7 @@ def _find_insert_position_after_kind(lines: List[str], blocks: List[A2LBlock], k
 # ----------------------------
 
 def Updatea2l(olda2l: str, elf: str, newa2l: str, report_path: Optional[str] = None, dry_run: bool = False) -> None:
-    """Update addresses; patch ECU_ADDRESS_EXTENSION, LINK_MAP/MAP, IF_DATA CANAPE_EXT DISPLAY; update/conditionally insert EXTENDED_LIMITS; save."""
+    """Update addresses; patch LINK_MAP/MAP, IF_DATA CANAPE_EXT DISPLAY; normalize ECU_ADDRESS_EXTENSION if present; update/conditionally insert EXTENDED_LIMITS; save."""
     log = ChangeLog()
 
     with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
@@ -1070,7 +1058,7 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
       - Replace LINK_MAP/MAP anywhere (symbol + address).
       - In CANAPE_EXT, ensure/update DISPLAY (color 0, min/max per type).
       - Update/conditionally insert EXTENDED_LIMITS (CHARACTERISTIC): insert only if other CHARACTERISTICs already have it.
-      - Ensure ECU_ADDRESS_EXTENSION is present.
+      - ECU_ADDRESS_EXTENSION: do not insert; normalize only if present in template.
     Report includes: template selection lines, inserted positions, and any inserted/updated nested items.
     """
     log = ChangeLog()
@@ -1244,7 +1232,8 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
 def mergea2l(a2l_files: Union[str, List[str]], outputfile: str, elf: Optional[str] = None, report_path: Optional[str] = None, dry_run: bool = False) -> None:
     """
     Merge A2L files into the first one; avoid duplicates; prefer CHARACTERISTIC; append MEASUREMENTs after last MEASUREMENT.
-    Optionally update addresses; ECU_ADDRESS_EXTENSION, LINK_MAP/MAP, CANAPE_EXT DISPLAY, and EXTENDED_LIMITS are patched as in Updatea2l.
+    Optionally update addresses; LINK_MAP/MAP, CANAPE_EXT DISPLAY, and EXTENDED_LIMITS are patched as in Updatea2l.
+    ECU_ADDRESS_EXTENSION is normalized if present but never inserted.
     - EXTENDED_LIMITS insertion policy follows the merged file usage (we only insert if it already exists somewhere in CHARACTERISTICs).
     Reports added/removed blocks and all nested changes when ELF update is applied.
     """
@@ -1330,7 +1319,7 @@ def mergea2l(a2l_files: Union[str, List[str]], outputfile: str, elf: Optional[st
                     del base_lines[k - 1]; insert_idx -= 1; k -= 1
         base_lines[insert_idx:insert_idx] = payload
 
-    # Normalize known address keywords (includes ECU_ADDRESS_EXTENSION)
+    # Normalize known address keywords (includes ECU_ADDRESS_EXTENSION if present)
     base_lines = force_uppercase_known_address_keywords(base_lines)
 
     # Optional address update (applies same patching as Updatea2l)
@@ -1381,9 +1370,10 @@ def _main(argv: List[str]) -> int:
               f"  {argv[0]} add <olda2l> <elf> <variablename|list> <characteristic|measurement> <outputfile> [--leaves-only|--include-containers] [--report <path>] [--dry-run]\n"
               f"  {argv[0]} merge <outputfile> <a2l1> [<a2l2> ...] [--elf <elf>] [--report <path>] [--dry-run]\n\n"
               f"Notes:\n"
-              f"- Updates address lines; ensures ECU_ADDRESS_EXTENSION; rewrites LINK_MAP/MAP anywhere in block.\n"
+              f"- Updates address lines; rewrites LINK_MAP/MAP anywhere in block.\n"
               f"- IF_DATA CANAPE_EXT: ensures DISPLAY 0 <min> <max> (insert if missing) and updates LINK_MAP/MAP.\n"
               f"- CHARACTERISTIC EXTENDED_LIMITS: updated if present; inserted only if other CHARACTERISTICs already use it.\n"
+              f"- ECU_ADDRESS_EXTENSION: normalized if present; not inserted when missing.\n"
               f"- Existing data types are preserved; new blocks infer type from DWARF (fallback {A2L_TYPE_FALLBACK}).\n"
               f"- Preference: if a symbol exists as both MEASUREMENT and CHARACTERISTIC, CHARACTERISTIC is kept.\n"
               f"- Reporting: use --report to write a detailed change report; --dry-run to avoid writing output files.")
