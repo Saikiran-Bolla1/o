@@ -1,0 +1,68 @@
+from elftools.elf.elffile import ELFFile
+
+def _resolve_typedefs(die):
+    seen = set()
+    cur = die
+    while cur and cur.offset not in seen:
+        seen.add(cur.offset)
+        if cur.tag in ('DW_TAG_base_type', 'DW_TAG_pointer_type',
+                       'DW_TAG_array_type', 'DW_TAG_structure_type',
+                       'DW_TAG_union_type', 'DW_TAG_enumeration_type'):
+            return cur
+        if 'DW_AT_type' in cur.attributes:
+            cur = cur.get_DIE_from_attribute('DW_AT_type')
+        else:
+            break
+    return cur
+
+def variable_is_enum(elf_path: str, var_name: str):
+    """
+    Return dict with:
+    - is_enum: bool
+    - enum_type: str or None
+    - enumerators: list[(name, value)] if enum, else []
+    """
+    with open(elf_path, 'rb') as f:
+        elf = ELFFile(f)
+        if not elf.has_dwarf_info():
+            return {'is_enum': False, 'enum_type': None, 'enumerators': []}
+
+        dwarf = elf.get_dwarf_info()
+
+        # Find the variable DIE by name
+        for cu in dwarf.iter_CUs():
+            for die in cu.iter_DIEs():
+                if die.tag != 'DW_TAG_variable':
+                    continue
+                n = die.attributes.get('DW_AT_name')
+                if not n:
+                    continue
+                vname = n.value.decode('utf-8', 'ignore')
+                if vname != var_name:
+                    continue
+
+                t_die = die.get_DIE_from_attribute('DW_AT_type') if 'DW_AT_type' in die.attributes else None
+                if not t_die:
+                    return {'is_enum': False, 'enum_type': None, 'enumerators': []}
+
+                resolved = _resolve_typedefs(t_die)
+                if not resolved or resolved.tag != 'DW_TAG_enumeration_type':
+                    return {'is_enum': False, 'enum_type': None, 'enumerators': []}
+
+                # Collect enum type name and enumerators
+                name_attr = resolved.attributes.get('DW_AT_name')
+                enum_type = name_attr.value.decode('utf-8', 'ignore') if name_attr else '<anon enum>'
+
+                enumerators = []
+                for child in resolved.iter_children():
+                    if child.tag != 'DW_TAG_enumerator':
+                        continue
+                    en = child.attributes.get('DW_AT_name')
+                    ev = child.attributes.get('DW_AT_const_value')
+                    if en is None or ev is None:
+                        continue
+                    enumerators.append((en.value.decode('utf-8', 'ignore'), int(ev.value)))
+
+                return {'is_enum': True, 'enum_type': enum_type, 'enumerators': enumerators}
+
+        return {'is_enum': False, 'enum_type': None, 'enumerators': []}
