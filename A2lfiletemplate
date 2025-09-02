@@ -10,10 +10,8 @@ Included features
 - Deduplication rule: if the same symbol appears as both MEASUREMENT and CHARACTERISTIC, prefer CHARACTERISTIC
   (applied to update, add, and merge flows).
 - Nested content updates:
-  - LINK_MAP/MAP lines (case-insensitive): set the quoted symbol to the block's symbol and the first numeric literal
-    after the keyword to the block's (possibly delta-adjusted) address.
-  - IF_DATA CANAPE_EXT blocks:
-      * Update LINK_MAP/MAP inside the IF_DATA scope (symbol + address as above).
+  - LINK_MAP/MAP lines (case-insensitive) inside IF_DATA CANAPE_EXT:
+      * Set the quoted symbol to the block's symbol and the first numeric literal to the block's address.
       * Update DISPLAY to "DISPLAY 0 <min> <max>" where color is forced to 0 and min/max inferred from the variable type.
   - EXTENDED_LIMITS in CHARACTERISTIC: if present, update to inferred min/max for the variable type.
 - Case-insensitive parsing of /begin, /end, SYMBOL_LINK, ECU_ADDRESS, ADDRESS, VALUE, LINK_MAP, MAP, DISPLAY, EXTENDED_LIMITS.
@@ -25,21 +23,14 @@ Included features
 - Merge multiple A2L files into the first one, appending missing blocks in their proper sections and optionally updating
   all addresses using an ELF, with the same nested-content patching.
 
+ECU_ADDRESS_EXTENSION policy
+- Never inserted by the tool. If present in the input/template, it is preserved and hex-normalized.
+
+New CHARACTERISTIC VALUE formatting (when creating or rewriting from template)
+- VALUE {ADDRESS} __{datatype}_S 0 NO_COMPU_METHOD {min} {max}
+  where {datatype} is the canonical A2L type (e.g., UBYTE, SLONG, FLOAT32_IEEE).
+
 Requires: pip install pyelftools
-
-Note on ECU_ADDRESS_EXTENSION
-- Do NOT insert ECU_ADDRESS_EXTENSION lines.
-- If an ECU_ADDRESS_EXTENSION line is already present in the A2L (either in existing blocks or inside a template being cloned),
-  it will be preserved and its hex value will be normalized to uppercase.
-
-Note on CHARACTERISTIC VALUE line when creating new blocks
-- When creating CHARACTERISTIC blocks (either minimal or from a template), the VALUE line is rendered as:
-    VALUE {ADDRESS} __{datatype}_S 0 NO_COMPU_METHOD {min} {max}
-  where:
-    - {ADDRESS} is the symbol address (hex, uppercase)
-    - {datatype} is the canonical A2L type (e.g., UBYTE, SLONG, FLOAT32_IEEE)
-    - {min} and {max} come from the canonical limits for that datatype
-- Existing blocks are not rewritten to change their VALUE type token; this format applies to newly created blocks only.
 """
 
 import sys
@@ -605,6 +596,8 @@ ECU_ADDRESS_RE = re.compile(r'^(\s*ECU_ADDRESS\s+)(0x[0-9A-Fa-f]+|\d+)(.*)$', re
 VALUE_ADDR_RE  = re.compile(r'^(\s*VALUE\s+)(0x[0-9A-Fa-f]+|\d+)(.*)$', re.IGNORECASE)
 ADDRESS_RE     = re.compile(r'^(\s*ADDRESS\s+)(0x[0-9A-Fa-f]+|\d+)(.*)$', re.IGNORECASE)
 DEC_ANY_ADDR_RE = re.compile(r'^(\s*(?:ECU_ADDRESS|VALUE|ADDRESS)\s+)(\d+)(.*)$', re.IGNORECASE)
+# ECU_ADDRESS_EXTENSION (normalize if present; never insert)
+ECU_ADDRESS_EXTENSION_RE = re.compile(r'^(\s*ECU_ADDRESS_EXTENSION\s+)(0x[0-9A-Fa-f]+|\d+)(.*)$', re.IGNORECASE)
 
 # IF_DATA CANAPE_EXT scoping
 IFDATA_CANAPE_BEGIN_RE = re.compile(r'^\s*/begin\s+IF_DATA\s+CANAPE_EXT\b', re.IGNORECASE)
@@ -685,7 +678,10 @@ def parse_a2l_blocks(lines: List[str]) -> Tuple[List[A2LBlock], List[str]]:
     return blocks, filters
 
 def force_uppercase_known_address_keywords(lines: List[str]) -> List[str]:
-    """Uppercase hex for ECU_ADDRESS/ADDRESS/VALUE fields across file; preserve spacing and casing."""
+    """
+    Uppercase hex for ECU_ADDRESS/ADDRESS/VALUE/ECU_ADDRESS_EXTENSION fields across file; preserve spacing and casing.
+    Note: This only normalizes existing ECU_ADDRESS_EXTENSION lines; it does not insert any.
+    """
     out: List[str] = []
     for line in lines:
         raw = line.rstrip("\n")
@@ -698,7 +694,30 @@ def force_uppercase_known_address_keywords(lines: List[str]) -> List[str]:
         m = VALUE_ADDR_RE.match(raw)
         if m:
             out.append(f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"); continue
+        m = ECU_ADDRESS_EXTENSION_RE.match(raw)
+        if m:
+            out.append(f"{m.group(1)}{to_upper_hex(m.group(2))}{m.group(3)}\n"); continue
         out.append(line)
+    return out
+
+def _normalize_blank_lines(lines: List[str]) -> List[str]:
+    """
+    Normalize whitespace:
+    - Replace whitespace-only lines with '\n'
+    - Collapse multiple blank lines into a single blank line
+    - Strip trailing spaces on non-blank lines
+    """
+    out: List[str] = []
+    last_was_blank = False
+    for line in lines:
+        raw = line.rstrip("\r\n")
+        if raw.strip() == "":
+            if not last_was_blank:
+                out.append("\n")
+                last_was_blank = True
+        else:
+            out.append(raw.rstrip() + "\n")
+            last_was_blank = False
     return out
 
 # ----------------------------
@@ -948,8 +967,9 @@ def _render_from_template(kind: str, variablename: str, addr_hex_up: str, templa
     Clone a template block and replace:
       - /begin KIND <name>
       - SYMBOL_LINK "<name>"
-      - first ECU_ADDRESS/ADDRESS/VALUE occurrence: for MEASUREMENT only the address; for CHARACTERISTIC, rewrite full VALUE line to:
-            VALUE {ADDRESS} __{datatype}_S 0 NO_COMPU_METHOD {min} {max}
+      - first ECU_ADDRESS/ADDRESS/VALUE occurrence:
+          * MEASUREMENT: update the address literal
+          * CHARACTERISTIC: rewrite full VALUE line to 'VALUE {ADDRESS} __{datatype}_S 0 NO_COMPU_METHOD {min} {max}'
       - inside IF_DATA CANAPE_EXT:
           - LINK_MAP/MAP symbol+address
           - DISPLAY -> color 0 and min/max from provided limits
@@ -984,7 +1004,7 @@ def _render_from_template(kind: str, variablename: str, addr_hex_up: str, templa
         raw = l.rstrip("\n")
         m_val = VALUE_ADDR_RE.match(raw)
         m_addr = ECU_ADDRESS_RE.match(raw) or ADDRESS_RE.match(raw) or DEC_ANY_ADDR_RE.match(raw)
-        if m_val:
+        if m_val and kind == "CHARACTERISTIC":
             # Use indent from existing VALUE line
             indent_match = re.match(r'^(\s*)', raw)
             indent = indent_match.group(1) if indent_match else "  "
@@ -1021,7 +1041,7 @@ def _render_from_template(kind: str, variablename: str, addr_hex_up: str, templa
         if m:
             cloned[i] = f"{m.group(1)}0{m.group(3)}{lower}{m.group(5)}{upper}{m.group(7)}\n"
 
-    # Normalize hex casing within block
+    # Normalize hex casing within block (including ECU_ADDRESS_EXTENSION if present)
     cloned = force_uppercase_known_address_keywords(cloned)
     return cloned
 
@@ -1094,6 +1114,7 @@ def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
 
     updated_lines = _enforce_prefer_characteristic_inplace(updated_lines)
     updated_lines = force_uppercase_known_address_keywords(updated_lines)
+    updated_lines = _normalize_blank_lines(updated_lines)
 
     with open(newa2l, "w", encoding="utf-8", errors="ignore") as f:
         f.writelines(updated_lines)
@@ -1191,6 +1212,7 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
         print("No new filtered symbols to add; only addresses were updated.")
         updated_lines = _enforce_prefer_characteristic_inplace(updated_lines)
         updated_lines = force_uppercase_known_address_keywords(updated_lines)
+        updated_lines = _normalize_blank_lines(updated_lines)
         with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
             f.writelines(updated_lines)
         print(f"Saved updated A2L to: {outputfile}")
@@ -1210,6 +1232,7 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
 
     updated_lines = _enforce_prefer_characteristic_inplace(updated_lines)
     updated_lines = force_uppercase_known_address_keywords(updated_lines)
+    updated_lines = _normalize_blank_lines(updated_lines)
 
     with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
         f.writelines(updated_lines)
@@ -1298,6 +1321,7 @@ def mergea2l(a2l_files: Union[str, List[str]], outputfile: str, elf: Optional[st
         base_lines[insert_idx:insert_idx] = payload
 
     base_lines = force_uppercase_known_address_keywords(base_lines)
+    base_lines = _normalize_blank_lines(base_lines)
 
     if elf:
         print(f"Updating addresses in merged A2L using ELF: {elf}")
@@ -1317,6 +1341,8 @@ def mergea2l(a2l_files: Union[str, List[str]], outputfile: str, elf: Optional[st
                 print(f"Warning: Failed to update addresses from ELF: {e}")
         else:
             print("No symbols found to update in merged A2L.")
+
+        base_lines = _normalize_blank_lines(base_lines)
 
     with open(outputfile, "w", encoding="utf-8", errors="ignore") as f:
         f.writelines(base_lines)
