@@ -26,6 +26,20 @@ Included features
   all addresses using an ELF, with the same nested-content patching.
 
 Requires: pip install pyelftools
+
+Note on ECU_ADDRESS_EXTENSION
+- Do NOT insert ECU_ADDRESS_EXTENSION lines.
+- If an ECU_ADDRESS_EXTENSION line is already present in the A2L (either in existing blocks or inside a template being cloned),
+  it will be preserved and its hex value will be normalized to uppercase.
+
+Note on CHARACTERISTIC VALUE line when creating new blocks
+- When creating CHARACTERISTIC blocks (either minimal or from a template), the VALUE line is rendered as:
+    VALUE {ADDRESS} __{datatype}_S 0 NO_COMPU_METHOD {min} {max}
+  where:
+    - {ADDRESS} is the symbol address (hex, uppercase)
+    - {datatype} is the canonical A2L type (e.g., UBYTE, SLONG, FLOAT32_IEEE)
+    - {min} and {max} come from the canonical limits for that datatype
+- Existing blocks are not rewritten to change their VALUE type token; this format applies to newly created blocks only.
 """
 
 import sys
@@ -780,6 +794,7 @@ def update_a2l_lines(lines: List[str], blocks: List[A2LBlock], addr_map: Dict[st
     """
     Update base address lines and patch IF_DATA CANAPE_EXT (LINK_MAP/MAP, DISPLAY).
     Also patch EXTENDED_LIMITS in CHARACTERISTIC if present.
+    Does not insert ECU_ADDRESS_EXTENSION; normalizes only if present (handled globally by hex-normalizer).
     """
     out_lines = list(lines)
     warnings: List[str] = []
@@ -903,8 +918,12 @@ def _select_block_templates(lines: List[str]) -> Dict[str, List[str]]:
             templates[kind] = list(lines[begin:end + 1])
     return templates
 
+def _characteristic_value_line(addr_hex_up: str, a2l_type: str, lower: str, upper: str, indent: str = "  ") -> str:
+    """Render the VALUE line for CHARACTERISTIC with the requested format."""
+    return f"{indent}VALUE {addr_hex_up} __{a2l_type}_S 0 NO_COMPU_METHOD {lower} {upper}\n"
+
 def _render_new_block_minimal(variablename: str, kind: str, addr_hex_up: str, a2l_type: str, lower: str, upper: str) -> List[str]:
-    """Fallback renderer when no template exists."""
+    """Fallback renderer when no template exists. Does NOT insert ECU_ADDRESS_EXTENSION."""
     lines: List[str] = []
     if kind == "MEASUREMENT":
         lines.extend([
@@ -917,26 +936,28 @@ def _render_new_block_minimal(variablename: str, kind: str, addr_hex_up: str, a2
     else:
         lines.extend([
             f'/begin CHARACTERISTIC {variablename} ""\n',
-            f'  VALUE {addr_hex_up} {a2l_type} 0 NO_COMPU_METHOD 0 {upper}\n',
+            _characteristic_value_line(addr_hex_up, a2l_type, lower, upper),
             f'  EXTENDED_LIMITS {lower} {upper}\n',
             f'  SYMBOL_LINK "{variablename}" 0\n',
             f'/end CHARACTERISTIC\n',
         ])
     return lines
 
-def _render_from_template(kind: str, variablename: str, addr_hex_up: str, template_lines: List[str], lower: str, upper: str) -> List[str]:
+def _render_from_template(kind: str, variablename: str, addr_hex_up: str, template_lines: List[str], a2l_type: str, lower: str, upper: str) -> List[str]:
     """
     Clone a template block and replace:
       - /begin KIND <name>
       - SYMBOL_LINK "<name>"
-      - first ECU_ADDRESS/ADDRESS/VALUE occurrence with addr_hex_up
+      - first ECU_ADDRESS/ADDRESS/VALUE occurrence: for MEASUREMENT only the address; for CHARACTERISTIC, rewrite full VALUE line to:
+            VALUE {ADDRESS} __{datatype}_S 0 NO_COMPU_METHOD {min} {max}
       - inside IF_DATA CANAPE_EXT:
           - LINK_MAP/MAP symbol+address
           - DISPLAY -> color 0 and min/max from provided limits
       - EXTENDED_LIMITS (if present in template) with provided limits
+    Note: ECU_ADDRESS_EXTENSION is preserved/normalized only if present in the template; never inserted.
     """
     if not template_lines:
-        return _render_new_block_minimal(variablename, kind, addr_hex_up, "ULONG", lower, upper)
+        return _render_new_block_minimal(variablename, kind, addr_hex_up, a2l_type, lower, upper)
 
     cloned = [l for l in template_lines]
     name_re = re.compile(rf'^(\s*/begin\s+{kind}\s+)(\S+)(.*)$', re.IGNORECASE)
@@ -958,12 +979,19 @@ def _render_from_template(kind: str, variablename: str, addr_hex_up: str, templa
                 cloned[i] = f'{l[:q1]}"{variablename}"{l[q2+1:]}'
             break
 
-    # Address line
+    # Address/Value line
     for i, l in enumerate(cloned):
         raw = l.rstrip("\n")
-        m = ECU_ADDRESS_RE.match(raw) or VALUE_ADDR_RE.match(raw) or ADDRESS_RE.match(raw) or DEC_ANY_ADDR_RE.match(raw)
-        if m:
-            cloned[i] = f"{m.group(1)}{addr_hex_up}{m.group(3)}\n"
+        m_val = VALUE_ADDR_RE.match(raw)
+        m_addr = ECU_ADDRESS_RE.match(raw) or ADDRESS_RE.match(raw) or DEC_ANY_ADDR_RE.match(raw)
+        if m_val:
+            # Use indent from existing VALUE line
+            indent_match = re.match(r'^(\s*)', raw)
+            indent = indent_match.group(1) if indent_match else "  "
+            cloned[i] = _characteristic_value_line(addr_hex_up, a2l_type, lower, upper, indent=indent)
+            break
+        elif m_addr and kind == "MEASUREMENT":
+            cloned[i] = f"{m_addr.group(1)}{addr_hex_up}{m_addr.group(3)}\n"
             break
 
     # EXTENDED_LIMITS (if present)
@@ -1036,7 +1064,7 @@ def _find_insert_position_after_kind(lines: List[str], blocks: List[A2LBlock], k
 # ----------------------------
 
 def Updatea2l(olda2l: str, elf: str, newa2l: str) -> None:
-    """Update addresses; patch CANAPE_EXT LINK_MAP/MAP and DISPLAY; update EXTENDED_LIMITS; save."""
+    """Update addresses; patch CANAPE_EXT LINK_MAP/MAP and DISPLAY; update EXTENDED_LIMITS; save. Does not insert ECU_ADDRESS_EXTENSION."""
     with open(olda2l, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 
@@ -1078,6 +1106,8 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
       - Clone a template block of the same kind (if available) to follow syntax, including IF_DATA CANAPE_EXT.
       - Replace LINK_MAP/MAP + DISPLAY (color 0, min/max per type) inside CANAPE_EXT.
       - Update EXTENDED_LIMITS if present.
+      - Do NOT insert ECU_ADDRESS_EXTENSION (kept only if present in template).
+      - For CHARACTERISTIC, render VALUE line as: VALUE {ADDRESS} __{datatype}_S 0 NO_COMPU_METHOD {min} {max}
     """
     kind = (vartype or "").strip().upper()
     if kind not in ("CHARACTERISTIC", "MEASUREMENT"):
@@ -1150,7 +1180,7 @@ def addvariable(olda2l: str, elf: str, variablename: Union[str, List[str]], vart
         addr_hex_up = to_upper_hex(meta.get("address", "0x0"))
 
         if tmpl:
-            block_lines = _render_from_template(kind, name, addr_hex_up, tmpl, lower, upper)
+            block_lines = _render_from_template(kind, name, addr_hex_up, tmpl, a2l_type, lower, upper)
         else:
             block_lines = _render_new_block_minimal(name, kind, addr_hex_up, a2l_type, lower, upper)
         insert_lines.extend(block_lines)
@@ -1189,6 +1219,7 @@ def mergea2l(a2l_files: Union[str, List[str]], outputfile: str, elf: Optional[st
     """
     Merge A2L files into the first one; avoid duplicates; prefer CHARACTERISTIC; append MEASUREMENTs after last MEASUREMENT.
     Optionally update addresses; CANAPE_EXT content is patched as in Updatea2l.
+    ECU_ADDRESS_EXTENSION is never inserted; existing lines (if present) are preserved and normalized.
     """
     if isinstance(a2l_files, str):
         a2l_files = [a2l_files]
@@ -1302,9 +1333,11 @@ def _main(argv: List[str]) -> int:
               f"  {argv[0]} add <olda2l> <elf> <variablename|list> <characteristic|measurement> <outputfile> [--leaves-only|--include-containers]\n"
               f"  {argv[0]} merge <outputfile> <a2l1> [<a2l2> ...] [--elf <elf>]\n\n"
               f"Notes:\n"
-              f"- Updates also patch nested LINK_MAP/MAP lines (symbol + address) inside blocks.\n"
+              f"- Updates also patch nested LINK_MAP/MAP lines (symbol + address) inside CANAPE_EXT blocks.\n"
               f"- IF_DATA CANAPE_EXT inside blocks is updated: LINK_MAP/MAP and DISPLAY 0 <min> <max>.\n"
               f"- EXTENDED_LIMITS is updated for CHARACTERISTIC if present.\n"
+              f"- ECU_ADDRESS_EXTENSION: never inserted; if present in the A2L/template, it is preserved and hex-normalized.\n"
+              f"- New CHARACTERISTIC blocks render VALUE as: VALUE {{ADDRESS}} __{{datatype}}_S 0 NO_COMPU_METHOD {{min}} {{max}}.\n"
               f"- 'add' clones a template block from the file (preserves IF_DATA/LINK_MAP/DISPLAY etc.).\n"
               f"- Preference: if a symbol exists as both MEASUREMENT and CHARACTERISTIC, CHARACTERISTIC is kept.")
         return 1
