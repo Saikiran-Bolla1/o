@@ -1,47 +1,98 @@
+import csv
 import pandas as pd
+from isotp import Message
+from udsoncan import Request, Response
+from udsoncan import services
 
-def parse_trace_file(trace_path):
-    # You need to adjust this based on your trace file format!
-    requests = []
-    responses = []
-    with open(trace_path, 'r') as file:
-        for line in file:
-            # Example parsing: "timestamp name id rx data"
-            parts = line.strip().split()
-            if len(parts) < 5:
-                continue
-            timestamp, name, msg_id, rx, data = parts
+TX_ID = 0x7E0  # Replace with your TX ID
+RX_ID = 0x7E8  # Replace with your RX ID
+INPUT_FILE = 'your_trace.csv'
+OUTPUT_FILE = 'diagnostic_pairs.csv'
 
-            # Example logic: requests have rx == "Tx", responses rx == "Rx"
-            # You must adapt this to your protocol!
-            if rx == "Tx":
-                requests.append({'timestamp': timestamp, 'id': msg_id, 'data': data})
-            elif rx == "Rx":
-                responses.append({'timestamp': timestamp, 'id': msg_id, 'data': data})
+def load_frames(filename, tx_id, rx_id):
+    tx_frames, rx_frames = [], []
+    with open(filename, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            can_id = int(row['id'], 16) if '0x' in row['id'] else int(row['id'])
+            data_bytes = bytes.fromhex(row['data'].replace(' ', ''))
+            ts = float(row['time'])
+            frame = {'timestamp': ts, 'can_id': can_id, 'data': data_bytes}
+            if can_id == tx_id:
+                tx_frames.append(frame)
+            elif can_id == rx_id:
+                rx_frames.append(frame)
+    return tx_frames, rx_frames
 
-    return requests, responses
+def reassemble_isotp(frames):
+    """
+    Takes frames sorted by timestamp, reassembles ISO-TP payloads.
+    Returns list of decoded payloads (bytes).
+    """
+    messages = []
+    buffer = b''
+    expected_length = None
+    next_sn = 1
 
-def pair_requests_responses(requests, responses):
-    # Example: pair by id
-    pairs = []
-    for req in requests:
-        # Find first response with same id (you may need better matching logic)
-        resp = next((r for r in responses if r['id'] == req['id']), None)
-        pairs.append({
-            'Request': f"{req['timestamp']} {req['id']} {req['data']}",
-            'Response': f"{resp['timestamp']} {resp['id']} {resp['data']}" if resp else ''
-        })
-    return pairs
+    for frame in frames:
+        data = frame['data']
+        pci = data[0] >> 4
+        if pci == 0:  # Single Frame
+            length = data[0] & 0x0F
+            messages.append(data[1:1+length])
+            buffer = b''
+            expected_length = None
+            next_sn = 1
+        elif pci == 1:  # First Frame
+            expected_length = ((data[0] & 0x0F) << 8) + data[1]
+            buffer = data[2:]
+            next_sn = 1
+        elif pci == 2:  # Consecutive Frame
+            sn = data[0] & 0x0F
+            if sn == next_sn and expected_length is not None:
+                buffer += data[1:]
+                next_sn = (next_sn + 1) % 16
+                if len(buffer) >= expected_length:
+                    messages.append(buffer[:expected_length])
+                    buffer = b''
+                    expected_length = None
+                    next_sn = 1
+            else:
+                # Out-of-order or missing frame, reset
+                buffer = b''
+                expected_length = None
+                next_sn = 1
+    return messages
 
-def save_to_excel(pairs, output_file):
-    df = pd.DataFrame(pairs)
-    df.to_excel(output_file, index=False)
+def decode_uds_payload(payload):
+    try:
+        req = Request.from_bytes(payload)
+        return req.service.__class__.__name__ + " " + ' '.join(f'{b:02X}' for b in req.data)
+    except Exception:
+        return payload.hex()
 
-if __name__ == "__main__":
-    trace_path = "trace.txt"       # Path to your trace file
-    output_file = "result.xlsx"    # Output Excel file name
+def main():
+    tx_frames, rx_frames = load_frames(INPUT_FILE, TX_ID, RX_ID)
+    tx_frames.sort(key=lambda x: x['timestamp'])
+    rx_frames.sort(key=lambda x: x['timestamp'])
 
-    requests, responses = parse_trace_file(trace_path)
-    pairs = pair_requests_responses(requests, responses)
-    save_to_excel(pairs, output_file)
-    print(f"Saved request/response pairs to {output_file}")
+    tx_payloads = reassemble_isotp(tx_frames)
+    rx_payloads = reassemble_isotp(rx_frames)
+
+    # Pair by order
+    max_len = max(len(tx_payloads), len(rx_payloads))
+    requests = [decode_uds_payload(p) for p in tx_payloads]
+    responses = [decode_uds_payload(p) for p in rx_payloads]
+
+    # Pad if mismatch
+    while len(requests) < max_len:
+        requests.append('')
+    while len(responses) < max_len:
+        responses.append('')
+
+    df = pd.DataFrame({'request': requests, 'response': responses})
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"Done. Output in {OUTPUT_FILE}")
+
+if __name__ == '__main__':
+    main()
