@@ -1,0 +1,47 @@
+import pandas as pd
+
+def parse_trace_file(trace_path):
+    # You need to adjust this based on your trace file format!
+    requests = []
+    responses = []
+    with open(trace_path, 'r') as file:
+        for line in file:
+            # Example parsing: "timestamp name id rx data"
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            timestamp, name, msg_id, rx, data = parts
+
+            # Example logic: requests have rx == "Tx", responses rx == "Rx"
+            # You must adapt this to your protocol!
+            if rx == "Tx":
+                requests.append({'timestamp': timestamp, 'id': msg_id, 'data': data})
+            elif rx == "Rx":
+                responses.append({'timestamp': timestamp, 'id': msg_id, 'data': data})
+
+    return requests, responses
+
+def pair_requests_responses(requests, responses):
+    # Example: pair by id
+    pairs = []
+    for req in requests:
+        # Find first response with same id (you may need better matching logic)
+        resp = next((r for r in responses if r['id'] == req['id']), None)
+        pairs.append({
+            'Request': f"{req['timestamp']} {req['id']} {req['data']}",
+            'Response': f"{resp['timestamp']} {resp['id']} {resp['data']}" if resp else ''
+        })
+    return pairs
+
+def save_to_excel(pairs, output_file):
+    df = pd.DataFrame(pairs)
+    df.to_excel(output_file, index=False)
+
+if __name__ == "__main__":
+    trace_path = "trace.txt"       # Path to your trace file
+    output_file = "result.xlsx"    # Output Excel file name
+
+    requests, responses = parse_trace_file(trace_path)
+    pairs = pair_requests_responses(requests, responses)
+    save_to_excel(pairs, output_file)
+    print(f"Saved request/response pairs to {output_file}")
