@@ -1,120 +1,375 @@
 import csv
-import pandas as pd
-from isotp import Message
-from udsoncan import Request, Response
-from udsoncan import services
-
-TX_ID = 0x7E0  # Replace with your TX ID
-RX_ID = 0x7E8  # Replace with your RX ID
-INPUT_FILE = 'your_trace.csv'
-OUTPUT_FILE = 'diagnostic_pairs.csv'
-
-import csv
+import argparse
+from typing import List, Dict, Optional, Tuple
 import pandas as pd
 
-# Change these to your actual IDs (in string format as in your CSV)
-TX_ID_STR = '18DAF110x'
-RX_ID_STR = '18DAF011x'
-INPUT_FILE = 'your_trace.csv'
-OUTPUT_FILE = 'diagnostic_pairs.csv'
+# Requires:
+#   pip install udsoncan pandas openpyxl
 
-def idstr_to_int(idstr):
-    """Convert '18DAF110x' to integer 0x18DAF110"""
-    if idstr.endswith('x'):
-        return int(idstr[:-1], 16)
-    return int(idstr, 16)
+def idstr_to_int(idstr: str) -> int:
+    """
+    Convert CAN ID strings like '18DAF110x' to integer (0x18DAF110).
+    Accepts '...x', '...X', '0x...' or plain hex or decimal.
+    """
+    s = idstr.strip()
+    if s.endswith(('x', 'X')):
+        s = s[:-1]
+    if s.lower().startswith('0x'):
+        return int(s, 16)
+    try:
+        return int(s, 16)
+    except ValueError:
+        return int(s, 10)
 
-TX_ID = idstr_to_int(TX_ID_STR)
-RX_ID = idstr_to_int(RX_ID_STR)
+def bytes_to_hex_spaced_upper(b: Optional[bytes]) -> str:
+    return ' '.join(f'{x:02X}' for x in b) if b is not None else ''
 
-def load_frames(filename, tx_id, rx_id):
-    tx_frames, rx_frames = [], []
-    with open(filename, 'r') as f:
+class IsoTpReassembler:
+    """
+    Offline ISO-TP reassembler for a single CAN ID stream.
+    Supports:
+      - Single Frame (SF) with normal and extended length
+      - First Frame (FF) with normal and extended length
+      - Consecutive Frames (CF) with SN checking
+    Ignores Flow Control (FC) frames (handled on the opposite direction).
+    """
+    def __init__(self, max_interframe_gap: float = 1.0):
+        self.max_gap = max_interframe_gap
+        self.reset()
+
+    def reset(self):
+        self.buffer = bytearray()
+        self.expected_len: Optional[int] = None
+        self.next_sn = 1
+        self.active = False
+        self.start_ts: Optional[float] = None
+        self.last_ts: Optional[float] = None
+
+    def process_frame(self, ts: float, data: bytes) -> Optional[Dict]:
+        """
+        Process one CAN frame. On complete message, returns:
+        {'start_ts': float, 'end_ts': float, 'payload': bytes}
+        Otherwise returns None.
+        """
+        if not data:
+            return None
+
+        # Time-gap protection
+        if self.active and self.last_ts is not None and ts - self.last_ts > self.max_gap:
+            self.reset()
+
+        pci_type = (data[0] >> 4) & 0x0F
+
+        # Single Frame (normal or extended length)
+        if pci_type == 0x0:
+            sf_len_nibble = data[0] & 0x0F
+            if sf_len_nibble != 0:
+                length = sf_len_nibble
+                payload = data[1:1 + length]
+            else:
+                # Extended SF length in next byte
+                if len(data) < 2:
+                    return None
+                length = data[1]
+                payload = data[2:2 + length]
+            return {'start_ts': ts, 'end_ts': ts, 'payload': bytes(payload)}
+
+        # First Frame (normal 12-bit or extended 32-bit length)
+        elif pci_type == 0x1:
+            nibble_len = ((data[0] & 0x0F) << 8) | (data[1] if len(data) > 1 else 0)
+            self.buffer = bytearray()
+            if nibble_len != 0:
+                self.expected_len = nibble_len
+                self.buffer.extend(data[2:])
+            else:
+                # Extended length: next 4 bytes contain length
+                if len(data) < 6:
+                    self.reset()
+                    return None
+                self.expected_len = int.from_bytes(data[2:6], 'big')
+                self.buffer.extend(data[6:])
+            self.next_sn = 1
+            self.active = True
+            self.start_ts = ts
+            self.last_ts = ts
+            return None
+
+        # Consecutive Frame
+        elif pci_type == 0x2:
+            if not self.active or self.expected_len is None:
+                self.reset()
+                return None
+
+            sn = data[0] & 0x0F
+            if sn != self.next_sn:
+                # Sequence error
+                self.reset()
+                return None
+
+            self.buffer.extend(data[1:])
+            self.next_sn = (self.next_sn + 1) % 16
+            self.last_ts = ts
+
+            if len(self.buffer) >= self.expected_len:
+                payload = bytes(self.buffer[:self.expected_len])
+                msg = {
+                    'start_ts': self.start_ts if self.start_ts is not None else ts,
+                    'end_ts': ts,
+                    'payload': payload
+                }
+                self.reset()
+                return msg
+            return None
+
+        # Flow Control (ignored on this stream)
+        elif pci_type == 0x3:
+            return None
+
+        # Unknown PCI
+        else:
+            self.reset()
+            return None
+
+def load_frames_from_csv(input_csv: str, tx_id: int, rx_id: int) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Load frames, filter by CAN ID, and return sorted lists for TX and RX.
+    CSV must have columns: time, id, data (others ignored).
+    """
+    tx_frames: List[Dict] = []
+    rx_frames: List[Dict] = []
+    with open(input_csv, 'r', newline='') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            can_id = idstr_to_int(row['id'])
-            data_bytes = bytes.fromhex(row['data'].replace(' ', ''))
-            ts = float(row['time'])
+            # Parse CAN ID from row['id'] which may look like '18DAF110x'
+            id_field = row.get('id') if 'id' in row else row.get('ID')
+            if id_field is None:
+                continue
+            try:
+                can_id = idstr_to_int(str(id_field))
+            except Exception:
+                continue
+
+            # Parse data
+            data_field = row.get('data') if 'data' in row else row.get('DATA')
+            data_str = (data_field or '').replace(' ', '')
+            if not data_str:
+                continue
+            try:
+                data_bytes = bytes.fromhex(data_str)
+            except ValueError:
+                filtered = ''.join(ch for ch in data_str if ch in '0123456789abcdefABCDEF')
+                if not filtered:
+                    continue
+                try:
+                    data_bytes = bytes.fromhex(filtered)
+                except Exception:
+                    continue
+
+            # Parse timestamp
+            ts_field = row.get('time') if 'time' in row else row.get('TIME')
+            ts_str = str(ts_field or '').strip()
+            try:
+                ts = float(ts_str)
+            except Exception:
+                ts = 0.0
+
             frame = {'timestamp': ts, 'can_id': can_id, 'data': data_bytes}
+
             if can_id == tx_id:
                 tx_frames.append(frame)
             elif can_id == rx_id:
                 rx_frames.append(frame)
-    return tx_frames, rx_frames
 
-# The rest of the script is as previously provided, using these tx_frames and rx_frames
-
-# ... (reassembly and output code as in previous messages)
-
-def reassemble_isotp(frames):
-    """
-    Takes frames sorted by timestamp, reassembles ISO-TP payloads.
-    Returns list of decoded payloads (bytes).
-    """
-    messages = []
-    buffer = b''
-    expected_length = None
-    next_sn = 1
-
-    for frame in frames:
-        data = frame['data']
-        pci = data[0] >> 4
-        if pci == 0:  # Single Frame
-            length = data[0] & 0x0F
-            messages.append(data[1:1+length])
-            buffer = b''
-            expected_length = None
-            next_sn = 1
-        elif pci == 1:  # First Frame
-            expected_length = ((data[0] & 0x0F) << 8) + data[1]
-            buffer = data[2:]
-            next_sn = 1
-        elif pci == 2:  # Consecutive Frame
-            sn = data[0] & 0x0F
-            if sn == next_sn and expected_length is not None:
-                buffer += data[1:]
-                next_sn = (next_sn + 1) % 16
-                if len(buffer) >= expected_length:
-                    messages.append(buffer[:expected_length])
-                    buffer = b''
-                    expected_length = None
-                    next_sn = 1
-            else:
-                # Out-of-order or missing frame, reset
-                buffer = b''
-                expected_length = None
-                next_sn = 1
-    return messages
-
-def decode_uds_payload(payload):
-    try:
-        req = Request.from_bytes(payload)
-        return req.service.__class__.__name__ + " " + ' '.join(f'{b:02X}' for b in req.data)
-    except Exception:
-        return payload.hex()
-
-def main():
-    tx_frames, rx_frames = load_frames(INPUT_FILE, TX_ID, RX_ID)
     tx_frames.sort(key=lambda x: x['timestamp'])
     rx_frames.sort(key=lambda x: x['timestamp'])
+    return tx_frames, rx_frames
 
-    tx_payloads = reassemble_isotp(tx_frames)
-    rx_payloads = reassemble_isotp(rx_frames)
+def reassemble_stream(frames: List[Dict], max_interframe_gap: float = 1.0) -> List[Dict]:
+    """
+    Reassemble ISO-TP messages for a single ID stream.
+    Returns list of {'start_ts', 'end_ts', 'payload'} in chronological order.
+    """
+    r = IsoTpReassembler(max_interframe_gap=max_interframe_gap)
+    messages: List[Dict] = []
+    for fr in frames:
+        msg = r.process_frame(fr['timestamp'], fr['data'])
+        if msg is not None:
+            messages.append(msg)
+    return messages
 
-    # Pair by order
-    max_len = max(len(tx_payloads), len(rx_payloads))
-    requests = [decode_uds_payload(p) for p in tx_payloads]
-    responses = [decode_uds_payload(p) for p in rx_payloads]
+def pair_by_time(requests: List[Dict], responses: List[Dict]) -> List[Dict]:
+    """
+    Pair each request with the next response starting at or after the request end time.
+    Keeps unmatched responses and requests as rows with the other side empty.
+    """
+    pairs: List[Dict] = []
+    i, j = 0, 0
+    n_req, n_resp = len(requests), len(responses)
 
-    # Pad if mismatch
-    while len(requests) < max_len:
-        requests.append('')
-    while len(responses) < max_len:
-        responses.append('')
+    # Emit leading responses that occur before any request ends
+    while j < n_resp and (n_req == 0 or responses[j]['start_ts'] < requests[0]['end_ts']):
+        pairs.append({
+            'req_start': None, 'req_end': None, 'req_payload': None,
+            'resp_start': responses[j]['start_ts'], 'resp_end': responses[j]['end_ts'], 'resp_payload': responses[j]['payload']
+        })
+        j += 1
 
-    df = pd.DataFrame({'request': requests, 'response': responses})
-    df.to_csv(OUTPUT_FILE, index=False)
-    print(f"Done. Output in {OUTPUT_FILE}")
+    while i < n_req:
+        matched_resp = None
+        while j < n_resp:
+            if responses[j]['start_ts'] >= requests[i]['end_ts']:
+                matched_resp = responses[j]
+                j += 1
+                break
+            else:
+                pairs.append({
+                    'req_start': None, 'req_end': None, 'req_payload': None,
+                    'resp_start': responses[j]['start_ts'], 'resp_end': responses[j]['end_ts'], 'resp_payload': responses[j]['payload']
+                })
+                j += 1
+
+        if matched_resp is not None:
+            pairs.append({
+                'req_start': requests[i]['start_ts'], 'req_end': requests[i]['end_ts'], 'req_payload': requests[i]['payload'],
+                'resp_start': matched_resp['start_ts'], 'resp_end': matched_resp['end_ts'], 'resp_payload': matched_resp['payload']
+            })
+        else:
+            pairs.append({
+                'req_start': requests[i]['start_ts'], 'req_end': requests[i]['end_ts'], 'req_payload': requests[i]['payload'],
+                'resp_start': None, 'resp_end': None, 'resp_payload': None
+            })
+        i += 1
+
+    while j < n_resp:
+        pairs.append({
+            'req_start': None, 'req_end': None, 'req_payload': None,
+            'resp_start': responses[j]['start_ts'], 'resp_end': responses[j]['end_ts'], 'resp_payload': responses[j]['payload']
+        })
+        j += 1
+
+    return pairs
+
+def import_udsoncan():
+    try:
+        import udsoncan  # noqa: F401
+        from udsoncan import services
+        return services
+    except Exception as e:
+        raise SystemExit("udsoncan is required. Install with: pip install udsoncan") from e
+
+def build_service_map(services_module):
+    """
+    Build SID -> service class name map from udsoncan.services.
+    """
+    sid_to_name = {}
+    for name in dir(services_module):
+        obj = getattr(services_module, name)
+        if hasattr(obj, 'service_id'):
+            try:
+                sid = int(getattr(obj, 'service_id'))
+                sid_to_name[sid] = name
+            except Exception:
+                continue
+    return sid_to_name
+
+def decode_request_service(payload: Optional[bytes], sid_map: Dict[int, str]) -> Tuple[str, str]:
+    if not payload or len(payload) == 0:
+        return '', ''
+    sid = payload[0]
+    return f'0x{sid:02X}', sid_map.get(sid, '')
+
+def decode_response_service(payload: Optional[bytes], sid_map: Dict[int, str]) -> Tuple[str, str, str]:
+    """
+    Returns (resp_sid_hex, service_label, nrc_hex)
+    - Positive response: resp_sid = SID+0x40; label 'PositiveResponse to <Service>'
+    - Negative response: b0==0x7F; nrc in byte 2; label 'NegativeResponse to <Service>'
+    - Unknown: label empty
+    """
+    if not payload or len(payload) == 0:
+        return '', '', ''
+    b0 = payload[0]
+    # Negative response
+    if b0 == 0x7F and len(payload) >= 3:
+        orig_sid = payload[1]
+        nrc = payload[2]
+        name = sid_map.get(orig_sid, None)
+        label = f'NegativeResponse to {name}' if name else 'NegativeResponse'
+        return f'0x{b0:02X}', label, f'0x{nrc:02X}'
+    # Positive response
+    if b0 >= 0x40:
+        orig_sid = b0 - 0x40
+        name = sid_map.get(orig_sid, None)
+        label = f'PositiveResponse to {name}' if name else 'PositiveResponse'
+        return f'0x{b0:02X}', label, ''
+    # Otherwise unknown
+    return f'0x{b0:02X}', '', ''
+
+def main():
+    parser = argparse.ArgumentParser(description='Use udsoncan to process UDS-on-CAN (ISO-TP) from CSV and export to Excel.')
+    parser.add_argument('--input', required=True, help='Path to input CSV trace file')
+    parser.add_argument('--tx-id', required=True, help="TX CAN ID string as in CSV, e.g. '18DAF110x'")
+    parser.add_argument('--rx-id', required=True, help="RX CAN ID string as in CSV, e.g. '18DAF011x'")
+    parser.add_argument('--out', default='diagnostic_pairs.xlsx', help='Output Excel file path (.xlsx)')
+    parser.add_argument('--gap', type=float, default=1.0, help='Max inter-frame gap (seconds) for reassembly')
+    args = parser.parse_args()
+
+    # Ensure udsoncan is present and build SID map
+    services_module = import_udsoncan()
+    sid_map = build_service_map(services_module)
+
+    tx_id = idstr_to_int(args.tx_id)
+    rx_id = idstr_to_int(args.rx_id)
+
+    # Load and reassemble
+    tx_frames, rx_frames = load_frames_from_csv(args.input, tx_id, rx_id)
+    tx_msgs = reassemble_stream(tx_frames, max_interframe_gap=args.gap)
+    rx_msgs = reassemble_stream(rx_frames, max_interframe_gap=args.gap)
+
+    # Pair by time
+    pairs = pair_by_time(tx_msgs, rx_msgs)
+
+    # Prepare rows
+    rows = []
+    for p in pairs:
+        req_hex = bytes_to_hex_spaced_upper(p['req_payload'])
+        resp_hex = bytes_to_hex_spaced_upper(p['resp_payload'])
+
+        latency_ms = None
+        if p['req_end'] is not None and p['resp_start'] is not None:
+            latency_ms = max(0.0, (p['resp_start'] - p['req_end']) * 1000.0)
+
+        req_sid_hex, req_service = decode_request_service(p['req_payload'], sid_map)
+        resp_sid_hex, resp_service, resp_nrc_hex = decode_response_service(p['resp_payload'], sid_map)
+
+        rows.append({
+            'request': req_hex,
+            'response': resp_hex,
+            'req_sid': req_sid_hex,
+            'req_service': req_service,
+            'resp_sid': resp_sid_hex,
+            'resp_service': resp_service,
+            'resp_nrc': resp_nrc_hex,
+            'req_start': p['req_start'],
+            'req_end': p['req_end'],
+            'resp_start': p['resp_start'],
+            'resp_end': p['resp_end'],
+            'latency_ms': latency_ms
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Column order
+    cols = [
+        'request', 'response',
+        'req_sid', 'req_service', 'resp_sid', 'resp_service', 'resp_nrc',
+        'req_start', 'req_end', 'resp_start', 'resp_end', 'latency_ms'
+    ]
+    cols = [c for c in cols if c in df.columns]
+
+    with pd.ExcelWriter(args.out, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, columns=cols, sheet_name='UDS_Pairs')
+
+    print(f'Wrote {len(rows)} rows to {args.out}')
 
 if __name__ == '__main__':
     main()
