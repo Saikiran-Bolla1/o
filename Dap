@@ -1,0 +1,134 @@
+class CanapeAutomation:
+    # ... keep your existing code ...
+
+    def add_xcp_on_dap_ecu(
+        self,
+        name: str,
+        a2l_path: str,
+        channel: int = 1,
+        *,
+        transport: str = "VX1000",
+        serial: str = "",
+        dap_port: int = 1,
+        mcu: str = "AURIX",
+        jtag_clock_hz: int = 10_000_000,
+    ) -> CanapeDevice:
+        """
+        Adds an ECU configured for XCP on DAP (Vector VX1000).
+        After adding, you can go_online_all() and use recorder(...) with ECU signals.
+
+        name: ECU device name in CANape
+        a2l_path: path to A2L
+        channel: driver channel (commonly 1)
+        transport: transport name; typically 'VX1000'
+        serial: optional VX1000 serial (string)
+        dap_port: DAP port index (1..n)
+        mcu: target MCU family (e.g., 'AURIX', 'TriCore')
+        jtag_clock_hz: JTAG/DAP clock
+        """
+        dev_com = self.app.Devices.Add(name, a2l_path, "XCP", channel)
+        dev = CanapeDevice(self.app, dev_com, name)
+        self.devices[name] = dev
+
+        # Ensure protocol is XCP
+        try:
+            dev.dev.Protocol = "XCP"
+        except Exception:
+            pass
+
+        # Access XCP object
+        xcp = getattr(dev.dev, "XCP", None)
+        if xcp is None:
+            # Some versions expose it differently
+            xcp = getattr(dev.dev, "ProtocolObject", None)
+
+        if xcp is not None:
+            # Set transport to VX1000 (DAP)
+            ok = False
+            for prop in ("Transport", "Driver"):
+                try:
+                    setattr(xcp, prop, transport)
+                    ok = True
+                    break
+                except Exception:
+                    continue
+
+            # Try strong-typed VX1000 sub-object first
+            vx = getattr(xcp, "VX1000", None)
+            if vx is not None:
+                try:
+                    if transport:
+                        try:
+                            vx.Device = transport  # sometimes accepts 'VX1000'
+                        except Exception:
+                            pass
+                    if serial:
+                        vx.SerialNumber = serial
+                    vx.DapPort = dap_port
+                    vx.MCU = mcu
+                    vx.JtagClockHz = int(jtag_clock_hz)
+                except Exception:
+                    pass
+            else:
+                # Fallback: parameter bag
+                params = getattr(xcp, "Parameters", None)
+                if params is not None:
+                    def set_param(key, value):
+                        try:
+                            params.Item(key).Value = value
+                        except Exception:
+                            pass
+                    set_param("Transport", transport)
+                    if serial:
+                        set_param("SerialNumber", serial)
+                    set_param("DAPPort", dap_port)
+                    set_param("MCU", mcu)
+                    set_param("JtagClockHz", int(jtag_clock_hz))
+        else:
+            # As a last resort, try generic parameters on the device
+            params = getattr(dev.dev, "Parameters", None)
+            if params is not None:
+                try:
+                    params.Item("Protocol").Value = "XCP"
+                except Exception:
+                    pass
+
+        return dev
+
+
+
+import time
+from canape_additions_xcp_on_dap import CanapeAutomation  # or from your module if integrated
+
+proj = r"C:\Path\To\Your\CANapeProject.cfg"
+a2l  = r"C:\Path\To\Ecu.a2l"
+
+sess = CanapeAutomation(proj)
+
+# Add the ECU via XCP on DAP (VX1000)
+ecu = sess.add_xcp_on_dap_ecu(
+    name="ECU",
+    a2l_path=a2l,
+    channel=1,
+    transport="VX1000",
+    serial="",            # put your VX1000 serial if you need to target a specific device
+    dap_port=1,
+    mcu="AURIX",
+    jtag_clock_hz=10_000_000
+)
+
+# Go online and record a variable
+sess.go_online_all()
+
+with sess.recorder(
+    "ECU:EngSpd",                   # ECU/XCP variable from A2L
+    mdf_path=r"C:\logs\run1.mf4",
+    task="10ms", sampling_time=10
+) as rec:
+    time.sleep(3.0)
+
+# Access data after finalize()
+V = rec["ECU:EngSpd"]
+print("First points:", list(zip(V.x[:5], V.y[:5])))
+
+sess.close()
