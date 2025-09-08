@@ -1,57 +1,72 @@
 """
-CANape Automation Helper (Patched Full File)
+CANape Automation Helper (Full Patched Version WITH SyncMode Support)
 
-Main goals of this patched version:
-1. Robust recorder creation (with retries, optional clearing of existing recorders, fallback modes).
-2. Precise channel-to-recorder assignment & safe cleanup (configurable).
-3. Multi-attempt GoOnline logic (before config and/or start).
-4. Time-base handling:
-   - Optional CANape measurement relative time reset before start.
-   - Optional rebasing (global or per-signal) after reading the MF4 to mitigate offsets (e.g. Vector driver signals recorded "at the end").
-5. Integrity & diagnostics:
-   - Verification that requested signals appear and have samples (optional fail).
-   - Debug logging paths for channel assignment, recorder operations, timing, and missing data.
-6. File freshness:
-   - Guarantee a brand-new MF4 (optionally delete if exists).
-7. Flexible cleanup:
-   - remove_added_channels (default True) controls whether channels you added are removed.
-   - clear_all_tasks_after (default False) controls whether *all* channels of involved tasks are cleared after recording.
-8. Retry & fallback strategy for device online state and recorder creation.
-9. Optional selective time rebasing (vector-only or all signals).
-10. Minimal direct dependencies (asammdf, pywin32, numpy).
+This consolidated file merges all previously discussed robustness features PLUS an
+optional SyncMode switch. It is designed to address:
 
-Install requirements:
-  pip install pywin32 asammdf numpy
+1. Repeated / continuing timestamps (channels starting at large offsets):
+   - Fresh recorder & file strategies
+   - Force-fresh measurement mode
+   - Optional aggressive channel/task clearing before and/or after a run
+   - Relative time reset attempts (ResetRelativeTime / ResetTime)
+   - Prevention (where possible) of recorder append / absolute time settings
+   - Selecting only the last DataGroup (if unavoidable append persists)
+   - Optional post-load time rebasing (global or per-signal)
 
-Typical usage:
+2. Channel hygiene:
+   - Baseline snapshot of existing task channels; upon finalize removes ONLY those
+     added during the recorder context (even if internal names differ slightly)
+   - Optional full clearing of tasks after finalize
+   - Configurable removal of added channels (remove_added_channels)
 
-    sess = CanapeAutomation(r"C:\\Path\\To\\Project")
-    sess.add_device("ECU", r"C:\\path\\ecu.a2l", "XCP", 1)
-    sess.add_device("CAN1", r"C:\\path\\bus.dbc", "CAN", 1)
+3. Verification & diagnostics:
+   - Integrity checks (missing or zero-sample signals) with fail_if_missing
+   - Debug mode prints channel assignment, recorder creation, baseline cleanup
+   - dump_signals() helper
 
-    with sess.recorder(
-        "ECU:EngSpd", "ECU:PedalPos",
-        can_signals=["CAN1:Msg1.Signal1"],
-        mdf_path=r"C:\\logs\\test1.mf4",
-        retry_recorder_attempts=5,
-        go_online_retries=5,
+4. Reliability:
+   - Multi-attempt GoOnline logic (before configure & before start)
+   - Recorder creation retries + fallback to legacy Measurement.MDFFilename (optional)
+   - Controlled start/stop with measurement stop wait & file size stabilization
+
+5. Convenience:
+   - Batch read / write with retry + verify
+   - Poll simple variable time series without recording
+   - Time rebasing (global / per-signal / vector-only)
+   - Select last DataGroup only (select_last_datagroup_only)
+   - SyncMode toggle (Measurement.SyncMode) before start if required
+
+KEY PARAMETERS (recorder()):
+    force_fresh_measurement:    Stop any active measurement, clear recorders,
+                                (optionally) clear channels before configuring.
+    clear_recorders_before:     Clear Recorders collection before creating a new one.
+    clear_all_devices_before:   When force_fresh_measurement=True, also clear tasks
+                                for ALL known devices (not just involved).
+    ensure_new_file:            Delete file if it exists before starting.
+    reset_relative_time_before_start:
+                                Attempt ResetRelativeTime() / ResetTime() before Start.
+    sync_mode:                  None (leave), True (enable), False (disable) BEFORE Start.
+    rebase_time:                None | "global" | "per_signal"
+    rebase_only_vector:         If True and rebase_time set, only rebase vector_signals.
+    select_last_datagroup_only: After loading MDF, keep only last DataGroup.
+    fail_if_missing:            Raise RuntimeError if any requested signals missing or empty.
+    remove_added_channels:      Remove channels added during this context at finalize.
+    clear_all_tasks_after:      Clear ALL channels from tasks of involved devices at finalize.
+
+SUGGESTED SETTINGS TO PREVENT CONTINUING TIMESTAMPS:
+    with sess.recorder(...,
+        force_fresh_measurement=True,
         clear_recorders_before=True,
+        ensure_new_file=True,
         reset_relative_time_before_start=True,
-        rebase_time="global",       # or "per_signal" or None
-        fail_if_missing=True,
-        debug=True
-    ) as rec:
-        time.sleep(5)
+        sync_mode=True,                 # optional (alignment)
+        select_last_datagroup_only=True,# if old DataGroups persist
+        rebase_time="global",           # optional if still offset
+        debug=True) as rec:
 
-    print(rec["ECU:EngSpd"].y[:10])
+DEPENDENCIES:
+    pip install pywin32 asammdf numpy
 
-If Vector signals show a large offset, ensure:
-- clear_recorders_before=True
-- ensure_new_file=True
-- reset_relative_time_before_start=True
-- (Optionally) rebase_time="global" for post normalization.
-
-Author: Patched automation composite.
 """
 
 import os
@@ -61,10 +76,14 @@ import win32com.client
 import numpy as np
 from datetime import datetime
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union, Iterable, Tuple, Set
+from typing import (
+    Dict, List, Optional, Union, Iterable, Tuple, Any, Set
+)
 from asammdf import MDF, Signal
 
-# ---------------------------- Utility helpers ---------------------------- #
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
 def _dispatch_canape():
     return win32com.client.Dispatch("CANape.Application")
@@ -74,9 +93,9 @@ def _ensure_dir(path: str):
     if p and not os.path.exists(p):
         os.makedirs(p, exist_ok=True)
 
-def _wait_stable(path: str, timeout=30.0, poll=0.3, stability_cycles=3):
+def _wait_stable(path: str, timeout=40.0, poll=0.4, stability_cycles=3):
     """
-    Wait until file size stops changing for stability_cycles consecutive polls or timeout.
+    Wait until file size is stable for stability_cycles consecutive polls or timeout.
     """
     end = time.time() + timeout
     last = -1
@@ -95,9 +114,6 @@ def _wait_stable(path: str, timeout=30.0, poll=0.3, stability_cycles=3):
     return os.path.exists(path)
 
 def _wait_measurement_stopped(app, timeout=12.0, poll=0.25):
-    """
-    Poll CANape Measurement.State until it indicates stopped (heuristically 0) or timeout.
-    """
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -134,13 +150,16 @@ def _maybe_text_to_numeric(samples, signal: Signal):
     if conv:
         for attr in ("text_2_value","text2value","text_to_value","value_map","val_map","mapping"):
             mapping = getattr(conv, attr, None)
-            if mapping: break
+            if mapping:
+                break
         if mapping is None:
             txts = getattr(conv, "texts", None) or getattr(conv, "labels", None)
             vals = getattr(conv, "values", None) or getattr(conv, "ids", None)
             if txts is not None and vals is not None:
-                try: mapping = {t:v for t,v in zip(txts, vals)}
-                except: mapping = None
+                try:
+                    mapping = {t: v for t, v in zip(txts, vals)}
+                except:
+                    mapping = None
     if mapping:
         out = []
         for s in samples:
@@ -149,7 +168,8 @@ def _maybe_text_to_numeric(samples, signal: Signal):
             if isinstance(s, (bytes, bytearray)):
                 try: s2 = s.decode(errors="ignore")
                 except: s2 = ""
-            else: s2 = str(s)
+            else:
+                s2 = str(s)
             v = mapping.get(s2)
             out.append(_to_float(v if v is not None else s))
         return np.array(out, dtype=float)
@@ -163,7 +183,9 @@ def _get_signal(mdf: MDF, name: str, prefer_raw: bool):
         try: return mdf.get(name)
         except: return mdf.get(name, raw=True)
 
-# ---------------------------- Data abstractions ---------------------------- #
+# ---------------------------------------------------------------------------
+# Data abstractions
+# ---------------------------------------------------------------------------
 
 class CanapeVariable:
     def __init__(self, app, dev_com, device: str, var: str):
@@ -196,7 +218,8 @@ class CanapeVariable:
         obj.Value = v
         obj.Write()
 
-    def __repr__(self): return f"<CanapeVariable {self.longname}>"
+    def __repr__(self):
+        return f"<CanapeVariable {self.longname}>"
 
 class _TaskSignalRef:
     def __init__(self, device: str, signal: str):
@@ -208,7 +231,7 @@ class _TaskSignalRef:
 class _SignalView:
     def __init__(self, sig: Signal, display: str, force_numeric: bool):
         xs, ys = sig.timestamps, sig.samples
-        if force_numeric and hasattr(ys,"dtype") and ys.dtype.kind in ("O","U","S"):
+        if force_numeric and hasattr(ys, "dtype") and ys.dtype.kind in ("O","U","S"):
             ys = _maybe_text_to_numeric(ys, sig)
         self._x = np.asarray(xs)
         self._y = np.asarray(ys)
@@ -223,11 +246,14 @@ class _SignalView:
     def data(self): return tuple(zip(self._x.astype(float), self._y.astype(float)))
     def __repr__(self): return f"<SignalView {self._name} len={len(self._x)}>"
 
-# ---------------------------- RecorderResult ---------------------------- #
+# ---------------------------------------------------------------------------
+# RecorderResult
+# ---------------------------------------------------------------------------
 
 class RecorderResult:
     def __init__(
-        self, app, cleanup, vars_, vector, can_, path,
+        self, app,
+        cleanup, vars_, vector, can_, path,
         prefer_raw, prefer_enum_numeric,
         devices_involved, device_objs,
         recorder_obj, recorder_name,
@@ -238,7 +264,9 @@ class RecorderResult:
         requested_longnames: List[str],
         fail_if_missing: bool,
         remove_added_channels: bool,
-        clear_all_tasks_after: bool
+        clear_all_tasks_after: bool,
+        baseline_task_channels: Dict[int, Set[str]],
+        select_last_datagroup_only: bool
     ):
         self._app = app
         self._cleanup = cleanup
@@ -266,6 +294,8 @@ class RecorderResult:
         self._fail_if_missing = fail_if_missing
         self._remove_added_channels = remove_added_channels
         self._clear_all_tasks_after = clear_all_tasks_after
+        self._baseline_task_channels = baseline_task_channels
+        self._select_last_datagroup_only = select_last_datagroup_only
 
     def _log(self, msg):
         if self._debug:
@@ -274,9 +304,13 @@ class RecorderResult:
     def _enum_upgrade(self, mdf: MDF, sig: Signal, name: str):
         try:
             ys = sig.samples
-            if self._prefer_enum_numeric and hasattr(ys,"dtype") and ys.dtype.kind in ("O","U","S"):
-                try: return _get_signal(mdf, name, prefer_raw=True)
-                except: return sig
+            if (self._prefer_enum_numeric
+                and hasattr(ys,"dtype")
+                and ys.dtype.kind in ("O","U","S")):
+                try:
+                    return _get_signal(mdf, name, prefer_raw=True)
+                except:
+                    return sig
         except:
             pass
         return sig
@@ -292,100 +326,6 @@ class RecorderResult:
                 return
             except:
                 continue
-
-    def finalize(self):
-        self._log("Stopping measurement.")
-        try: self._app.Measurement.Stop()
-        except: pass
-        _wait_measurement_stopped(self._app)
-
-        # Remove assignment of our recorder (non-legacy path)
-        if not self._legacy_mode and self._recorder is not None:
-            for ch in self._channel_assignments:
-                try:
-                    try:
-                        ch.AssignedRecorders.Remove(self._recorder)
-                    except:
-                        ch.AssignedRecorders.Remove(self._rec_name)
-                except:
-                    if self._exclusive:
-                        try: ch.AssignedRecorders.Clear()
-                        except: pass
-
-        # Remove channels we added (if configured)
-        if self._remove_added_channels:
-            for tsk, ch_name in self._cleanup:
-                try: tsk.Channels.Remove(ch_name)
-                except: pass
-
-        # Remove recorder object (non-legacy)
-        if not self._legacy_mode and self._recorder is not None:
-            self._log("Removing recorder object.")
-            try: self._app.Recorders.Remove(self._rec_name)
-            except:
-                try:
-                    cnt = self._app.Recorders.Count
-                    for i in range(1, cnt+1):
-                        try:
-                            r = self._app.Recorders.Item(i)
-                            if getattr(r, "Name", "") == self._rec_name:
-                                self._app.Recorders.Remove(i)
-                                break
-                        except: pass
-                except: pass
-
-        # Wait for file flush
-        _wait_stable(self.filepath, timeout=40.0, poll=0.4, stability_cycles=4)
-        if self._debug:
-            print(f"[RecorderResult] MF4 size final: {os.path.getsize(self.filepath) if os.path.exists(self.filepath) else 'Missing'}")
-
-        # Load MDF
-        try:
-            self._mdf = MDF(self.filepath)
-        except Exception as e:
-            raise RuntimeError(f"Failed to open MF4 '{self.filepath}': {e}")
-
-        # Build variable views
-        for v in self._vars:
-            self._add_view(self._mdf, v.longname, [v.longname, v.varname])
-
-        # Vector signals
-        for r in self._vec:
-            self._add_view(self._mdf, r.longname, [r.longname, r.signal])
-
-        # CAN signals
-        for r in self._can:
-            self._add_view(self._mdf, r.longname, [r.longname, r.signal])
-
-        # Add any remaining channels (raw access)
-        try:
-            for ch in self._mdf.get_channel_names():
-                if ch not in self._views_by_name:
-                    try:
-                        sig = _get_signal(self._mdf, ch, self._prefer_raw)
-                        sig = self._enum_upgrade(self._mdf, sig, ch)
-                        self._views_by_name[ch] = _SignalView(sig, ch, self._prefer_enum_numeric)
-                    except: pass
-        except:
-            pass
-
-        # Rebase time if requested
-        self._perform_rebase()
-
-        # Integrity checks
-        self._integrity_check()
-
-        # Optional big cleanup of entire tasks
-        if self._clear_all_tasks_after:
-            for name in self._devices_involved:
-                dev = self._device_objs.get(name)
-                if not dev: continue
-                try:
-                    if not dev.IsOnline: dev.GoOnline()
-                    for t in dev.Tasks:
-                        try: t.Channels.Clear()
-                        except: pass
-                except: pass
 
     def _perform_rebase(self):
         if self._rebase_time not in ("global", "per_signal"):
@@ -403,14 +343,14 @@ class RecorderResult:
                 if len(view.x):
                     view._x = view._x - gmin
             if self._debug:
-                print(f"[Rebase] Global rebase subtracting {gmin:.6f}")
-        else:  # per_signal
+                print(f"[Rebase] Global offset subtracted: {gmin:.6f}")
+        else:
             for _, view in targets:
                 if len(view.x):
-                    offset = view._x[0]
-                    view._x = view._x - offset
+                    off = view._x[0]
+                    view._x = view._x - off
             if self._debug:
-                print("[Rebase] Per-signal rebase applied.")
+                print("[Rebase] Per-signal offsets subtracted.")
 
     def _integrity_check(self):
         missing = []
@@ -424,11 +364,176 @@ class RecorderResult:
                     zero_sample.append(name)
         if self._debug:
             if missing:
-                print("[Integrity] Missing:", missing)
+                print("[Integrity] Missing signals:", missing)
             if zero_sample:
-                print("[Integrity] Zero samples:", zero_sample)
+                print("[Integrity] Zero-sample signals:", zero_sample)
         if self._fail_if_missing and (missing or zero_sample):
             raise RuntimeError(f"Recording incomplete. Missing={missing}, ZeroSamples={zero_sample}")
+
+    def finalize(self):
+        self._log("Stopping measurement.")
+        try:
+            self._app.Measurement.Stop()
+        except:
+            pass
+        _wait_measurement_stopped(self._app)
+
+        # Remove recorder assignments
+        if not self._legacy_mode and self._recorder is not None:
+            for ch in self._channel_assignments:
+                try:
+                    try:
+                        ch.AssignedRecorders.Remove(self._recorder)
+                    except:
+                        ch.AssignedRecorders.Remove(self._rec_name)
+                except:
+                    if self._exclusive:
+                        try: ch.AssignedRecorders.Clear()
+                        except: pass
+
+        # Remove explicitly added channels (initial list)
+        if self._remove_added_channels:
+            for tsk, ch_name in self._cleanup:
+                try:
+                    tsk.Channels.Remove(ch_name)
+                except:
+                    pass
+
+        # Remove recorder object
+        if not self._legacy_mode and self._recorder is not None:
+            self._log("Removing recorder object.")
+            try:
+                self._app.Recorders.Remove(self._rec_name)
+            except:
+                try:
+                    cnt = self._app.Recorders.Count
+                    for i in range(1, cnt+1):
+                        try:
+                            r = self._app.Recorders.Item(i)
+                            if getattr(r, "Name", "") == self._rec_name:
+                                self._app.Recorders.Remove(i)
+                                break
+                        except:
+                            pass
+                except:
+                    pass
+
+        # Wait for flush
+        _wait_stable(self.filepath)
+
+        # Load MDF
+        try:
+            self._mdf = MDF(self.filepath)
+        except Exception as e:
+            raise RuntimeError(f"Failed to open MF4 '{self.filepath}': {e}")
+
+        # Optionally select only last DataGroup
+        if self._select_last_datagroup_only and self._mdf is not None:
+            try:
+                if len(self._mdf.groups) > 1:
+                    if self._debug:
+                        print(f"[RecorderResult] Selecting only last DataGroup (had {len(self._mdf.groups)}).")
+                    self._mdf = self._mdf.select([len(self._mdf.groups) - 1])
+            except:
+                pass
+
+        # Build views
+        for v in self._vars:
+            self._add_view(self._mdf, v.longname, [v.longname, v.varname])
+        for r in self._vec:
+            self._add_view(self._mdf, r.longname, [r.longname, r.signal])
+        for r in self._can:
+            self._add_view(self._mdf, r.longname, [r.longname, r.signal])
+
+        # Add any remaining channels
+        try:
+            for ch in self._mdf.get_channel_names():
+                if ch not in self._views_by_name:
+                    try:
+                        sig = _get_signal(self._mdf, ch, self._prefer_raw)
+                        sig = self._enum_upgrade(self._mdf, sig, ch)
+                        self._views_by_name[ch] = _SignalView(sig, ch, self._prefer_enum_numeric)
+                    except:
+                        pass
+        except:
+            pass
+
+        # Time rebase
+        self._perform_rebase()
+
+        # Integrity
+        self._integrity_check()
+
+        # Baseline cleanup (remove leftover channels not originally in task)
+        if self._remove_added_channels:
+            for name in self._devices_involved:
+                dev = self._device_objs.get(name)
+                if not dev:
+                    continue
+                try:
+                    for t in dev.Tasks:
+                        try:
+                            base = self._baseline_task_channels.get(id(t))
+                            if base is None:
+                                continue
+                            current = []
+                            try:
+                                for i in range(1, t.Channels.Count + 1):
+                                    try:
+                                        current.append(t.Channels.Item(i).Name)
+                                    except:
+                                        pass
+                            except:
+                                pass
+                            for ch_name in current:
+                                if ch_name not in base:
+                                    try:
+                                        t.Channels.Remove(ch_name)
+                                        if self._debug:
+                                            print(f"[BaselineCleanup] Removed lingering channel '{ch_name}' from task '{getattr(t,'Name','?')}'")
+                                    except:
+                                        pass
+                        except:
+                            pass
+                except:
+                    pass
+
+        # Optional full task clear
+        if self._clear_all_tasks_after:
+            for name in self._devices_involved:
+                dev = self._device_objs.get(name)
+                if not dev:
+                    continue
+                try:
+                    if not dev.IsOnline:
+                        dev.GoOnline()
+                    for t in dev.Tasks:
+                        try:
+                            t.Channels.Clear()
+                        except:
+                            pass
+                except:
+                    pass
+
+    def __getitem__(self, key: Union[str, CanapeVariable]):
+        if isinstance(key, CanapeVariable):
+            key = key.longname
+        if key in self._views_by_name:
+            return self._views_by_name[key]
+        # Flexible suffix match
+        tail = key.split(":", 1)[-1]
+        matches = [n for n in self._views_by_name
+                   if n.endswith(":"+tail) or n.endswith("."+tail) or n == tail]
+        if len(matches) == 1:
+            return self._views_by_name[matches[0]]
+        raise KeyError(f"No recorded data for '{key}'")
+
+    @property
+    def signals(self):
+        return [n for n in self._order]
+
+    def values(self):
+        return [self._views_by_name[n] for n in self._order if n in self._views_by_name]
 
     def debug_report(self):
         lines = []
@@ -441,28 +546,16 @@ class RecorderResult:
                 lines.append(f"  OK {rn} count={len(sv.x)} first_ts={(sv.x[0] if len(sv.x)>0 else 'NA')}")
         return "\n".join(lines)
 
-    def __getitem__(self, key: Union[str, CanapeVariable]):
-        if isinstance(key, CanapeVariable):
-            key = key.longname
-        if key in self._views_by_name:
-            return self._views_by_name[key]
-        tail = key.split(":",1)[-1]
-        matches = [n for n in self._views_by_name
-                   if n.endswith(":"+tail) or n.endswith("."+tail) or n==tail]
-        if len(matches)==1:
-            return self._views_by_name[matches[0]]
-        raise KeyError(f"No recorded data for '{key}'")
-
-    @property
-    def signals(self): return [n for n in self._order]
-    def values(self): return [self._views_by_name[n] for n in self._order if n in self._views_by_name]
     def close(self):
         try:
-            if self._mdf: self._mdf.close()
+            if self._mdf:
+                self._mdf.close()
         except:
             pass
 
-# ---------------------------- Device & Session ---------------------------- #
+# ---------------------------------------------------------------------------
+# Device & Session
+# ---------------------------------------------------------------------------
 
 class CanapeDevice:
     def __init__(self, app, dev_com, name):
@@ -485,16 +578,26 @@ class CanapeAutomation:
         self.devices: Dict[str, CanapeDevice] = {}
         self._var_cache: Dict[str, CanapeVariable] = {}
 
+    # ---------------- Device Management ----------------
+
     def add_device(self, name: str, definition_path: str, dev_type: str, channel: int):
         dev_com = self.app.Devices.Add(name, definition_path, dev_type, channel)
         dev = CanapeDevice(self.app, dev_com, name)
         self.devices[name] = dev
         return dev
 
-    def go_online_all(self, reconnect: bool=False):
-        for d in self.devices.values():
-            try: d.dev.GoOnline(reconnect)
-            except: pass
+    def __getitem__(self, longname: str) -> CanapeVariable:
+        if ":" not in longname:
+            raise ValueError('Use "Device:Variable" format.')
+        dev, var = longname.split(":", 1)
+        if dev not in self.devices:
+            raise KeyError(f"Device '{dev}' not added.")
+        key = f"{dev}:{var}"
+        if key not in self._var_cache:
+            self._var_cache[key] = CanapeVariable(self.app, self.devices[dev].dev, dev, var)
+        return self._var_cache[key]
+
+    # ---------------- Online Handling ----------------
 
     def _retry_go_online(self, dev_com, retries: int, delay: float, debug: bool):
         for attempt in range(1, retries+1):
@@ -510,7 +613,11 @@ class CanapeAutomation:
             time.sleep(delay)
         return getattr(dev_com, "IsOnline", False)
 
-    def go_online_all_retries(self, retries=3, delay=0.75, assert_online=False, debug=False):
+    def go_online_all_retries(self,
+                              retries: int = 3,
+                              delay: float = 0.75,
+                              assert_online: bool = False,
+                              debug: bool = False):
         results = {}
         for name, dev in self.devices.items():
             ok = self._retry_go_online(dev.dev, retries, delay, debug)
@@ -521,26 +628,164 @@ class CanapeAutomation:
                 raise RuntimeError(f"Device '{name}' could not go online after {retries} attempts.")
         return results
 
-    def __getitem__(self, longname: str) -> CanapeVariable:
-        if ":" not in longname: raise ValueError('Use "Device:Variable" format.')
-        dev, var = longname.split(":",1)
-        if dev not in self.devices: raise KeyError(f"Device '{dev}' not added.")
-        key = f"{dev}:{var}"
-        if key not in self._var_cache:
-            self._var_cache[key] = CanapeVariable(self.app, self.devices[dev].dev, dev, var)
-        return self._var_cache[key]
+    def ensure_online_devices(self, device_names: Iterable[str], retries=3, delay=0.5, debug=False):
+        for name in device_names:
+            dev = self.devices.get(name)
+            if not dev:
+                continue
+            self._retry_go_online(dev.dev, retries, delay, debug)
+
+    # ---------------- Batch Read/Write/Poll (Convenience) ----------------
+
+    def _retry_call(self, func, retries, delay, online_func=None, debug=False, desc="operation"):
+        last_exc = None
+        for attempt in range(1, retries+1):
+            try:
+                return func()
+            except Exception as e:
+                last_exc = e
+                if debug:
+                    print(f"[Retry] {desc} attempt {attempt} failed: {e}")
+                if online_func:
+                    try: online_func()
+                    except: pass
+                time.sleep(delay)
+        raise last_exc or RuntimeError(f"{desc} failed")
+
+    def read(self,
+             *longnames: str,
+             retries: int = 3,
+             delay: float = 0.2,
+             online_retries: int = 2,
+             verify: bool = False,
+             debug: bool = False) -> Dict[str, Any]:
+        if not longnames:
+            raise ValueError("Provide at least one Device:Var name to read.")
+        devs = set(n.split(":", 1)[0] for n in longnames if ":" in n)
+        self.ensure_online_devices(devs, retries=online_retries, delay=delay, debug=debug)
+
+        result = {}
+        for ln in longnames:
+            var = self[ln]
+            def _do_read():
+                var._dev.CalibrationObjects.Add(var.varname)
+                obj = var._dev.CalibrationObjects.Item(var.varname)
+                obj.Read()
+                return obj.Value
+            val = self._retry_call(
+                _do_read,
+                retries=retries,
+                delay=delay,
+                online_func=lambda v=var: v._dev.GoOnline(),
+                debug=debug,
+                desc=f"read {ln}"
+            )
+            result[ln] = val
+
+        if verify:
+            time.sleep(delay)
+            for ln in longnames:
+                v2 = self.read(ln, retries=1, delay=delay, online_retries=0, verify=False)
+                result[ln] = v2[ln]
+        return result
+
+    def write(self,
+              mapping: Dict[str, Any],
+              retries: int = 3,
+              delay: float = 0.2,
+              online_retries: int = 2,
+              verify: bool = True,
+              tolerance: float = 1e-6,
+              debug: bool = False) -> Dict[str, bool]:
+        if not mapping:
+            return {}
+        devs = set(n.split(":", 1)[0] for n in mapping if ":" in n)
+        self.ensure_online_devices(devs, retries=online_retries, delay=delay, debug=debug)
+
+        def _set(var_obj: CanapeVariable, value):
+            var_obj._dev.CalibrationObjects.Add(var_obj.varname)
+            obj = var_obj._dev.CalibrationObjects.Item(var_obj.varname)
+            obj.Value = value
+            obj.Write()
+
+        status: Dict[str, bool] = {}
+        for ln, val in mapping.items():
+            var = self[ln]
+            self._retry_call(
+                lambda v=var, val_=val: _set(v, val_),
+                retries=retries,
+                delay=delay,
+                online_func=lambda v=var: v._dev.GoOnline(),
+                debug=debug,
+                desc=f"write {ln}"
+            )
+            status[ln] = True
+
+        if verify:
+            time.sleep(delay)
+            readback = self.read(*mapping.keys(), retries=2, delay=delay, online_retries=0, verify=False, debug=debug)
+            for ln, tgt in mapping.items():
+                rb = readback.get(ln, None)
+                ok = True
+                try:
+                    if isinstance(tgt, (int, float)) and isinstance(rb, (int, float)):
+                        ok = abs(float(tgt) - float(rb)) <= tolerance
+                    else:
+                        ok = (rb == tgt)
+                except:
+                    ok = False
+                status[ln] = ok
+                if debug and not ok:
+                    print(f"[Verify] {ln} target={tgt} readback={rb}")
+        return status
+
+    def poll(self,
+             longnames: List[str],
+             period: float,
+             duration: float,
+             retries: int = 2,
+             online_retries: int = 2,
+             debug: bool = False) -> Dict[str, List[Tuple[float, Any]]]:
+        if not longnames:
+            raise ValueError("Provide variable names to poll.")
+        start = time.time()
+        data = {ln: [] for ln in longnames}
+        self.ensure_online_devices({ln.split(':',1)[0] for ln in longnames},
+                                   retries=online_retries,
+                                   delay=period/2 if period > 0 else 0.1,
+                                   debug=debug)
+        next_t = start
+        while True:
+            now = time.time()
+            if now >= start + duration:
+                break
+            if now >= next_t:
+                snapshot = self.read(*longnames, retries=retries,
+                                     delay=period/4 if period>0 else 0.05,
+                                     online_retries=0, verify=False, debug=debug)
+                ts = time.time() - start
+                for ln, val in snapshot.items():
+                    data[ln].append((ts, val))
+                next_t += period if period > 0 else 0.0
+            time.sleep(min(0.01, period/10) if period else 0.01)
+        return data
+
+    # ---------------- Recorder creation helpers ----------------
 
     def _normalize_refs(self, items: Optional[Iterable[Union[str, CanapeVariable]]], kind: str) -> List[_TaskSignalRef]:
         out = []
-        if not items: return out
+        if not items:
+            return out
         for it in items:
-            if it is None: continue
+            if it is None:
+                continue
             if isinstance(it, CanapeVariable):
                 out.append(_TaskSignalRef(it.device_name, it.varname))
             elif isinstance(it, str):
-                if ":" not in it: raise ValueError(f"Invalid {kind} signal '{it}' (expected 'Device:Signal')")
-                d,s = it.split(":",1)
-                out.append(_TaskSignalRef(d,s))
+                if ":" not in it:
+                    raise ValueError(f"Invalid {kind} signal '{it}' (expected 'Device:Signal')")
+                d, s = it.split(":", 1)
+                out.append(_TaskSignalRef(d, s))
             else:
                 raise TypeError(f"{kind}_signals entries must be str or CanapeVariable")
         return out
@@ -552,7 +797,8 @@ class CanapeAutomation:
                          fallback_measurement: bool,
                          debug: bool):
         def log(msg):
-            if debug: print(f"[RecorderCreate] {msg}")
+            if debug:
+                print(f"[RecorderCreate] {msg}")
         recorder_name = None
         recorder_obj = None
         legacy_mode = False
@@ -594,20 +840,26 @@ class CanapeAutomation:
 
     @staticmethod
     def _safe_set_sampling(tsk, sampling_value, debug=False):
-        if sampling_value is None: return
+        if sampling_value is None:
+            return
         try:
             before = None
-            try: before = tsk.SamplingTime
-            except: pass
+            try:
+                before = tsk.SamplingTime
+            except:
+                pass
             tsk.SamplingTime = int(sampling_value)
             try:
                 after = tsk.SamplingTime
                 if debug and before != after:
                     print(f"[Sampling] Task '{getattr(tsk,'Name','?')}' {before} -> {after}")
-            except: pass
+            except:
+                pass
         except:
             if debug:
                 print(f"[Sampling] Task '{getattr(tsk,'Name','?')}' cannot set SamplingTime; ignored.")
+
+    # ---------------- Recorder Context ----------------
 
     @contextmanager
     def recorder(
@@ -632,23 +884,30 @@ class CanapeAutomation:
         go_online_retry_delay: float = 0.75,
         re_online_on_start: bool = True,
         re_online_before_config: bool = True,
+        # Advanced timing & cleanup controls:
         rebase_time: Optional[str] = None,
         rebase_only_vector: bool = False,
         fail_if_missing: bool = False,
         ensure_new_file: bool = True,
         clear_recorders_before: bool = False,
+        force_fresh_measurement: bool = False,
+        clear_all_devices_before: bool = False,
         reset_relative_time_before_start: bool = False,
         sleep_after_recorder_create_ms: int = 0,
         remove_added_channels: bool = True,
-        clear_all_tasks_after: bool = False
+        clear_all_tasks_after: bool = False,
+        select_last_datagroup_only: bool = False,
+        sync_mode: Optional[bool] = None,  # None=leave, True/False=set before start
     ):
         def log(msg):
-            if debug: print(f"[RecorderCtx] {msg}")
+            if debug:
+                print(f"[RecorderCtx] {msg}")
 
-        # Normalize ECU signals
+        # --- Parse ECU variable signals first (needed early if force_fresh_measurement + targeted clearing) ---
         ecu_vars: List[CanapeVariable] = []
         for s in signals:
-            if s is None: continue
+            if s is None:
+                continue
             if isinstance(s, CanapeVariable):
                 ecu_vars.append(s)
             elif isinstance(s, str):
@@ -668,27 +927,70 @@ class CanapeAutomation:
             [r.device for r in can_refs]
         ))
 
-        # Optional pre-config re-online
+        # --- Force fresh measurement (stop + clear recorders + optional clearing of tasks) ---
+        if force_fresh_measurement:
+            log("Force fresh measurement state engaged.")
+            try:
+                if self.app.Measurement.State != 0:
+                    self.app.Measurement.Stop()
+                    _wait_measurement_stopped(self.app)
+            except:
+                pass
+            try:
+                self.app.Recorders.Clear()
+                if debug:
+                    print("[RecorderCtx] Recorders cleared (force_fresh_measurement).")
+            except:
+                pass
+            if clear_all_devices_before:
+                for dev_name, dev in self.devices.items():
+                    try:
+                        for t in dev.dev.Tasks:
+                            try: t.Channels.Clear()
+                            except: pass
+                    except:
+                        pass
+            else:
+                for dev_name in involved_devices:
+                    dev = self.devices.get(dev_name)
+                    if not dev:
+                        continue
+                    try:
+                        for t in dev.dev.Tasks:
+                            try: t.Channels.Clear()
+                            except: pass
+                    except:
+                        pass
+            time.sleep(0.15)
+
+        # --- Pre-config go-online attempts ---
         if re_online_before_config:
             for name in involved_devices:
                 dev = self.devices[name].dev
                 self._retry_go_online(dev, go_online_retries, go_online_retry_delay, debug)
 
+        # --- File path prep ---
         if mdf_path is None:
             mdf_path = os.path.abspath(f"canape_recording_{datetime.now():%Y%m%d_%H%M%S}.mf4")
         if ensure_new_file and os.path.exists(mdf_path):
-            try: os.remove(mdf_path)
-            except: pass
+            try:
+                os.remove(mdf_path)
+                if debug:
+                    print(f"[RecorderCtx] Removed pre-existing file: {mdf_path}")
+            except:
+                pass
         _ensure_dir(mdf_path)
 
-        # Optionally clear existing recorders to avoid time continuity
-        if clear_recorders_before:
+        # --- Optionally clear recorders BEFORE creation (if not already via force_fresh) ---
+        if clear_recorders_before and not force_fresh_measurement:
             try:
                 self.app.Recorders.Clear()
-                if debug: print("[RecorderCtx] Cleared existing recorders.")
+                if debug:
+                    print("[RecorderCtx] Cleared existing recorders.")
             except:
                 pass
 
+        # --- Create recorder / fallback ---
         recorder_obj, recorder_name, legacy_mode = self._create_recorder(
             mdf_path,
             attempts=retry_recorder_attempts,
@@ -700,16 +1002,66 @@ class CanapeAutomation:
         if sleep_after_recorder_create_ms > 0:
             time.sleep(sleep_after_recorder_create_ms / 1000.0)
 
-        cleanup: List[Tuple[object,str]] = []
+        # --- Attempt to disable append / absolute time if such recorder props exist ---
+        if recorder_obj is not None and not legacy_mode:
+            for attr, val in [
+                ("ContinuousTimeBase", False),
+                ("UseAbsoluteTime", False),
+                ("Append", False),
+            ]:
+                try:
+                    setattr(recorder_obj, attr, val)
+                    if debug:
+                        print(f"[RecorderCtx] Set recorder.{attr}={val}")
+                except:
+                    pass
+
+        cleanup: List[Tuple[object, str]] = []
         channel_assignments = []
 
+        # Baseline snapshot BEFORE adding new channels
+        baseline_task_channels: Dict[int, Set[str]] = {}
+
+        def _snapshot_task(tsk):
+            names = set()
+            try:
+                for i in range(1, tsk.Channels.Count + 1):
+                    try:
+                        names.add(tsk.Channels.Item(i).Name)
+                    except:
+                        pass
+            except:
+                pass
+            return names
+
+        def record_baseline_for(dev_name: str, tasks: List[str]):
+            dev_obj = self.devices[dev_name].dev
+            for tname in tasks:
+                try:
+                    t = dev_obj.Tasks(tname)
+                    baseline_task_channels[id(t)] = _snapshot_task(t)
+                except:
+                    pass
+
+        target_task_names = [task]
+        if vector_signals:
+            target_task_names.append(vector_task)
+        if can_signals:
+            target_task_names.append(can_task)
+        for dn in involved_devices:
+            record_baseline_for(dn, target_task_names)
+
+        # Organize ECU variables by device
         by_dev: Dict[str, List[CanapeVariable]] = {}
-        for v in ecu_vars: by_dev.setdefault(v.device_name, []).append(v)
+        for v in ecu_vars:
+            by_dev.setdefault(v.device_name, []).append(v)
 
         def assign_channel(tsk, ch_name: str):
-            try: ch = tsk.Channels(ch_name)
+            try:
+                ch = tsk.Channels(ch_name)
             except:
-                if debug: print(f"[Assign] Channel '{ch_name}' not found after add")
+                if debug:
+                    print(f"[Assign] Channel '{ch_name}' not found post-add.")
                 return
             if recorder_obj is not None and not legacy_mode:
                 if exclusive_recorder:
@@ -719,17 +1071,20 @@ class CanapeAutomation:
                 try:
                     ch.AssignedRecorders.Add(recorder_obj); added = True
                 except:
-                    try: ch.AssignedRecorders.Add(recorder_name); added = True
-                    except: pass
+                    try:
+                        ch.AssignedRecorders.Add(recorder_name); added = True
+                    except:
+                        pass
                 if debug:
-                    names = []
+                    rec_names = []
                     try:
                         ar = ch.AssignedRecorders
                         for i in range(1, ar.Count+1):
-                            try: names.append(ar.Item(i).Name)
+                            try: rec_names.append(ar.Item(i).Name)
                             except: pass
-                    except: pass
-                    print(f"[Assign] {ch_name} assigned={added} recorders={names}")
+                    except:
+                        pass
+                    print(f"[Assign] {ch_name} assigned={added} recorders={rec_names}")
             channel_assignments.append(ch)
 
         # ECU variable channels
@@ -739,25 +1094,32 @@ class CanapeAutomation:
             self._safe_set_sampling(tsk, sampling_time, debug=debug)
             for v in vars_:
                 try: dev_com.CalibrationObjects.Add(v.varname)
-                except: pass
+                except:
+                    pass
                 already = False
                 try:
                     for i in range(1, tsk.Channels.Count+1):
                         if tsk.Channels.Item(i).Name == v.varname:
-                            already = True; break
-                except: pass
+                            already = True
+                            break
+                except:
+                    pass
                 if not already:
                     try:
                         tsk.Channels.Add(v.varname)
                         cleanup.append((tsk, v.varname))
-                    except: pass
+                    except:
+                        pass
                 assign_channel(tsk, v.varname)
 
+        # Vector and CAN references
         def add_refs(refs: List[_TaskSignalRef], group_task: str,
                      sampling_val: Optional[int], allow_set_sampling: bool):
-            if not refs: return
+            if not refs:
+                return
             group: Dict[str, List[_TaskSignalRef]] = {}
-            for r in refs: group.setdefault(r.device, []).append(r)
+            for r in refs:
+                group.setdefault(r.device, []).append(r)
             for dev_name, lst in group.items():
                 dev_com = self.devices[dev_name].dev
                 tsk = dev_com.Tasks(group_task)
@@ -768,58 +1130,78 @@ class CanapeAutomation:
                     try:
                         for i in range(1, tsk.Channels.Count+1):
                             if tsk.Channels.Item(i).Name == r.signal:
-                                already = True; break
-                    except: pass
+                                already = True
+                                break
+                    except:
+                        pass
                     if not already:
                         try:
                             tsk.Channels.Add(r.signal)
                             cleanup.append((tsk, r.signal))
-                        except: pass
+                        except:
+                            pass
                     assign_channel(tsk, r.signal)
 
         add_refs(vec_refs, vector_task, vector_sampling_time, set_vector_sampling)
         add_refs(can_refs, can_task, can_sampling_time, set_can_sampling)
 
-        # Pre-start re-online (if requested)
+        # Pre-start re-online attempts
         if re_online_on_start:
             for name in involved_devices:
                 dev = self.devices[name].dev
                 self._retry_go_online(dev, go_online_retries, go_online_retry_delay, debug)
 
-        # Optional time reset (helps with offset issues)
-        if reset_relative_time_before_start:
+        # Optional SyncMode
+        if sync_mode is not None:
             try:
-                self.app.Measurement.ResetRelativeTime()
-                if debug: print("[RecorderCtx] ResetRelativeTime called.")
+                self.app.Measurement.SyncMode = bool(sync_mode)
+                if debug:
+                    print(f"[RecorderCtx] SyncMode set to {bool(sync_mode)}")
             except:
-                try:
-                    self.app.Measurement.ResetTime()
-                    if debug: print("[RecorderCtx] ResetTime called.")
-                except:
-                    if debug: print("[RecorderCtx] No time reset API available.")
+                if debug:
+                    print("[RecorderCtx] SyncMode property not available.")
 
-        log(f"Starting measurement legacy_mode={legacy_mode} recorder={recorder_name}")
+        # Optional time reset
+        if reset_relative_time_before_start:
+            reset_applied = False
+            for reset_name in ("ResetRelativeTime", "ResetTime"):
+                try:
+                    getattr(self.app.Measurement, reset_name)()
+                    reset_applied = True
+                    if debug:
+                        print(f"[RecorderCtx] {reset_name} called.")
+                    break
+                except:
+                    pass
+            if not reset_applied and debug:
+                print("[RecorderCtx] No relative time reset method available.")
+
         # Safety: ensure not already running
         try:
             if self.app.Measurement.State != 0:
-                if debug: print("[RecorderCtx] Measurement already running, stopping first.")
+                if debug:
+                    print("[RecorderCtx] Measurement already running, stopping first.")
                 self.app.Measurement.Stop()
                 _wait_measurement_stopped(self.app)
         except:
             pass
 
-        try: self.app.Measurement.Start()
+        log(f"Starting measurement legacy_mode={legacy_mode} recorder={recorder_name}")
+        try:
+            self.app.Measurement.Start()
         except Exception as e:
             log(f"Start failed: {e}; retry once.")
             time.sleep(0.5)
-            try: self.app.Measurement.Start()
-            except: pass
+            try:
+                self.app.Measurement.Start()
+            except:
+                pass
 
-        # Requested longnames for integrity
-        requested_longnames = []
-        requested_longnames += [v.longname for v in ecu_vars]
-        requested_longnames += [r.longname for r in vec_refs]
-        requested_longnames += [r.longname for r in can_refs]
+        requested_longnames = (
+            [v.longname for v in ecu_vars] +
+            [r.longname for r in vec_refs] +
+            [r.longname for r in can_refs]
+        )
 
         rec = RecorderResult(
             self.app, cleanup, ecu_vars, vec_refs, can_refs,
@@ -829,13 +1211,28 @@ class CanapeAutomation:
             exclusive_recorder, legacy_mode, debug,
             rebase_time, rebase_only_vector,
             requested_longnames, fail_if_missing,
-            remove_added_channels, clear_all_tasks_after
+            remove_added_channels, clear_all_tasks_after,
+            baseline_task_channels, select_last_datagroup_only
         )
         try:
             yield rec
         finally:
             log("Finalizing recorder context.")
             rec.finalize()
+
+    # ---------------- Diagnostics ----------------
+
+    @staticmethod
+    def dump_signals(rec: RecorderResult):
+        print("---- SIGNAL SUMMARY ----")
+        for name in rec.signals:
+            sv = rec[name]
+            if len(sv.x):
+                print(f"{name:60s} first={sv.x[0]:10.6f} last={sv.x[-1]:10.6f} count={len(sv.x)}")
+            else:
+                print(f"{name:60s} EMPTY")
+
+    # ---------------- Session Close ----------------
 
     def close(self):
         try:
@@ -846,22 +1243,25 @@ class CanapeAutomation:
             try: self.app.Quit()
             except: pass
 
-# ---------------------------- Optional Example ---------------------------- #
+# ---------------------------------------------------------------------------
+# Example usage (commented)
+# ---------------------------------------------------------------------------
 # if __name__ == "__main__":
 #     import time
 #     sess = CanapeAutomation(r"C:\Path\To\Project")
 #     sess.add_device("ECU", r"C:\path\ecu.a2l", "XCP", 1)
-#     sess.add_device("CAN1", r"C:\path\bus.dbc", "CAN", 1)
+#     # Example: robust run with forced fresh state & SyncMode
 #     with sess.recorder(
 #         "ECU:EngSpd",
-#         can_signals=["CAN1:Msg1.Signal1"],
-#         mdf_path=r"C:\logs\example_run.mf4",
-#         retry_recorder_attempts=5,
-#         go_online_retries=5,
+#         force_fresh_measurement=True,
 #         clear_recorders_before=True,
+#         ensure_new_file=True,
 #         reset_relative_time_before_start=True,
-#         rebase_time="global",
+#         sync_mode=True,
+#         rebase_time="global",  # optional
+#         select_last_datagroup_only=True,
 #         debug=True
 #     ) as rec:
-#         time.sleep(5)
+#         time.sleep(3)
+#     CanapeAutomation.dump_signals(rec)
 #     print(rec.debug_report())
