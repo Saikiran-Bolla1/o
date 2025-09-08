@@ -1,22 +1,28 @@
 """
-Compact CANape automation helper with explicit Recorder management.
+CANape automation helper with explicit Recorder lifecycle.
 
-Additions in this version:
-- For every recording a dedicated recorder object is created (Application.Recorders.Add).
-- Signals/channels added to tasks are explicitly assigned to that recorder via Channel.AssignedRecorders.Add.
-- After recording:
-    * Channels are detached (AssignedRecorders.Clear) and removed from tasks.
-    * The created recorder is cleared of assignments and removed from Application.Recorders.
-- Previous behavior of simply setting Measurement.MDFFilename is replaced by per-recorder MDFFilename.
+Updates (reflecting Vector CANape COM docs for IRecorders / IMeasurementRecorders):
+- Creates a dedicated recorder via Application.Recorders.Add(name)
+- Assigns the recorder to each added channel using Channel.AssignedRecorders.Add(recorder)
+- Added exclusive_recorder flag (default True):
+    * True  -> Clear existing AssignedRecorders before adding ours (exclusive use)
+    * False -> Keep existing; just Add ours and later Remove only ours
+- During finalization:
+    * Stops measurement
+    * Removes ONLY our recorder assignment from each channel using
+          Channel.AssignedRecorders.Remove(recorderObj) or Remove("RecorderName")
+      (falls back to Clear only if exclusive_recorder True or targeted removal fails)
+    * Removes the recorder object from Application.Recorders.Remove("RecorderName")
+- Avoids overuse of .Clear() which would remove unrelated recorder mappings.
 
 Other retained features:
 - Direct variable access: sess["Device:Var"]
-- Recorder context manager returns MF4 data via asammdf.
-- Supports ECU (XCP/CCP) variables, Vector driver signals, CAN (DBC) signals.
-- Physical values by default; enum/text optionally converted to numeric IDs.
-- prefer_raw=True forces raw samples.
-- Ensures devices online before read/write or recording.
-- Clears all task channels for involved devices before starting, and after finishing.
+- Supports ECU (XCP/CCP) variables, Vector driver signals, CAN (DBC) signals
+- Physical values by default; can force raw or numeric enum values
+- Ensures devices online before read/write/record
+- Clears all task channels before starting (your earlier request)
+- After recording, clears task channels again
+- Returns parsed MF4 data via RecorderResult
 
 Requires:
   pip install pywin32 asammdf numpy
@@ -30,7 +36,7 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional, Union, Iterable, Tuple
 from asammdf import MDF, Signal
 
-# ---------------------------- Low-level helpers ---------------------------- #
+# ---------------------------- Helpers ---------------------------- #
 
 def _dispatch_canape():
     return win32com.client.Dispatch("CANape.Application")
@@ -86,8 +92,8 @@ def _maybe_text_to_numeric(samples, signal: Signal):
             if txts is not None and vals is not None:
                 try: mapping = {t:v for t,v in zip(txts, vals)}
                 except: mapping = None
-    out = []
     if mapping:
+        out = []
         for s in samples:
             if s in mapping:
                 out.append(_to_float(mapping[s])); continue
@@ -97,9 +103,8 @@ def _maybe_text_to_numeric(samples, signal: Signal):
             else: s2 = str(s)
             v = mapping.get(s2)
             out.append(_to_float(v if v is not None else s))
-    else:
-        out = [_to_float(s) for s in samples]
-    return np.array(out, dtype=float)
+        return np.array(out, dtype=float)
+    return np.array([_to_float(s) for s in samples], dtype=float)
 
 def _get_signal(mdf: MDF, name: str, prefer_raw: bool):
     if prefer_raw:
@@ -109,7 +114,7 @@ def _get_signal(mdf: MDF, name: str, prefer_raw: bool):
         try: return mdf.get(name)
         except: return mdf.get(name, raw=True)
 
-# ---------------------------- Data abstractions ---------------------------- #
+# ---------------------------- Abstractions ---------------------------- #
 
 class CanapeVariable:
     def __init__(self, app, dev_com, device: str, var: str):
@@ -152,14 +157,12 @@ class _TaskSignalRef:
 
 class _SignalView:
     def __init__(self, sig: Signal, display: str, force_numeric: bool):
-        self._sig = sig
-        self._name = display
         xs, ys = sig.timestamps, sig.samples
         if force_numeric and hasattr(ys,"dtype") and ys.dtype.kind in ("O","U","S"):
             ys = _maybe_text_to_numeric(ys, sig)
         self._x = np.asarray(xs)
         self._y = np.asarray(ys)
-
+        self._name = display
     @property
     def x(self): return self._x
     @property
@@ -177,10 +180,11 @@ class RecorderResult:
         self, app, cleanup, vars_, vector, can_, path,
         prefer_raw, prefer_enum_numeric,
         devices_involved, device_objs,
-        recorder_obj, recorder_name, channel_assignments
+        recorder_obj, recorder_name,
+        channel_assignments, exclusive
     ):
         self._app = app
-        self._cleanup = cleanup          # (task_obj, channel_name)
+        self._cleanup = cleanup
         self._vars = vars_
         self._vec = vector
         self._can = can_
@@ -194,8 +198,8 @@ class RecorderResult:
         self._device_objs = device_objs
         self._recorder = recorder_obj
         self._rec_name = recorder_name
-        # list of (channel_com_obj) used for recorder assignment clearing
-        self._channel_assignments = channel_assignments
+        self._channel_assignments = channel_assignments   # list of channel COM objects
+        self._exclusive = exclusive
 
     def _enum_upgrade(self, mdf: MDF, sig: Signal, name: str):
         try:
@@ -222,46 +226,58 @@ class RecorderResult:
         try: self._app.Measurement.Stop()
         except: pass
 
-        # Detach recorder from each channel then remove channels
+        # Remove ONLY our recorder assignment from each channel
         for ch in self._channel_assignments:
             try:
-                ch.AssignedRecorders.Clear()
+                # Preferred: Remove(recorder COM)
+                try:
+                    ch.AssignedRecorders.Remove(self._recorder)
+                except:
+                    # fallback by name
+                    try:
+                        ch.AssignedRecorders.Remove(self._rec_name)
+                    except:
+                        # as last resort (only if exclusive) clear all
+                        if self._exclusive:
+                            try: ch.AssignedRecorders.Clear()
+                            except: pass
             except: pass
 
+        # Remove channels from tasks
         for tsk, ch_name in self._cleanup:
-            try:
-                tsk.Channels.Remove(ch_name)
+            try: tsk.Channels.Remove(ch_name)
             except: pass
 
-        # Remove recorder object from application
-        try:
-            # Ensure no lingering assignments
-            self._recorder.MDFFilename = ""
-        except: pass
+        # Remove recorder object
         try:
             self._app.Recorders.Remove(self._rec_name)
-        except: pass
+        except:
+            # try by index search
+            try:
+                cnt = self._app.Recorders.Count
+                for i in range(1, cnt+1):
+                    try:
+                        r = self._app.Recorders.Item(i)
+                        if getattr(r, "Name", "") == self._rec_name:
+                            self._app.Recorders.Remove(i)
+                            break
+                    except: pass
+            except: pass
 
-        # Ensure file stable then read
+        # Wait for file, load MDF
         _wait_stable(self.filepath)
         try:
             self._mdf = MDF(self.filepath)
         except Exception as e:
             raise RuntimeError(f"Failed to open MF4 '{self.filepath}': {e}")
 
-        # Build views for variables
         for v in self._vars:
             self._add_view(self._mdf, v.longname, [v.longname, v.varname])
-
-        # Vector signals
         for r in self._vec:
             self._add_view(self._mdf, r.longname, [r.longname, r.signal])
-
-        # CAN signals
         for r in self._can:
             self._add_view(self._mdf, r.longname, [r.longname, r.signal])
 
-        # Add raw MDF channel names (fallback access)
         try:
             for ch in self._mdf.get_channel_names():
                 if ch not in self._views_by_name:
@@ -272,7 +288,6 @@ class RecorderResult:
                     except: pass
         except: pass
 
-        # Clear tasks after recording
         self._clear_all_involved_tasks()
 
     def _clear_all_involved_tasks(self):
@@ -385,7 +400,13 @@ class CanapeAutomation:
         can_task: str = "can", can_sampling_time: Optional[int] = None,
         prefer_raw: bool = False,
         prefer_enum_numeric: bool = True,
+        exclusive_recorder: bool = True,
     ):
+        """
+        exclusive_recorder:
+            True  - remove any pre-existing recorder assignments on each channel (AssignedRecorders.Clear)
+            False - keep other assignments, only Add / later Remove ours
+        """
         # Normalize ECU signals
         ecu_vars: List[CanapeVariable] = []
         for s in signals:
@@ -410,49 +431,39 @@ class CanapeAutomation:
         self._ensure_online_and_clear(involved_devices)
 
         cleanup: List[Tuple[object,str]] = []
-        channel_assignments = []  # store channel COM objects for later recorder unassignment
+        channel_assignments = []
 
-        # Prepare unique recorder + file
+        # Build recorder + file
         if mdf_path is None:
             mdf_path = os.path.abspath(f"canape_recording_{datetime.now():%Y%m%d_%H%M%S}.mf4")
         _ensure_dir(mdf_path)
 
         recorder_name = f"pyRec_{datetime.now():%Y%m%d_%H%M%S_%f}"
         try:
-            recorder_obj = self.app.Recorders.Add(recorder_name)
+            recorder_obj = self.app.Recorders.Add(recorder_name)  # IRecorders::Add
         except:
-            # fallback: try unique suffix
             recorder_name = f"pyRec_{int(time.time()*1000)}"
             recorder_obj = self.app.Recorders.Add(recorder_name)
-
-        # Set MF4 path on this recorder
         try: recorder_obj.MDFFilename = mdf_path
         except: pass
-        # Optionally select it
         try: self.app.Recorders.SelectedRecorder = recorder_obj
         except: pass
 
-        # ECU variable grouping by device
+        # ECU grouping
         by_dev: Dict[str, List[CanapeVariable]] = {}
-        for v in ecu_vars:
-            by_dev.setdefault(v.device_name, []).append(v)
+        for v in ecu_vars: by_dev.setdefault(v.device_name, []).append(v)
 
-        def _assign_channel(tsk, name):
-            """
-            After adding channel, assign it to our recorder (exclusive).
-            """
-            try:
-                ch = tsk.Channels(name)  # channel COM object
-            except:
-                return
-            try:
-                # Remove any previous recorder associations
-                ch.AssignedRecorders.Clear()
-            except: pass
+        def _assign(tsk, channel_name: str):
+            """Add recorder assignment to channel."""
+            try: ch = tsk.Channels(channel_name)
+            except: return
+            if exclusive_recorder:
+                try: ch.AssignedRecorders.Clear()
+                except: pass
+            # Add our recorder (COM object or name)
             try:
                 ch.AssignedRecorders.Add(recorder_obj)
             except:
-                # attempt by name
                 try: ch.AssignedRecorders.Add(recorder_name)
                 except: pass
             channel_assignments.append(ch)
@@ -469,15 +480,14 @@ class CanapeAutomation:
                 try:
                     tsk.Channels.Add(v.varname)
                     cleanup.append((tsk, v.varname))
-                    _assign_channel(tsk, v.varname)
+                    _assign(tsk, v.varname)
                 except: pass
 
-        # Generic add for vector & can
         def _add_refs(refs: List[_TaskSignalRef], group_task: str, group_sampling: Optional[int]):
             if not refs: return
-            grouped: Dict[str, List[_TaskSignalRef]] = {}
-            for r in refs: grouped.setdefault(r.device, []).append(r)
-            for dev_name, lst in grouped.items():
+            group: Dict[str, List[_TaskSignalRef]] = {}
+            for r in refs: group.setdefault(r.device, []).append(r)
+            for dev_name, lst in group.items():
                 dev_com = self.devices[dev_name].dev
                 tsk = dev_com.Tasks(group_task)
                 if group_sampling is not None:
@@ -487,13 +497,13 @@ class CanapeAutomation:
                     try:
                         tsk.Channels.Add(r.signal)
                         cleanup.append((tsk, r.signal))
-                        _assign_channel(tsk, r.signal)
+                        _assign(tsk, r.signal)
                     except: pass
 
         _add_refs(vec_refs, vector_task, vector_sampling_time)
         _add_refs(can_refs, can_task, can_sampling_time)
 
-        # Ensure online again just before start
+        # Ensure devices online before start
         for d in involved_devices:
             try:
                 dev = self.devices[d].dev
@@ -507,7 +517,8 @@ class CanapeAutomation:
             self.app, cleanup, ecu_vars, vec_refs, can_refs,
             mdf_path, prefer_raw, prefer_enum_numeric,
             involved_devices, {n: self.devices[n].dev for n in involved_devices},
-            recorder_obj, recorder_name, channel_assignments
+            recorder_obj, recorder_name, channel_assignments,
+            exclusive_recorder
         )
         try:
             yield rec
@@ -534,8 +545,8 @@ class CanapeAutomation:
 #         can_signals=["CAN1:Msg1.Signal1"],
 #         task="10ms", sampling_time=10,
 #         mdf_path=r"C:\logs\run1.mf4",
-#         prefer_enum_numeric=True
+#         prefer_enum_numeric=True,
+#         exclusive_recorder=True
 #     ) as rec:
 #         time.sleep(5)
-#     spd = rec["ECU:EngSpd"]
-#     print(spd.x[:5], spd.y[:5])
+#     print(rec["ECU:EngSpd"].y[:5])
