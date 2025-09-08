@@ -1,33 +1,3 @@
-"""
-CANape automation helper with explicit Recorder lifecycle.
-
-Updates (reflecting Vector CANape COM docs for IRecorders / IMeasurementRecorders):
-- Creates a dedicated recorder via Application.Recorders.Add(name)
-- Assigns the recorder to each added channel using Channel.AssignedRecorders.Add(recorder)
-- Added exclusive_recorder flag (default True):
-    * True  -> Clear existing AssignedRecorders before adding ours (exclusive use)
-    * False -> Keep existing; just Add ours and later Remove only ours
-- During finalization:
-    * Stops measurement
-    * Removes ONLY our recorder assignment from each channel using
-          Channel.AssignedRecorders.Remove(recorderObj) or Remove("RecorderName")
-      (falls back to Clear only if exclusive_recorder True or targeted removal fails)
-    * Removes the recorder object from Application.Recorders.Remove("RecorderName")
-- Avoids overuse of .Clear() which would remove unrelated recorder mappings.
-
-Other retained features:
-- Direct variable access: sess["Device:Var"]
-- Supports ECU (XCP/CCP) variables, Vector driver signals, CAN (DBC) signals
-- Physical values by default; can force raw or numeric enum values
-- Ensures devices online before read/write/record
-- Clears all task channels before starting (your earlier request)
-- After recording, clears task channels again
-- Returns parsed MF4 data via RecorderResult
-
-Requires:
-  pip install pywin32 asammdf numpy
-"""
-
 import os, re, time
 import win32com.client
 import numpy as np
@@ -36,7 +6,7 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional, Union, Iterable, Tuple
 from asammdf import MDF, Signal
 
-# ---------------------------- Helpers ---------------------------- #
+# ---------------------------- Utility helpers ---------------------------- #
 
 def _dispatch_canape():
     return win32com.client.Dispatch("CANape.Application")
@@ -114,7 +84,7 @@ def _get_signal(mdf: MDF, name: str, prefer_raw: bool):
         try: return mdf.get(name)
         except: return mdf.get(name, raw=True)
 
-# ---------------------------- Abstractions ---------------------------- #
+# ---------------------------- Data abstractions ---------------------------- #
 
 class CanapeVariable:
     def __init__(self, app, dev_com, device: str, var: str):
@@ -173,7 +143,7 @@ class _SignalView:
     def data(self): return tuple(zip(self._x.astype(float), self._y.astype(float)))
     def __repr__(self): return f"<SignalView {self._name} len={len(self._x)}>"
 
-# ---------------------------- Recorder Result ---------------------------- #
+# ---------------------------- RecorderResult ---------------------------- #
 
 class RecorderResult:
     def __init__(
@@ -181,7 +151,8 @@ class RecorderResult:
         prefer_raw, prefer_enum_numeric,
         devices_involved, device_objs,
         recorder_obj, recorder_name,
-        channel_assignments, exclusive
+        channel_assignments, exclusive,
+        legacy_mode, debug
     ):
         self._app = app
         self._cleanup = cleanup
@@ -198,8 +169,14 @@ class RecorderResult:
         self._device_objs = device_objs
         self._recorder = recorder_obj
         self._rec_name = recorder_name
-        self._channel_assignments = channel_assignments   # list of channel COM objects
+        self._channel_assignments = channel_assignments
         self._exclusive = exclusive
+        self._legacy_mode = legacy_mode
+        self._debug = debug
+
+    def _log(self, msg):
+        if self._debug:
+            print(f"[RecorderResult] {msg}")
 
     def _enum_upgrade(self, mdf: MDF, sig: Signal, name: str):
         try:
@@ -222,49 +199,45 @@ class RecorderResult:
             except: continue
 
     def finalize(self):
-        # Stop measurement
+        self._log("Stopping measurement.")
         try: self._app.Measurement.Stop()
         except: pass
 
-        # Remove ONLY our recorder assignment from each channel
-        for ch in self._channel_assignments:
-            try:
-                # Preferred: Remove(recorder COM)
+        # Remove assignment of our recorder (if one exists and not legacy)
+        if not self._legacy_mode and self._recorder is not None:
+            for ch in self._channel_assignments:
                 try:
-                    ch.AssignedRecorders.Remove(self._recorder)
-                except:
-                    # fallback by name
                     try:
-                        ch.AssignedRecorders.Remove(self._rec_name)
+                        ch.AssignedRecorders.Remove(self._recorder)
                     except:
-                        # as last resort (only if exclusive) clear all
-                        if self._exclusive:
-                            try: ch.AssignedRecorders.Clear()
-                            except: pass
-            except: pass
+                        ch.AssignedRecorders.Remove(self._rec_name)
+                except:
+                    if self._exclusive:
+                        try: ch.AssignedRecorders.Clear()
+                        except: pass
 
-        # Remove channels from tasks
+        # Remove channels we added
         for tsk, ch_name in self._cleanup:
             try: tsk.Channels.Remove(ch_name)
             except: pass
 
-        # Remove recorder object
-        try:
-            self._app.Recorders.Remove(self._rec_name)
-        except:
-            # try by index search
-            try:
-                cnt = self._app.Recorders.Count
-                for i in range(1, cnt+1):
-                    try:
-                        r = self._app.Recorders.Item(i)
-                        if getattr(r, "Name", "") == self._rec_name:
-                            self._app.Recorders.Remove(i)
-                            break
-                    except: pass
-            except: pass
+        # Remove recorder object (non-legacy)
+        if not self._legacy_mode and self._recorder is not None:
+            self._log("Removing recorder object.")
+            try: self._app.Recorders.Remove(self._rec_name)
+            except:
+                try:
+                    cnt = self._app.Recorders.Count
+                    for i in range(1, cnt+1):
+                        try:
+                            r = self._app.Recorders.Item(i)
+                            if getattr(r, "Name", "") == self._rec_name:
+                                self._app.Recorders.Remove(i)
+                                break
+                        except: pass
+                except: pass
 
-        # Wait for file, load MDF
+        # Wait and load file
         _wait_stable(self.filepath)
         try:
             self._mdf = MDF(self.filepath)
@@ -288,9 +261,7 @@ class RecorderResult:
                     except: pass
         except: pass
 
-        self._clear_all_involved_tasks()
-
-    def _clear_all_involved_tasks(self):
+        # Clear tasks (post-cleanup)
         for name in self._devices_involved:
             dev = self._device_objs.get(name)
             if not dev: continue
@@ -307,7 +278,8 @@ class RecorderResult:
         if key in self._views_by_name:
             return self._views_by_name[key]
         tail = key.split(":",1)[-1]
-        matches = [n for n in self._views_by_name if n.endswith(":"+tail) or n.endswith("."+tail) or n==tail]
+        matches = [n for n in self._views_by_name
+                   if n.endswith(":"+tail) or n.endswith("."+tail) or n==tail]
         if len(matches)==1:
             return self._views_by_name[matches[0]]
         raise KeyError(f"No recorded data for '{key}'")
@@ -376,17 +348,88 @@ class CanapeAutomation:
                 raise TypeError(f"{kind}_signals entries must be str or CanapeVariable")
         return out
 
-    def _ensure_online_and_clear(self, device_names: Iterable[str]):
+    def _ensure_online(self, device_names: Iterable[str]):
         for name in device_names:
             dev = self.devices.get(name)
             if not dev: continue
             try:
                 if not dev.dev.IsOnline:
                     dev.dev.GoOnline()
-                for t in dev.dev.Tasks:
-                    try: t.Channels.Clear()
-                    except: pass
             except: pass
+
+    # Robust recorder creation with retries & fallbacks
+    def _create_recorder(self,
+                         mdf_path: str,
+                         attempts: int,
+                         use_existing: bool,
+                         fallback_measurement: bool,
+                         debug: bool):
+        def log(msg):
+            if debug: print(f"[RecorderCreate] {msg}")
+
+        recorder_name = None
+        recorder_obj = None
+        legacy_mode = False
+
+        for attempt in range(1, attempts+1):
+            recorder_name = f"pyRec_{datetime.now():%Y%m%d_%H%M%S_%f}_{attempt}"
+            try:
+                recorder_obj = self.app.Recorders.Add(recorder_name)
+                try: recorder_obj.MDFFilename = mdf_path
+                except: pass
+                try: self.app.Recorders.SelectedRecorder = recorder_obj
+                except: pass
+                log(f"Created recorder '{recorder_name}' (attempt {attempt}).")
+                return recorder_obj, recorder_name, legacy_mode
+            except Exception as e:
+                log(f"Add failed attempt {attempt}: {e}")
+                time.sleep(0.15)
+
+        # Fallback: reuse existing
+        if use_existing:
+            try:
+                cnt = self.app.Recorders.Count
+                if cnt >= 1:
+                    recorder_obj = self.app.Recorders.Item(1)
+                    recorder_name = getattr(recorder_obj, "Name", "Recorder1")
+                    try: recorder_obj.MDFFilename = mdf_path
+                    except: pass
+                    log(f"Reusing existing recorder '{recorder_name}'.")
+                    return recorder_obj, recorder_name, legacy_mode
+            except Exception as e:
+                log(f"Existing reuse failed: {e}")
+
+        # Final fallback: direct Measurement.MDFFilename (legacy mode)
+        if fallback_measurement:
+            try:
+                self.app.Measurement.MDFFilename = mdf_path
+                legacy_mode = True
+                recorder_name = "LEGACY_MEASUREMENT"
+                log("Falling back to Measurement.MDFFilename legacy mode (no dedicated recorder).")
+                return None, recorder_name, legacy_mode
+            except Exception as e:
+                raise RuntimeError(f"Could not create or fallback to legacy recorder: {e}")
+
+        raise RuntimeError("Failed to create recorder after retries and no fallback configured.")
+
+    # Attempt to set sampling time only if property is writable
+    @staticmethod
+    def _safe_set_sampling(tsk, sampling_value, debug=False):
+        if sampling_value is None: return
+        try:
+            before = None
+            try: before = tsk.SamplingTime
+            except: pass
+            tsk.SamplingTime = int(sampling_value)
+            # Optional verification
+            try:
+                after = tsk.SamplingTime
+                if debug and before != after:
+                    print(f"[Sampling] Task '{getattr(tsk,'Name','?')}' sampling {before} -> {after}")
+            except: pass
+        except:
+            if debug:
+                print(f"[Sampling] Task '{getattr(tsk,'Name','?')}' does not allow SamplingTime set; ignored.")
 
     @contextmanager
     def recorder(
@@ -401,12 +444,17 @@ class CanapeAutomation:
         prefer_raw: bool = False,
         prefer_enum_numeric: bool = True,
         exclusive_recorder: bool = True,
+        # New robustness parameters:
+        retry_recorder_attempts: int = 3,
+        use_existing_on_fail: bool = True,
+        fallback_to_measurement_filename: bool = True,
+        set_vector_sampling: bool = True,
+        set_can_sampling: bool = False,  # often event-driven; default False
+        debug: bool = False,
     ):
-        """
-        exclusive_recorder:
-            True  - remove any pre-existing recorder assignments on each channel (AssignedRecorders.Clear)
-            False - keep other assignments, only Add / later Remove ours
-        """
+        def log(msg):
+            if debug: print(f"[RecorderCtx] {msg}")
+
         # Normalize ECU signals
         ecu_vars: List[CanapeVariable] = []
         for s in signals:
@@ -427,102 +475,117 @@ class CanapeAutomation:
             [r.device for r in can_refs]
         ))
 
-        # Ensure online & clear tasks BEFORE config
-        self._ensure_online_and_clear(involved_devices)
+        # Ensure devices online
+        self._ensure_online(involved_devices)
 
-        cleanup: List[Tuple[object,str]] = []
-        channel_assignments = []
-
-        # Build recorder + file
         if mdf_path is None:
             mdf_path = os.path.abspath(f"canape_recording_{datetime.now():%Y%m%d_%H%M%S}.mf4")
         _ensure_dir(mdf_path)
 
-        recorder_name = f"pyRec_{datetime.now():%Y%m%d_%H%M%S_%f}"
-        try:
-            recorder_obj = self.app.Recorders.Add(recorder_name)  # IRecorders::Add
-        except:
-            recorder_name = f"pyRec_{int(time.time()*1000)}"
-            recorder_obj = self.app.Recorders.Add(recorder_name)
-        try: recorder_obj.MDFFilename = mdf_path
-        except: pass
-        try: self.app.Recorders.SelectedRecorder = recorder_obj
-        except: pass
+        recorder_obj, recorder_name, legacy_mode = self._create_recorder(
+            mdf_path,
+            attempts=retry_recorder_attempts,
+            use_existing=use_existing_on_fail,
+            fallback_measurement=fallback_to_measurement_filename,
+            debug=debug
+        )
 
-        # ECU grouping
+        cleanup: List[Tuple[object,str]] = []
+        channel_assignments = []
+
+        # Group ECU variables
         by_dev: Dict[str, List[CanapeVariable]] = {}
         for v in ecu_vars: by_dev.setdefault(v.device_name, []).append(v)
 
-        def _assign(tsk, channel_name: str):
-            """Add recorder assignment to channel."""
-            try: ch = tsk.Channels(channel_name)
-            except: return
-            if exclusive_recorder:
-                try: ch.AssignedRecorders.Clear()
-                except: pass
-            # Add our recorder (COM object or name)
-            try:
-                ch.AssignedRecorders.Add(recorder_obj)
+        def assign_channel(tsk, ch_name: str):
+            try: ch = tsk.Channels(ch_name)
             except:
-                try: ch.AssignedRecorders.Add(recorder_name)
-                except: pass
+                return
+            # Recorder assignment only if we have a dedicated recorder
+            if recorder_obj is not None and not legacy_mode:
+                if exclusive_recorder:
+                    try: ch.AssignedRecorders.Clear()
+                    except: pass
+                try:
+                    ch.AssignedRecorders.Add(recorder_obj)
+                except:
+                    try: ch.AssignedRecorders.Add(recorder_name)
+                    except: pass
             channel_assignments.append(ch)
 
+        # Add ECU channels
         for dev_name, vars_ in by_dev.items():
             dev_com = self.devices[dev_name].dev
             tsk = dev_com.Tasks(task)
-            if sampling_time is not None:
-                try: tsk.SamplingTime = int(sampling_time)
-                except: pass
+            self._safe_set_sampling(tsk, sampling_time, debug=debug)
             for v in vars_:
                 try: dev_com.CalibrationObjects.Add(v.varname)
                 except: pass
+                already = False
                 try:
-                    tsk.Channels.Add(v.varname)
-                    cleanup.append((tsk, v.varname))
-                    _assign(tsk, v.varname)
+                    # If already exists, avoid exception
+                    for i in range(1, tsk.Channels.Count+1):
+                        if tsk.Channels.Item(i).Name == v.varname:
+                            already = True
+                            break
                 except: pass
+                if not already:
+                    try:
+                        tsk.Channels.Add(v.varname)
+                        cleanup.append((tsk, v.varname))
+                    except: pass
+                assign_channel(tsk, v.varname)
 
-        def _add_refs(refs: List[_TaskSignalRef], group_task: str, group_sampling: Optional[int]):
+        def add_refs(refs: List[_TaskSignalRef], group_task: str,
+                     sampling_val: Optional[int], allow_set_sampling: bool):
             if not refs: return
             group: Dict[str, List[_TaskSignalRef]] = {}
             for r in refs: group.setdefault(r.device, []).append(r)
             for dev_name, lst in group.items():
                 dev_com = self.devices[dev_name].dev
                 tsk = dev_com.Tasks(group_task)
-                if group_sampling is not None:
-                    try: tsk.SamplingTime = int(group_sampling)
-                    except: pass
+                if allow_set_sampling:
+                    self._safe_set_sampling(tsk, sampling_val, debug=debug)
                 for r in lst:
+                    already = False
                     try:
-                        tsk.Channels.Add(r.signal)
-                        cleanup.append((tsk, r.signal))
-                        _assign(tsk, r.signal)
+                        for i in range(1, tsk.Channels.Count+1):
+                            if tsk.Channels.Item(i).Name == r.signal:
+                                already = True; break
                     except: pass
+                    if not already:
+                        try:
+                            tsk.Channels.Add(r.signal)
+                            cleanup.append((tsk, r.signal))
+                        except: pass
+                    assign_channel(tsk, r.signal)
 
-        _add_refs(vec_refs, vector_task, vector_sampling_time)
-        _add_refs(can_refs, can_task, can_sampling_time)
+        add_refs(vec_refs, vector_task, vector_sampling_time, set_vector_sampling)
+        add_refs(can_refs, can_task, can_sampling_time, set_can_sampling)
 
-        # Ensure devices online before start
-        for d in involved_devices:
-            try:
-                dev = self.devices[d].dev
-                if not dev.IsOnline: dev.GoOnline()
-            except: pass
+        # Final online check
+        self._ensure_online(involved_devices)
 
+        log(f"Starting measurement (legacy_mode={legacy_mode}, recorder={recorder_name}).")
         try: self.app.Measurement.Start()
-        except: pass
+        except Exception as e:
+            log(f"Start failed: {e}")
+            # Attempt small wait & retry
+            time.sleep(0.5)
+            try: self.app.Measurement.Start()
+            except: pass
 
         rec = RecorderResult(
             self.app, cleanup, ecu_vars, vec_refs, can_refs,
             mdf_path, prefer_raw, prefer_enum_numeric,
             involved_devices, {n: self.devices[n].dev for n in involved_devices},
             recorder_obj, recorder_name, channel_assignments,
-            exclusive_recorder
+            exclusive_recorder, legacy_mode, debug
         )
         try:
             yield rec
         finally:
+            log("Finalizing recorder context.")
             rec.finalize()
 
     def close(self):
@@ -546,7 +609,11 @@ class CanapeAutomation:
 #         task="10ms", sampling_time=10,
 #         mdf_path=r"C:\logs\run1.mf4",
 #         prefer_enum_numeric=True,
-#         exclusive_recorder=True
+#         retry_recorder_attempts=5,
+#         use_existing_on_fail=True,
+#         fallback_to_measurement_filename=True,
+#         set_can_sampling=False,
+#         debug=True
 #     ) as rec:
 #         time.sleep(5)
 #     print(rec["ECU:EngSpd"].y[:5])
