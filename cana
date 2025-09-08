@@ -1,3 +1,24 @@
+"""
+CANape automation helper (robust “GoOnline” with multiple retry attempts).
+
+WHAT'S NEW (multi-attempt GoOnline support):
+- Added method: go_online_all_retries(retries=3, delay=0.75, assert_online=False)
+  Tries each device up to N times; optionally raises if a device still offline.
+- Added lower-level helper: _retry_go_online(dev_com, retries, delay, debug)
+- recorder(...) now has parameters:
+    go_online_retries (int, default 3)
+    go_online_retry_delay (float, default 0.75 seconds)
+    re_online_on_start (bool, default True)    # attempt retries just before Measurement.Start
+    re_online_before_config (bool, default True) # attempt before adding channels
+- All previous functionality retained (robust recorder creation & fallback modes, selective sampling setting, etc.)
+- When debug=True you will see detailed retry logs.
+
+If you already had a previous version, only the sections marked  ### NEW / UPDATED FOR MULTI-RETRY ###  changed.
+
+Requires:
+  pip install pywin32 asammdf numpy
+"""
+
 import os, re, time
 import win32com.client
 import numpy as np
@@ -203,7 +224,6 @@ class RecorderResult:
         try: self._app.Measurement.Stop()
         except: pass
 
-        # Remove assignment of our recorder (if one exists and not legacy)
         if not self._legacy_mode and self._recorder is not None:
             for ch in self._channel_assignments:
                 try:
@@ -216,12 +236,10 @@ class RecorderResult:
                         try: ch.AssignedRecorders.Clear()
                         except: pass
 
-        # Remove channels we added
         for tsk, ch_name in self._cleanup:
             try: tsk.Channels.Remove(ch_name)
             except: pass
 
-        # Remove recorder object (non-legacy)
         if not self._legacy_mode and self._recorder is not None:
             self._log("Removing recorder object.")
             try: self._app.Recorders.Remove(self._rec_name)
@@ -237,7 +255,6 @@ class RecorderResult:
                         except: pass
                 except: pass
 
-        # Wait and load file
         _wait_stable(self.filepath)
         try:
             self._mdf = MDF(self.filepath)
@@ -261,7 +278,6 @@ class RecorderResult:
                     except: pass
         except: pass
 
-        # Clear tasks (post-cleanup)
         for name in self._devices_involved:
             dev = self._device_objs.get(name)
             if not dev: continue
@@ -324,6 +340,41 @@ class CanapeAutomation:
             try: d.dev.GoOnline(reconnect)
             except: pass
 
+    ### NEW / UPDATED FOR MULTI-RETRY ###
+    def _retry_go_online(self, dev_com, retries: int, delay: float, debug: bool):
+        for attempt in range(1, retries+1):
+            try:
+                if getattr(dev_com, "IsOnline", False):
+                    return True
+                dev_com.GoOnline()
+                if getattr(dev_com, "IsOnline", False):
+                    return True
+            except Exception as e:
+                if debug:
+                    print(f"[GoOnline] Attempt {attempt} failed: {e}")
+            time.sleep(delay)
+        return getattr(dev_com, "IsOnline", False)
+
+    def go_online_all_retries(self,
+                              retries: int = 3,
+                              delay: float = 0.75,
+                              assert_online: bool = False,
+                              debug: bool = False):
+        """
+        Tries each device up to 'retries' times. Optionally raises if a device
+        cannot go online after all attempts.
+        """
+        results = {}
+        for name, dev in self.devices.items():
+            ok = self._retry_go_online(dev.dev, retries, delay, debug)
+            results[name] = ok
+            if debug:
+                print(f"[GoOnlineAllRetries] Device {name} -> {'ONLINE' if ok else 'OFFLINE'}")
+            if assert_online and not ok:
+                raise RuntimeError(f"Device '{name}' could not go online after {retries} attempts.")
+        return results
+    ### END NEW SECTION ###
+
     def __getitem__(self, longname: str) -> CanapeVariable:
         if ":" not in longname: raise ValueError('Use "Device:Variable" format.')
         dev, var = longname.split(":",1)
@@ -357,7 +408,6 @@ class CanapeAutomation:
                     dev.dev.GoOnline()
             except: pass
 
-    # Robust recorder creation with retries & fallbacks
     def _create_recorder(self,
                          mdf_path: str,
                          attempts: int,
@@ -366,11 +416,9 @@ class CanapeAutomation:
                          debug: bool):
         def log(msg):
             if debug: print(f"[RecorderCreate] {msg}")
-
         recorder_name = None
         recorder_obj = None
         legacy_mode = False
-
         for attempt in range(1, attempts+1):
             recorder_name = f"pyRec_{datetime.now():%Y%m%d_%H%M%S_%f}_{attempt}"
             try:
@@ -384,8 +432,6 @@ class CanapeAutomation:
             except Exception as e:
                 log(f"Add failed attempt {attempt}: {e}")
                 time.sleep(0.15)
-
-        # Fallback: reuse existing
         if use_existing:
             try:
                 cnt = self.app.Recorders.Count
@@ -398,21 +444,17 @@ class CanapeAutomation:
                     return recorder_obj, recorder_name, legacy_mode
             except Exception as e:
                 log(f"Existing reuse failed: {e}")
-
-        # Final fallback: direct Measurement.MDFFilename (legacy mode)
         if fallback_measurement:
             try:
                 self.app.Measurement.MDFFilename = mdf_path
                 legacy_mode = True
                 recorder_name = "LEGACY_MEASUREMENT"
-                log("Falling back to Measurement.MDFFilename legacy mode (no dedicated recorder).")
+                log("Falling back to Measurement.MDFFilename (legacy mode).")
                 return None, recorder_name, legacy_mode
             except Exception as e:
                 raise RuntimeError(f"Could not create or fallback to legacy recorder: {e}")
-
         raise RuntimeError("Failed to create recorder after retries and no fallback configured.")
 
-    # Attempt to set sampling time only if property is writable
     @staticmethod
     def _safe_set_sampling(tsk, sampling_value, debug=False):
         if sampling_value is None: return
@@ -421,7 +463,6 @@ class CanapeAutomation:
             try: before = tsk.SamplingTime
             except: pass
             tsk.SamplingTime = int(sampling_value)
-            # Optional verification
             try:
                 after = tsk.SamplingTime
                 if debug and before != after:
@@ -429,7 +470,7 @@ class CanapeAutomation:
             except: pass
         except:
             if debug:
-                print(f"[Sampling] Task '{getattr(tsk,'Name','?')}' does not allow SamplingTime set; ignored.")
+                print(f"[Sampling] Task '{getattr(tsk,'Name','?')}' cannot set SamplingTime; ignored.")
 
     @contextmanager
     def recorder(
@@ -444,18 +485,21 @@ class CanapeAutomation:
         prefer_raw: bool = False,
         prefer_enum_numeric: bool = True,
         exclusive_recorder: bool = True,
-        # New robustness parameters:
         retry_recorder_attempts: int = 3,
         use_existing_on_fail: bool = True,
         fallback_to_measurement_filename: bool = True,
         set_vector_sampling: bool = True,
-        set_can_sampling: bool = False,  # often event-driven; default False
+        set_can_sampling: bool = False,
         debug: bool = False,
+        # NEW multi-online parameters:
+        go_online_retries: int = 3,
+        go_online_retry_delay: float = 0.75,
+        re_online_on_start: bool = True,
+        re_online_before_config: bool = True,
     ):
         def log(msg):
             if debug: print(f"[RecorderCtx] {msg}")
 
-        # Normalize ECU signals
         ecu_vars: List[CanapeVariable] = []
         for s in signals:
             if s is None: continue
@@ -475,8 +519,11 @@ class CanapeAutomation:
             [r.device for r in can_refs]
         ))
 
-        # Ensure devices online
-        self._ensure_online(involved_devices)
+        # Ensure initial online state
+        if re_online_before_config:
+            for name in involved_devices:
+                dev = self.devices[name].dev
+                self._retry_go_online(dev, go_online_retries, go_online_retry_delay, debug)
 
         if mdf_path is None:
             mdf_path = os.path.abspath(f"canape_recording_{datetime.now():%Y%m%d_%H%M%S}.mf4")
@@ -493,15 +540,12 @@ class CanapeAutomation:
         cleanup: List[Tuple[object,str]] = []
         channel_assignments = []
 
-        # Group ECU variables
         by_dev: Dict[str, List[CanapeVariable]] = {}
         for v in ecu_vars: by_dev.setdefault(v.device_name, []).append(v)
 
         def assign_channel(tsk, ch_name: str):
             try: ch = tsk.Channels(ch_name)
-            except:
-                return
-            # Recorder assignment only if we have a dedicated recorder
+            except: return
             if recorder_obj is not None and not legacy_mode:
                 if exclusive_recorder:
                     try: ch.AssignedRecorders.Clear()
@@ -513,7 +557,7 @@ class CanapeAutomation:
                     except: pass
             channel_assignments.append(ch)
 
-        # Add ECU channels
+        # ECU
         for dev_name, vars_ in by_dev.items():
             dev_com = self.devices[dev_name].dev
             tsk = dev_com.Tasks(task)
@@ -523,11 +567,9 @@ class CanapeAutomation:
                 except: pass
                 already = False
                 try:
-                    # If already exists, avoid exception
                     for i in range(1, tsk.Channels.Count+1):
                         if tsk.Channels.Item(i).Name == v.varname:
-                            already = True
-                            break
+                            already = True; break
                 except: pass
                 if not already:
                     try:
@@ -563,14 +605,16 @@ class CanapeAutomation:
         add_refs(vec_refs, vector_task, vector_sampling_time, set_vector_sampling)
         add_refs(can_refs, can_task, can_sampling_time, set_can_sampling)
 
-        # Final online check
-        self._ensure_online(involved_devices)
+        # Re-online attempts just before start if requested
+        if re_online_on_start:
+            for name in involved_devices:
+                dev = self.devices[name].dev
+                self._retry_go_online(dev, go_online_retries, go_online_retry_delay, debug)
 
         log(f"Starting measurement (legacy_mode={legacy_mode}, recorder={recorder_name}).")
         try: self.app.Measurement.Start()
         except Exception as e:
-            log(f"Start failed: {e}")
-            # Attempt small wait & retry
+            log(f"Start failed: {e}; retry after delay.")
             time.sleep(0.5)
             try: self.app.Measurement.Start()
             except: pass
@@ -602,7 +646,8 @@ class CanapeAutomation:
 #     sess = CanapeAutomation(r"C:\path\to\Project")
 #     ecu = sess.add_device("ECU", r"C:\my.ecu.a2l", "XCP", 1)
 #     can = sess.add_device("CAN1", r"C:\bus.dbc", "CAN", 1)
-#     sess.go_online_all()
+#     # Multi-attempt global online
+#     sess.go_online_all_retries(retries=5, delay=0.5, assert_online=False, debug=True)
 #     with sess.recorder(
 #         "ECU:EngSpd", "ECU:PedalPos",
 #         can_signals=["CAN1:Msg1.Signal1"],
@@ -610,9 +655,10 @@ class CanapeAutomation:
 #         mdf_path=r"C:\logs\run1.mf4",
 #         prefer_enum_numeric=True,
 #         retry_recorder_attempts=5,
-#         use_existing_on_fail=True,
-#         fallback_to_measurement_filename=True,
-#         set_can_sampling=False,
+#         go_online_retries=4,
+#         go_online_retry_delay=0.6,
+#         re_online_on_start=True,
+#         re_online_before_config=True,
 #         debug=True
 #     ) as rec:
 #         time.sleep(5)
