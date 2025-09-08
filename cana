@@ -1,30 +1,67 @@
 """
-CANape automation helper (robust “GoOnline” with multiple retry attempts).
+CANape Automation Helper (Patched Full File)
 
-WHAT'S NEW (multi-attempt GoOnline support):
-- Added method: go_online_all_retries(retries=3, delay=0.75, assert_online=False)
-  Tries each device up to N times; optionally raises if a device still offline.
-- Added lower-level helper: _retry_go_online(dev_com, retries, delay, debug)
-- recorder(...) now has parameters:
-    go_online_retries (int, default 3)
-    go_online_retry_delay (float, default 0.75 seconds)
-    re_online_on_start (bool, default True)    # attempt retries just before Measurement.Start
-    re_online_before_config (bool, default True) # attempt before adding channels
-- All previous functionality retained (robust recorder creation & fallback modes, selective sampling setting, etc.)
-- When debug=True you will see detailed retry logs.
+Main goals of this patched version:
+1. Robust recorder creation (with retries, optional clearing of existing recorders, fallback modes).
+2. Precise channel-to-recorder assignment & safe cleanup (configurable).
+3. Multi-attempt GoOnline logic (before config and/or start).
+4. Time-base handling:
+   - Optional CANape measurement relative time reset before start.
+   - Optional rebasing (global or per-signal) after reading the MF4 to mitigate offsets (e.g. Vector driver signals recorded "at the end").
+5. Integrity & diagnostics:
+   - Verification that requested signals appear and have samples (optional fail).
+   - Debug logging paths for channel assignment, recorder operations, timing, and missing data.
+6. File freshness:
+   - Guarantee a brand-new MF4 (optionally delete if exists).
+7. Flexible cleanup:
+   - remove_added_channels (default True) controls whether channels you added are removed.
+   - clear_all_tasks_after (default False) controls whether *all* channels of involved tasks are cleared after recording.
+8. Retry & fallback strategy for device online state and recorder creation.
+9. Optional selective time rebasing (vector-only or all signals).
+10. Minimal direct dependencies (asammdf, pywin32, numpy).
 
-If you already had a previous version, only the sections marked  ### NEW / UPDATED FOR MULTI-RETRY ###  changed.
-
-Requires:
+Install requirements:
   pip install pywin32 asammdf numpy
+
+Typical usage:
+
+    sess = CanapeAutomation(r"C:\\Path\\To\\Project")
+    sess.add_device("ECU", r"C:\\path\\ecu.a2l", "XCP", 1)
+    sess.add_device("CAN1", r"C:\\path\\bus.dbc", "CAN", 1)
+
+    with sess.recorder(
+        "ECU:EngSpd", "ECU:PedalPos",
+        can_signals=["CAN1:Msg1.Signal1"],
+        mdf_path=r"C:\\logs\\test1.mf4",
+        retry_recorder_attempts=5,
+        go_online_retries=5,
+        clear_recorders_before=True,
+        reset_relative_time_before_start=True,
+        rebase_time="global",       # or "per_signal" or None
+        fail_if_missing=True,
+        debug=True
+    ) as rec:
+        time.sleep(5)
+
+    print(rec["ECU:EngSpd"].y[:10])
+
+If Vector signals show a large offset, ensure:
+- clear_recorders_before=True
+- ensure_new_file=True
+- reset_relative_time_before_start=True
+- (Optionally) rebase_time="global" for post normalization.
+
+Author: Patched automation composite.
 """
 
-import os, re, time
+import os
+import re
+import time
 import win32com.client
 import numpy as np
 from datetime import datetime
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union, Iterable, Tuple
+from typing import Dict, List, Optional, Union, Iterable, Tuple, Set
 from asammdf import MDF, Signal
 
 # ---------------------------- Utility helpers ---------------------------- #
@@ -37,19 +74,40 @@ def _ensure_dir(path: str):
     if p and not os.path.exists(p):
         os.makedirs(p, exist_ok=True)
 
-def _wait_stable(path: str, timeout=30.0, poll=0.25):
+def _wait_stable(path: str, timeout=30.0, poll=0.3, stability_cycles=3):
+    """
+    Wait until file size stops changing for stability_cycles consecutive polls or timeout.
+    """
     end = time.time() + timeout
     last = -1
-    seen = False
+    stable = 0
     while time.time() < end:
         if os.path.exists(path):
             sz = os.path.getsize(path)
-            if seen and sz == last and sz > 0:
-                return True
+            if sz == last and sz > 0:
+                stable += 1
+                if stable >= stability_cycles:
+                    return True
+            else:
+                stable = 0
             last = sz
-            seen = True
         time.sleep(poll)
     return os.path.exists(path)
+
+def _wait_measurement_stopped(app, timeout=12.0, poll=0.25):
+    """
+    Poll CANape Measurement.State until it indicates stopped (heuristically 0) or timeout.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            st = app.Measurement.State
+            if st == 0:
+                return True
+        except:
+            pass
+        time.sleep(poll)
+    return False
 
 def _to_float(val):
     if isinstance(val, (int, float, np.integer, np.floating)): return float(val)
@@ -119,7 +177,8 @@ class CanapeVariable:
         try:
             if not self._dev.IsOnline:
                 self._dev.GoOnline()
-        except: pass
+        except:
+            pass
 
     @property
     def value(self):
@@ -173,7 +232,13 @@ class RecorderResult:
         devices_involved, device_objs,
         recorder_obj, recorder_name,
         channel_assignments, exclusive,
-        legacy_mode, debug
+        legacy_mode, debug,
+        rebase_time: Optional[str],
+        rebase_only_vector: bool,
+        requested_longnames: List[str],
+        fail_if_missing: bool,
+        remove_added_channels: bool,
+        clear_all_tasks_after: bool
     ):
         self._app = app
         self._cleanup = cleanup
@@ -194,6 +259,13 @@ class RecorderResult:
         self._exclusive = exclusive
         self._legacy_mode = legacy_mode
         self._debug = debug
+        self._rebase_time = rebase_time
+        self._rebase_only_vector = rebase_only_vector
+        self._vector_names: Set[str] = {r.longname for r in vector}
+        self._requested_longnames = requested_longnames
+        self._fail_if_missing = fail_if_missing
+        self._remove_added_channels = remove_added_channels
+        self._clear_all_tasks_after = clear_all_tasks_after
 
     def _log(self, msg):
         if self._debug:
@@ -205,7 +277,8 @@ class RecorderResult:
             if self._prefer_enum_numeric and hasattr(ys,"dtype") and ys.dtype.kind in ("O","U","S"):
                 try: return _get_signal(mdf, name, prefer_raw=True)
                 except: return sig
-        except: pass
+        except:
+            pass
         return sig
 
     def _add_view(self, mdf: MDF, display: str, candidates: List[str]):
@@ -217,13 +290,16 @@ class RecorderResult:
                     self._views_by_name[display] = _SignalView(sig, display, self._prefer_enum_numeric)
                     self._order.append(display)
                 return
-            except: continue
+            except:
+                continue
 
     def finalize(self):
         self._log("Stopping measurement.")
         try: self._app.Measurement.Stop()
         except: pass
+        _wait_measurement_stopped(self._app)
 
+        # Remove assignment of our recorder (non-legacy path)
         if not self._legacy_mode and self._recorder is not None:
             for ch in self._channel_assignments:
                 try:
@@ -236,10 +312,13 @@ class RecorderResult:
                         try: ch.AssignedRecorders.Clear()
                         except: pass
 
-        for tsk, ch_name in self._cleanup:
-            try: tsk.Channels.Remove(ch_name)
-            except: pass
+        # Remove channels we added (if configured)
+        if self._remove_added_channels:
+            for tsk, ch_name in self._cleanup:
+                try: tsk.Channels.Remove(ch_name)
+                except: pass
 
+        # Remove recorder object (non-legacy)
         if not self._legacy_mode and self._recorder is not None:
             self._log("Removing recorder object.")
             try: self._app.Recorders.Remove(self._rec_name)
@@ -255,19 +334,30 @@ class RecorderResult:
                         except: pass
                 except: pass
 
-        _wait_stable(self.filepath)
+        # Wait for file flush
+        _wait_stable(self.filepath, timeout=40.0, poll=0.4, stability_cycles=4)
+        if self._debug:
+            print(f"[RecorderResult] MF4 size final: {os.path.getsize(self.filepath) if os.path.exists(self.filepath) else 'Missing'}")
+
+        # Load MDF
         try:
             self._mdf = MDF(self.filepath)
         except Exception as e:
             raise RuntimeError(f"Failed to open MF4 '{self.filepath}': {e}")
 
+        # Build variable views
         for v in self._vars:
             self._add_view(self._mdf, v.longname, [v.longname, v.varname])
+
+        # Vector signals
         for r in self._vec:
             self._add_view(self._mdf, r.longname, [r.longname, r.signal])
+
+        # CAN signals
         for r in self._can:
             self._add_view(self._mdf, r.longname, [r.longname, r.signal])
 
+        # Add any remaining channels (raw access)
         try:
             for ch in self._mdf.get_channel_names():
                 if ch not in self._views_by_name:
@@ -276,17 +366,80 @@ class RecorderResult:
                         sig = self._enum_upgrade(self._mdf, sig, ch)
                         self._views_by_name[ch] = _SignalView(sig, ch, self._prefer_enum_numeric)
                     except: pass
-        except: pass
+        except:
+            pass
 
-        for name in self._devices_involved:
-            dev = self._device_objs.get(name)
-            if not dev: continue
-            try:
-                if not dev.IsOnline: dev.GoOnline()
-                for t in dev.Tasks:
-                    try: t.Channels.Clear()
-                    except: pass
-            except: pass
+        # Rebase time if requested
+        self._perform_rebase()
+
+        # Integrity checks
+        self._integrity_check()
+
+        # Optional big cleanup of entire tasks
+        if self._clear_all_tasks_after:
+            for name in self._devices_involved:
+                dev = self._device_objs.get(name)
+                if not dev: continue
+                try:
+                    if not dev.IsOnline: dev.GoOnline()
+                    for t in dev.Tasks:
+                        try: t.Channels.Clear()
+                        except: pass
+                except: pass
+
+    def _perform_rebase(self):
+        if self._rebase_time not in ("global", "per_signal"):
+            return
+        targets = list(self._views_by_name.items())
+        if self._rebase_only_vector:
+            targets = [(n,v) for n,v in targets if n in self._vector_names]
+        if not targets:
+            return
+        if self._rebase_time == "global":
+            mins = [v.x[0] for _,v in targets if len(v.x)]
+            if not mins: return
+            gmin = min(mins)
+            for _, view in targets:
+                if len(view.x):
+                    view._x = view._x - gmin
+            if self._debug:
+                print(f"[Rebase] Global rebase subtracting {gmin:.6f}")
+        else:  # per_signal
+            for _, view in targets:
+                if len(view.x):
+                    offset = view._x[0]
+                    view._x = view._x - offset
+            if self._debug:
+                print("[Rebase] Per-signal rebase applied.")
+
+    def _integrity_check(self):
+        missing = []
+        zero_sample = []
+        for name in self._requested_longnames:
+            sv = self._views_by_name.get(name)
+            if sv is None:
+                missing.append(name)
+            else:
+                if len(sv.x) == 0:
+                    zero_sample.append(name)
+        if self._debug:
+            if missing:
+                print("[Integrity] Missing:", missing)
+            if zero_sample:
+                print("[Integrity] Zero samples:", zero_sample)
+        if self._fail_if_missing and (missing or zero_sample):
+            raise RuntimeError(f"Recording incomplete. Missing={missing}, ZeroSamples={zero_sample}")
+
+    def debug_report(self):
+        lines = []
+        lines.append(f"Recorder={self._rec_name} legacy={self._legacy_mode} file={self.filepath}")
+        for rn in self._requested_longnames:
+            sv = self._views_by_name.get(rn)
+            if sv is None:
+                lines.append(f"  MISSING {rn}")
+            else:
+                lines.append(f"  OK {rn} count={len(sv.x)} first_ts={(sv.x[0] if len(sv.x)>0 else 'NA')}")
+        return "\n".join(lines)
 
     def __getitem__(self, key: Union[str, CanapeVariable]):
         if isinstance(key, CanapeVariable):
@@ -299,13 +452,15 @@ class RecorderResult:
         if len(matches)==1:
             return self._views_by_name[matches[0]]
         raise KeyError(f"No recorded data for '{key}'")
+
     @property
     def signals(self): return [n for n in self._order]
     def values(self): return [self._views_by_name[n] for n in self._order if n in self._views_by_name]
     def close(self):
         try:
             if self._mdf: self._mdf.close()
-        except: pass
+        except:
+            pass
 
 # ---------------------------- Device & Session ---------------------------- #
 
@@ -321,7 +476,8 @@ class CanapeAutomation:
         try:
             self.app.Measurement.FifoSize = 2048
             self.app.Measurement.SampleSize = 1024
-        except: pass
+        except:
+            pass
         if project_path is None:
             project_path = r"C:\Users\Public\Documents\Vector\CANape Examples 21.0\XCPDemo"
         self.app.Open2(project_path, 1, 100000, 0, 0, 1)
@@ -340,7 +496,6 @@ class CanapeAutomation:
             try: d.dev.GoOnline(reconnect)
             except: pass
 
-    ### NEW / UPDATED FOR MULTI-RETRY ###
     def _retry_go_online(self, dev_com, retries: int, delay: float, debug: bool):
         for attempt in range(1, retries+1):
             try:
@@ -355,25 +510,16 @@ class CanapeAutomation:
             time.sleep(delay)
         return getattr(dev_com, "IsOnline", False)
 
-    def go_online_all_retries(self,
-                              retries: int = 3,
-                              delay: float = 0.75,
-                              assert_online: bool = False,
-                              debug: bool = False):
-        """
-        Tries each device up to 'retries' times. Optionally raises if a device
-        cannot go online after all attempts.
-        """
+    def go_online_all_retries(self, retries=3, delay=0.75, assert_online=False, debug=False):
         results = {}
         for name, dev in self.devices.items():
             ok = self._retry_go_online(dev.dev, retries, delay, debug)
             results[name] = ok
             if debug:
-                print(f"[GoOnlineAllRetries] Device {name} -> {'ONLINE' if ok else 'OFFLINE'}")
+                print(f"[GoOnlineAllRetries] {name} -> {'ONLINE' if ok else 'OFFLINE'}")
             if assert_online and not ok:
                 raise RuntimeError(f"Device '{name}' could not go online after {retries} attempts.")
         return results
-    ### END NEW SECTION ###
 
     def __getitem__(self, longname: str) -> CanapeVariable:
         if ":" not in longname: raise ValueError('Use "Device:Variable" format.')
@@ -399,15 +545,6 @@ class CanapeAutomation:
                 raise TypeError(f"{kind}_signals entries must be str or CanapeVariable")
         return out
 
-    def _ensure_online(self, device_names: Iterable[str]):
-        for name in device_names:
-            dev = self.devices.get(name)
-            if not dev: continue
-            try:
-                if not dev.dev.IsOnline:
-                    dev.dev.GoOnline()
-            except: pass
-
     def _create_recorder(self,
                          mdf_path: str,
                          attempts: int,
@@ -427,11 +564,11 @@ class CanapeAutomation:
                 except: pass
                 try: self.app.Recorders.SelectedRecorder = recorder_obj
                 except: pass
-                log(f"Created recorder '{recorder_name}' (attempt {attempt}).")
+                log(f"Created recorder '{recorder_name}' attempt={attempt}")
                 return recorder_obj, recorder_name, legacy_mode
             except Exception as e:
                 log(f"Add failed attempt {attempt}: {e}")
-                time.sleep(0.15)
+                time.sleep(0.2)
         if use_existing:
             try:
                 cnt = self.app.Recorders.Count
@@ -449,11 +586,11 @@ class CanapeAutomation:
                 self.app.Measurement.MDFFilename = mdf_path
                 legacy_mode = True
                 recorder_name = "LEGACY_MEASUREMENT"
-                log("Falling back to Measurement.MDFFilename (legacy mode).")
+                log("Fallback to Measurement.MDFFilename (legacy mode).")
                 return None, recorder_name, legacy_mode
             except Exception as e:
                 raise RuntimeError(f"Could not create or fallback to legacy recorder: {e}")
-        raise RuntimeError("Failed to create recorder after retries and no fallback configured.")
+        raise RuntimeError("Failed to create recorder after all retries; no fallback configured.")
 
     @staticmethod
     def _safe_set_sampling(tsk, sampling_value, debug=False):
@@ -466,7 +603,7 @@ class CanapeAutomation:
             try:
                 after = tsk.SamplingTime
                 if debug and before != after:
-                    print(f"[Sampling] Task '{getattr(tsk,'Name','?')}' sampling {before} -> {after}")
+                    print(f"[Sampling] Task '{getattr(tsk,'Name','?')}' {before} -> {after}")
             except: pass
         except:
             if debug:
@@ -491,21 +628,33 @@ class CanapeAutomation:
         set_vector_sampling: bool = True,
         set_can_sampling: bool = False,
         debug: bool = False,
-        # NEW multi-online parameters:
         go_online_retries: int = 3,
         go_online_retry_delay: float = 0.75,
         re_online_on_start: bool = True,
         re_online_before_config: bool = True,
+        rebase_time: Optional[str] = None,
+        rebase_only_vector: bool = False,
+        fail_if_missing: bool = False,
+        ensure_new_file: bool = True,
+        clear_recorders_before: bool = False,
+        reset_relative_time_before_start: bool = False,
+        sleep_after_recorder_create_ms: int = 0,
+        remove_added_channels: bool = True,
+        clear_all_tasks_after: bool = False
     ):
         def log(msg):
             if debug: print(f"[RecorderCtx] {msg}")
 
+        # Normalize ECU signals
         ecu_vars: List[CanapeVariable] = []
         for s in signals:
             if s is None: continue
-            if isinstance(s, CanapeVariable): ecu_vars.append(s)
-            elif isinstance(s, str): ecu_vars.append(self[s])
-            else: raise TypeError("signals must be str or CanapeVariable")
+            if isinstance(s, CanapeVariable):
+                ecu_vars.append(s)
+            elif isinstance(s, str):
+                ecu_vars.append(self[s])
+            else:
+                raise TypeError("signals must be str or CanapeVariable")
 
         vec_refs = self._normalize_refs(vector_signals, "vector")
         can_refs = self._normalize_refs(can_signals, "can")
@@ -519,7 +668,7 @@ class CanapeAutomation:
             [r.device for r in can_refs]
         ))
 
-        # Ensure initial online state
+        # Optional pre-config re-online
         if re_online_before_config:
             for name in involved_devices:
                 dev = self.devices[name].dev
@@ -527,7 +676,18 @@ class CanapeAutomation:
 
         if mdf_path is None:
             mdf_path = os.path.abspath(f"canape_recording_{datetime.now():%Y%m%d_%H%M%S}.mf4")
+        if ensure_new_file and os.path.exists(mdf_path):
+            try: os.remove(mdf_path)
+            except: pass
         _ensure_dir(mdf_path)
+
+        # Optionally clear existing recorders to avoid time continuity
+        if clear_recorders_before:
+            try:
+                self.app.Recorders.Clear()
+                if debug: print("[RecorderCtx] Cleared existing recorders.")
+            except:
+                pass
 
         recorder_obj, recorder_name, legacy_mode = self._create_recorder(
             mdf_path,
@@ -537,6 +697,9 @@ class CanapeAutomation:
             debug=debug
         )
 
+        if sleep_after_recorder_create_ms > 0:
+            time.sleep(sleep_after_recorder_create_ms / 1000.0)
+
         cleanup: List[Tuple[object,str]] = []
         channel_assignments = []
 
@@ -545,19 +708,31 @@ class CanapeAutomation:
 
         def assign_channel(tsk, ch_name: str):
             try: ch = tsk.Channels(ch_name)
-            except: return
+            except:
+                if debug: print(f"[Assign] Channel '{ch_name}' not found after add")
+                return
             if recorder_obj is not None and not legacy_mode:
                 if exclusive_recorder:
                     try: ch.AssignedRecorders.Clear()
                     except: pass
+                added = False
                 try:
-                    ch.AssignedRecorders.Add(recorder_obj)
+                    ch.AssignedRecorders.Add(recorder_obj); added = True
                 except:
-                    try: ch.AssignedRecorders.Add(recorder_name)
+                    try: ch.AssignedRecorders.Add(recorder_name); added = True
                     except: pass
+                if debug:
+                    names = []
+                    try:
+                        ar = ch.AssignedRecorders
+                        for i in range(1, ar.Count+1):
+                            try: names.append(ar.Item(i).Name)
+                            except: pass
+                    except: pass
+                    print(f"[Assign] {ch_name} assigned={added} recorders={names}")
             channel_assignments.append(ch)
 
-        # ECU
+        # ECU variable channels
         for dev_name, vars_ in by_dev.items():
             dev_com = self.devices[dev_name].dev
             tsk = dev_com.Tasks(task)
@@ -605,26 +780,56 @@ class CanapeAutomation:
         add_refs(vec_refs, vector_task, vector_sampling_time, set_vector_sampling)
         add_refs(can_refs, can_task, can_sampling_time, set_can_sampling)
 
-        # Re-online attempts just before start if requested
+        # Pre-start re-online (if requested)
         if re_online_on_start:
             for name in involved_devices:
                 dev = self.devices[name].dev
                 self._retry_go_online(dev, go_online_retries, go_online_retry_delay, debug)
 
-        log(f"Starting measurement (legacy_mode={legacy_mode}, recorder={recorder_name}).")
+        # Optional time reset (helps with offset issues)
+        if reset_relative_time_before_start:
+            try:
+                self.app.Measurement.ResetRelativeTime()
+                if debug: print("[RecorderCtx] ResetRelativeTime called.")
+            except:
+                try:
+                    self.app.Measurement.ResetTime()
+                    if debug: print("[RecorderCtx] ResetTime called.")
+                except:
+                    if debug: print("[RecorderCtx] No time reset API available.")
+
+        log(f"Starting measurement legacy_mode={legacy_mode} recorder={recorder_name}")
+        # Safety: ensure not already running
+        try:
+            if self.app.Measurement.State != 0:
+                if debug: print("[RecorderCtx] Measurement already running, stopping first.")
+                self.app.Measurement.Stop()
+                _wait_measurement_stopped(self.app)
+        except:
+            pass
+
         try: self.app.Measurement.Start()
         except Exception as e:
-            log(f"Start failed: {e}; retry after delay.")
+            log(f"Start failed: {e}; retry once.")
             time.sleep(0.5)
             try: self.app.Measurement.Start()
             except: pass
+
+        # Requested longnames for integrity
+        requested_longnames = []
+        requested_longnames += [v.longname for v in ecu_vars]
+        requested_longnames += [r.longname for r in vec_refs]
+        requested_longnames += [r.longname for r in can_refs]
 
         rec = RecorderResult(
             self.app, cleanup, ecu_vars, vec_refs, can_refs,
             mdf_path, prefer_raw, prefer_enum_numeric,
             involved_devices, {n: self.devices[n].dev for n in involved_devices},
             recorder_obj, recorder_name, channel_assignments,
-            exclusive_recorder, legacy_mode, debug
+            exclusive_recorder, legacy_mode, debug,
+            rebase_time, rebase_only_vector,
+            requested_longnames, fail_if_missing,
+            remove_added_channels, clear_all_tasks_after
         )
         try:
             yield rec
@@ -641,25 +846,22 @@ class CanapeAutomation:
             try: self.app.Quit()
             except: pass
 
-# ---------------------------- Example (commented) ---------------------------- #
+# ---------------------------- Optional Example ---------------------------- #
 # if __name__ == "__main__":
-#     sess = CanapeAutomation(r"C:\path\to\Project")
-#     ecu = sess.add_device("ECU", r"C:\my.ecu.a2l", "XCP", 1)
-#     can = sess.add_device("CAN1", r"C:\bus.dbc", "CAN", 1)
-#     # Multi-attempt global online
-#     sess.go_online_all_retries(retries=5, delay=0.5, assert_online=False, debug=True)
+#     import time
+#     sess = CanapeAutomation(r"C:\Path\To\Project")
+#     sess.add_device("ECU", r"C:\path\ecu.a2l", "XCP", 1)
+#     sess.add_device("CAN1", r"C:\path\bus.dbc", "CAN", 1)
 #     with sess.recorder(
-#         "ECU:EngSpd", "ECU:PedalPos",
+#         "ECU:EngSpd",
 #         can_signals=["CAN1:Msg1.Signal1"],
-#         task="10ms", sampling_time=10,
-#         mdf_path=r"C:\logs\run1.mf4",
-#         prefer_enum_numeric=True,
+#         mdf_path=r"C:\logs\example_run.mf4",
 #         retry_recorder_attempts=5,
-#         go_online_retries=4,
-#         go_online_retry_delay=0.6,
-#         re_online_on_start=True,
-#         re_online_before_config=True,
+#         go_online_retries=5,
+#         clear_recorders_before=True,
+#         reset_relative_time_before_start=True,
+#         rebase_time="global",
 #         debug=True
 #     ) as rec:
 #         time.sleep(5)
-#     print(rec["ECU:EngSpd"].y[:5])
+#     print(rec.debug_report())
