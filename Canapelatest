@@ -1,1 +1,1153 @@
 
+"""
+CANape Automation Utility (Updated with per-device task clearing parameter)
+
+New/Updated Functionality (relative to previous version):
+- Added parameters to recorder() so you can explicitly specify which task names to clear across devices:
+    tasks_to_clear: 
+        * None (default): uses only the tasks that will actually be used this run 
+          (ECU task, vector_task, can_task if they have signals).
+        * An iterable/list/tuple/set of task names: only those task names will be cleared.
+        * "*" (string): clear ALL tasks (i.e., every device.Tasks(...) found) across chosen devices.
+    clear_all_devices_tasks (bool, default True):
+        * If True, the clearing logic (when clear_tasks_before / clear_tasks_after enabled) iterates
+          all project devices (Project.Devices) and clears the specified tasks (or all tasks if "*").
+        * If False, only devices that are actually used by this recorder invocation are cleared.
+
+- Clearing happens BEFORE channel enabling if clear_tasks_before=True.
+- Optional clearing happens AFTER measurement if clear_tasks_after=True.
+- Clearing logic uses device.Tasks iteration; for each matching task, calls task.Channels.Clear().
+
+Other retained features:
+- Optional global disable of Save2MDF (disable_global_save2mdf).
+- Restoration of previous Save2MDF states (when not clearing after run).
+- Online enforcement for devices.
+- Task sampling time application.
+- Enum → numeric handling via prefer_enum_numeric.
+- Optional relative time base resets and MF4 config attempts.
+
+Choose isolation model examples:
+1) Full isolation (start clean, end clean):
+    clear_tasks_before=True, clear_tasks_after=True, disable_global_save2mdf=False
+   (restore_previous_save2mdf is ignored because tasks are cleared after.)
+
+2) Minimal intrusion (only manage Save2MDF flags, keep existing tasks/channels):
+    clear_tasks_before=False, clear_tasks_after=False, disable_global_save2mdf=True, restore_previous_save2mdf=True
+
+3) Targeted clearing of specific tasks (e.g., only "100ms" and "cyclic"):
+    tasks_to_clear=["100ms","cyclic"], clear_tasks_before=True, clear_all_devices_tasks=True
+
+"""
+
+import os
+import re
+import time
+import win32com.client
+import numpy as np
+from datetime import datetime
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Union, Any, Tuple, Iterable, Set
+
+from asammdf import MDF, Signal
+
+
+# -------------------- Helper Functions --------------------
+
+def _dispatch_canape():
+    return win32com.client.Dispatch("CANape.Application")
+
+def _ensure_parent_dir(path: str):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+
+def _wait_for_file_stable(path: str, timeout_s: float = 30.0, poll_s: float = 0.25) -> bool:
+    end = time.time() + timeout_s
+    last = -1
+    seen = False
+    while time.time() < end:
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            if seen and size == last and size > 0:
+                return True
+            last = size
+            seen = True
+        time.sleep(poll_s)
+    return os.path.exists(path)
+
+def _iter_collection(coll):
+    try:
+        for item in coll:
+            yield item
+        return
+    except Exception:
+        pass
+    try:
+        n = coll.Count
+    except Exception:
+        n = 0
+    for i in range(1, int(n) + 1):
+        try:
+            yield coll.Item(i)
+        except Exception:
+            pass
+
+def _device_is_online(dev) -> bool:
+    try:
+        attr = getattr(dev, "IsOnline", None)
+        if attr is None:
+            attr = getattr(dev, "isOnline", None) or getattr(dev, "Online", None)
+        if callable(attr):
+            return bool(attr())
+        if attr is not None:
+            return bool(attr)
+    except Exception:
+        pass
+    for flag in ("State", "Status"):
+        try:
+            val = getattr(dev, flag)
+            if isinstance(val, (int, float)) and int(val) != 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+def _get_signal_preferred(mdf: MDF, name: str, prefer_raw: bool = False) -> Signal:
+    if prefer_raw:
+        try:
+            return mdf.get(name, raw=True)
+        except Exception:
+            return mdf.get(name)
+    else:
+        try:
+            return mdf.get(name)
+        except Exception:
+            return mdf.get(name, raw=True)
+
+def _to_float_safe(val) -> float:
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return float(val)
+    if val is None:
+        return np.nan
+    if isinstance(val, (bytes, bytearray)):
+        try:
+            val = val.decode("utf-8", errors="ignore")
+        except Exception:
+            return np.nan
+    s = str(val).strip().replace("\xa0", " ")
+    if s == "" or s.lower() in ("nan", "none", "null"):
+        return np.nan
+    low = s.lower()
+    if low in ("true", "on", "high", "yes"):
+        return 1.0
+    if low in ("false", "off", "low", "no"):
+        return 0.0
+    m = re.search(r"[-+]?\d+(?:[.,]\d+)?(?:[eE][-+]?\d+)?", s)
+    if m:
+        num = m.group(0).replace(",", ".")
+        try:
+            return float(num)
+        except Exception:
+            pass
+    return np.nan
+
+def _maybe_text_to_raw(samples: np.ndarray, signal: Signal) -> np.ndarray:
+    if hasattr(samples, "dtype") and samples.dtype.kind in ("i","u","f","b"):
+        return samples
+    conv = getattr(signal, "conversion", None)
+    mapping = None
+    if conv is not None:
+        for attr in ("text_2_value","text2value","text_to_value","value_map","val_map","mapping"):
+            mapping = getattr(conv, attr, None)
+            if mapping:
+                break
+        if mapping is None:
+            texts = getattr(conv, "texts", None) or getattr(conv, "labels", None)
+            values = getattr(conv, "values", None) or getattr(conv, "ids", None)
+            if texts is not None and values is not None:
+                try:
+                    mapping = {t: v for t, v in zip(texts, values)}
+                except Exception:
+                    mapping = None
+    out = []
+    if mapping:
+        for s in samples:
+            if s in mapping:
+                out.append(_to_float_safe(mapping[s]))
+                continue
+            if isinstance(s, (bytes, bytearray)):
+                try:
+                    s2 = s.decode(errors="ignore")
+                except Exception:
+                    s2 = ""
+            else:
+                s2 = str(s)
+            v = mapping.get(s2, None)
+            out.append(_to_float_safe(v if v is not None else s))
+    else:
+        out = [_to_float_safe(s) for s in samples]
+    return np.array(out, dtype=float)
+
+
+# -------------------- Core Classes --------------------
+
+class CanapeVariable:
+    def __init__(self, app, device_com, device_name: str, varname: str):
+        self._app = app
+        self._dev = device_com
+        self.device_name = device_name
+        self.varname = varname
+        self.longname = f"{device_name}:{varname}"
+
+    def _ensure_online(self, timeout_s: float = 5.0, poll_s: float = 0.05):
+        if _device_is_online(self._dev):
+            return
+        try:
+            self._dev.GoOnline(False)
+        except Exception:
+            try:
+                self._dev.GoOnline()
+            except Exception:
+                pass
+        end = time.time() + timeout_s
+        while time.time() < end:
+            if _device_is_online(self._dev):
+                return
+            time.sleep(poll_s)
+        if not _device_is_online(self._dev):
+            raise RuntimeError(f"Device '{self.device_name}' not online for variable '{self.varname}'")
+
+    @property
+    def value(self):
+        self._ensure_online()
+        self._dev.CalibrationObjects.Add(self.varname)
+        obj = self._dev.CalibrationObjects.Item(self.varname)
+        obj.Read()
+        return obj.Value
+
+    @value.setter
+    def value(self, val):
+        self._ensure_online()
+        self._dev.CalibrationObjects.Add(self.varname)
+        obj = self._dev.CalibrationObjects.Item(self.varname)
+        obj.Value = val
+        obj.Write()
+
+    def __repr__(self):
+        return f"<CanapeVariable {self.longname}>"
+
+
+class _TaskSignalRef:
+    def __init__(self, device_name: str, signal_name: str):
+        self.device_name = device_name
+        self.signal_name = signal_name
+    @property
+    def longname(self):
+        return f"{self.device_name}:{self.signal_name}"
+    def __repr__(self):
+        return f"<TaskSignal {self.longname}>"
+
+
+class _SignalView:
+    def __init__(self, signal: Signal, display_name: Optional[str] = None, force_text_to_numeric: bool = True):
+        self._sig = signal
+        self._name = display_name or signal.name
+        xs = signal.timestamps
+        ys = signal.samples
+        if force_text_to_numeric and (hasattr(ys, "dtype") and ys.dtype.kind in ("O","U","S")):
+            ys = _maybe_text_to_raw(ys, signal)
+        self._x = np.asarray(xs)
+        self._y = np.asarray(ys)
+    @property
+    def x(self): return self._x
+    @property
+    def y(self): return self._y
+    @property
+    def name(self): return self._name
+    @property
+    def data(self):
+        n = min(len(self._x), len(self._y))
+        return tuple((float(self._x[i]), float(self._y[i])) for i in range(n))
+    def __repr__(self):
+        return f"<SignalView name={self._name!r} len={len(self._x)}>"
+
+
+class RecorderResult:
+    def __init__(
+        self,
+        app,
+        *,
+        var_list: List[CanapeVariable],
+        vector_refs: List[_TaskSignalRef],
+        can_refs: List[_TaskSignalRef],
+        mdf_path: str,
+        prefer_raw: bool,
+        prefer_enum_numeric: bool,
+        normalize_time_zero: bool,
+        touched_items: List[Dict[str, Any]],
+        disabled_items: List[Dict[str, Any]],
+        restore_previous_save2mdf: bool,
+        clear_tasks_after: bool,
+        tasks_used: Set[Any],
+        tasks_to_clear_spec: Set[str],
+        wildcard_clear: bool,
+        clear_all_devices_tasks: bool
+    ):
+        self._app = app
+        self._vars = var_list
+        self._vectors = vector_refs
+        self._can_refs = can_refs
+        self.filepath = os.path.abspath(mdf_path)
+        self._prefer_raw = prefer_raw
+        self._prefer_enum_numeric = prefer_enum_numeric
+        self._normalize_time_zero_flag = normalize_time_zero
+        self._touched_items = touched_items
+        self._disabled_items = disabled_items
+        self._restore_previous = restore_previous_save2mdf
+        self._clear_tasks_after = clear_tasks_after
+        self._tasks_used = tasks_used
+        self._tasks_to_clear_spec = tasks_to_clear_spec
+        self._wildcard_clear = wildcard_clear
+        self._clear_all_devices_tasks = clear_all_devices_tasks
+
+        self._mdf: Optional[MDF] = None
+        self._views_by_var: Dict[CanapeVariable, _SignalView] = {}
+        self._views_by_name: Dict[str, _SignalView] = {}
+        self._ordered_names: List[str] = []
+
+    # ----- Internal resolution helpers -----
+    def _resolve_signal(self, mdf: MDF, candidates: List[str]) -> Optional[Signal]:
+        for name in candidates:
+            try:
+                return _get_signal_preferred(mdf, name, self._prefer_raw)
+            except Exception:
+                continue
+        try:
+            names = list(mdf.get_channel_names())
+        except Exception:
+            names = []
+        lower = {n.lower(): n for n in names}
+        for cand in candidates:
+            real = lower.get(cand.lower())
+            if real:
+                try:
+                    return _get_signal_preferred(mdf, real, self._prefer_raw)
+                except Exception:
+                    pass
+        for cand in candidates:
+            tail = cand.split(":",1)[-1]
+            for sep in (":","."):
+                suffix = f"{sep}{tail}"
+                matches = [n for n in names if n.endswith(suffix)]
+                if len(matches)==1:
+                    try:
+                        return _get_signal_preferred(mdf, matches[0], self._prefer_raw)
+                    except Exception:
+                        pass
+        return None
+
+    def _enum_upgrade(self, mdf: MDF, sig: Signal, candidates: List[str]) -> Signal:
+        if not self._prefer_enum_numeric:
+            return sig
+        try:
+            ys = sig.samples
+            texty = hasattr(ys, "dtype") and ys.dtype.kind in ("O","U","S")
+        except Exception:
+            texty = False
+        if not texty:
+            return sig
+        for name in candidates:
+            try:
+                return _get_signal_preferred(mdf, name, prefer_raw=True)
+            except Exception:
+                continue
+        return sig
+
+    def _normalize_time_zero(self):
+        if not self._normalize_time_zero_flag:
+            return
+        t0 = None
+        for v in self._views_by_name.values():
+            if v.x.size:
+                t0 = v.x[0] if t0 is None else min(t0, v.x[0])
+        if t0 is None or t0 == 0.0:
+            return
+        for v in self._views_by_name.values():
+            if v.x.size:
+                v._x = v._x - t0  # mutate
+
+    def _load_views(self):
+        self._mdf = MDF(self.filepath)
+
+        # ECU vars
+        for v in self._vars:
+            cands = [v.longname, v.varname]
+            sig = self._resolve_signal(self._mdf, cands)
+            if not sig:
+                continue
+            sig = self._enum_upgrade(self._mdf, sig, cands)
+            view = _SignalView(sig, display_name=v.longname)
+            self._views_by_var[v] = view
+            self._views_by_name[v.longname] = view
+            self._ordered_names.append(v.longname)
+
+        # Vector
+        for ref in self._vectors:
+            cands = [ref.longname, ref.signal_name]
+            sig = self._resolve_signal(self._mdf, cands)
+            if not sig:
+                continue
+            sig = self._enum_upgrade(self._mdf, sig, cands)
+            v = _SignalView(sig, display_name=ref.longname)
+            self._views_by_name[ref.longname] = v
+            self._ordered_names.append(ref.longname)
+
+        # CAN
+        for ref in self._can_refs:
+            cands = [ref.longname, ref.signal_name]
+            sig = self._resolve_signal(self._mdf, cands)
+            if not sig:
+                continue
+            sig = self._enum_upgrade(self._mdf, sig, cands)
+            v = _SignalView(sig, display_name=ref.longname)
+            self._views_by_name[ref.longname] = v
+            self._ordered_names.append(ref.longname)
+
+        # Raw MDF fallback
+        try:
+            all_names = list(self._mdf.get_channel_names())
+        except Exception:
+            all_names = []
+        for n in all_names:
+            if n in self._views_by_name:
+                continue
+            try:
+                sig = _get_signal_preferred(self._mdf, n, self._prefer_raw)
+                sig = self._enum_upgrade(self._mdf, sig, [n])
+                self._views_by_name[n] = _SignalView(sig, display_name=n)
+            except Exception:
+                pass
+
+        self._normalize_time_zero()
+
+    # ----- Task clearing (after) -----
+    def _clear_specified_tasks(self):
+        proj = getattr(self._app, "Project", None)
+        devices_coll = getattr(proj, "Devices", None) if proj else None
+        if not devices_coll:
+            return
+        for dev in _iter_collection(devices_coll):
+            try:
+                tasks = dev.Tasks
+            except Exception:
+                continue
+            for t in _iter_collection(tasks):
+                try:
+                    tname = t.Name
+                except Exception:
+                    continue
+                if self._wildcard_clear or tname in self._tasks_to_clear_spec:
+                    try:
+                        t.Channels.Clear()
+                    except Exception:
+                        pass
+
+    # ----- Finalization / cleanup -----
+    def finalize(self):
+        try:
+            self._app.Measurement.Stop()
+        except Exception:
+            pass
+
+        # Wait until measurement fully stops
+        end = time.time() + 5.0
+        while time.time() < end:
+            try:
+                if not bool(getattr(self._app.Measurement, "Active")):
+                    break
+            except Exception:
+                break
+            time.sleep(0.05)
+
+        if self._clear_tasks_after:
+            self._clear_specified_tasks()
+        else:
+            if self._restore_previous:
+                # Restore touched channels
+                for entry in self._touched_items:
+                    dev_name = entry['dev_name']
+                    task_name = entry['task_name']
+                    ch_name = entry['ch_name']
+                    existed_before = entry['existed_before']
+                    prev = entry['prev_save2mdf']
+                    try:
+                        dev_com = None
+                        try:
+                            dev_com = self._app.Devices.Item(dev_name)
+                        except Exception:
+                            dev_com = self._app.Project.Devices.Item(dev_name)
+                        tsk = dev_com.Tasks(task_name)
+                        chs = tsk.Channels
+                        if existed_before:
+                            if prev is not None:
+                                try:
+                                    chs(ch_name).Save2MDF = bool(prev)
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    chs(ch_name).Save2MDF = False
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                chs.Remove(ch_name)
+                            except Exception:
+                                try:
+                                    chs(ch_name).Save2MDF = False
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                # Restore other channels that were previously enabled
+                touched_keys = {(e['dev_name'], e['task_name'], e['ch_name']) for e in self._touched_items}
+                for entry in self._disabled_items:
+                    key = (entry['dev_name'], entry['task_name'], entry['ch_name'])
+                    if key in touched_keys:
+                        continue
+                    if not entry['prev_save2mdf']:
+                        continue
+                    try:
+                        dev_com = None
+                        try:
+                            dev_com = self._app.Devices.Item(entry['dev_name'])
+                        except Exception:
+                            dev_com = self._app.Project.Devices.Item(entry['dev_name'])
+                        tsk = dev_com.Tasks(entry['task_name'])
+                        tsk.Channels(entry['ch_name']).Save2MDF = True
+                    except Exception:
+                        pass
+
+        _wait_for_file_stable(self.filepath, timeout_s=30.0, poll_s=0.25)
+        self._load_views()
+
+    # ----- Accessors -----
+    def __getitem__(self, key: Union[CanapeVariable, str]) -> _SignalView:
+        if isinstance(key, CanapeVariable):
+            v = self._views_by_var.get(key)
+            if v:
+                return v
+            name = key.longname
+            if name in self._views_by_name:
+                return self._views_by_name[name]
+            tail = name.split(":",1)[-1]
+            matches = [n for n in self._views_by_name if n.endswith(":"+tail) or n.endswith("."+tail) or n==tail]
+            if len(matches)==1:
+                return self._views_by_name[matches[0]]
+            raise KeyError(f"No recorded data for {name}")
+        else:
+            if key in self._views_by_name:
+                return self._views_by_name[key]
+            tail = key.split(":",1)[-1]
+            matches = [n for n in self._views_by_name if n.endswith(":"+tail) or n.endswith("."+tail) or n==tail]
+            if len(matches)==1:
+                return self._views_by_name[matches[0]]
+            raise KeyError(f"No recorded data for '{key}'")
+
+    @property
+    def signals(self) -> List[str]:
+        return list(self._ordered_names)
+
+    def values(self) -> List[_SignalView]:
+        return [self._views_by_name[n] for n in self._ordered_names if n in self._views_by_name]
+
+    def y_values(self) -> List[Tuple[str, np.ndarray]]:
+        return [(n, self._views_by_name[n].y) for n in self._ordered_names if n in self._views_by_name]
+
+    def close(self):
+        try:
+            if self._mdf:
+                self._mdf.close()
+        except Exception:
+            pass
+
+
+class CanapeDevice:
+    def __init__(self, app, device_com, name: str):
+        self.app = app
+        self.dev = device_com
+        self.name = name
+
+
+# -------------------- Automation Facade --------------------
+
+class CanapeAutomation:
+    def __init__(self, project_path: Optional[str] = None):
+        self.app = _dispatch_canape()
+        try:
+            self.app.Measurement.FifoSize = 2048
+            self.app.Measurement.SampleSize = 1024
+        except Exception:
+            pass
+        if project_path is None:
+            project_path = r"C:\Users\Public\Documents\Vector\CANape Examples 21.0\XCPDemo"
+        try:
+            self.app.Open2(project_path, 1, 100000, 0, 0, 1)
+        except Exception:
+            self.app.Open(project_path)
+        time.sleep(2)
+        self.devices: Dict[str, CanapeDevice] = {}
+        self._var_cache: Dict[str, CanapeVariable] = {}
+
+    def add_device(self, name: str, a2l_or_dbc: str, dev_type: str, channel: int = 1) -> CanapeDevice:
+        dev_com = self.app.Devices.Add(name, a2l_or_dbc, dev_type, channel)
+        dev = CanapeDevice(self.app, dev_com, name)
+        self.devices[name] = dev
+        return dev
+
+    def add_xcp_on_dap_ecu(
+        self,
+        name: str,
+        a2l_path: str,
+        channel: int = 1,
+        *,
+        transport: str = "VX1000",
+        serial: str = "",
+        dap_port: int = 1,
+        mcu: str = "AURIX",
+        jtag_clock_hz: int = 10_000_000,
+    ) -> CanapeDevice:
+        dev = self.add_device(name, a2l_path, "XCP", channel)
+        try:
+            dev.dev.Protocol = "XCP"
+        except Exception:
+            pass
+        xcp = getattr(dev.dev, "XCP", None) or getattr(dev.dev, "ProtocolObject", None)
+        if xcp is not None:
+            for prop in ("Transport", "Driver"):
+                try:
+                    setattr(xcp, prop, transport)
+                    break
+                except Exception:
+                    continue
+            vx = getattr(xcp, "VX1000", None)
+            if vx is not None:
+                try:
+                    try:
+                        vx.Device = transport
+                    except Exception:
+                        pass
+                    if serial:
+                        vx.SerialNumber = serial
+                    vx.DapPort = dap_port
+                    vx.MCU = mcu
+                    vx.JtagClockHz = int(jtag_clock_hz)
+                except Exception:
+                    pass
+            else:
+                params = getattr(xcp, "Parameters", None)
+                if params:
+                    def set_param(k, v):
+                        try:
+                            params.Item(k).Value = v
+                        except Exception:
+                            pass
+                    set_param("Transport", transport)
+                    if serial:
+                        set_param("SerialNumber", serial)
+                    set_param("DAPPort", dap_port)
+                    set_param("MCU", mcu)
+                    set_param("JtagClockHz", int(jtag_clock_hz))
+        return dev
+
+    def is_online(self, device_name: str) -> bool:
+        dev = self.devices.get(device_name)
+        if dev is None:
+            try:
+                dev_com = self.app.Project.Devices.Item(device_name)
+            except Exception:
+                return False
+            return _device_is_online(dev_com)
+        return _device_is_online(dev.dev)
+
+    def go_online(self, device_name: str, timeout_s: float = 5.0) -> bool:
+        dev = self.devices.get(device_name)
+        dev_com = dev.dev if dev else None
+        if dev_com is None:
+            try:
+                dev_com = self.app.Project.Devices.Item(device_name)
+            except Exception:
+                return False
+        if _device_is_online(dev_com):
+            return True
+        try:
+            dev_com.GoOnline(False)
+        except Exception:
+            try:
+                dev_com.GoOnline()
+            except Exception:
+                pass
+        end = time.time() + timeout_s
+        while time.time() < end:
+            if _device_is_online(dev_com):
+                return True
+            time.sleep(0.05)
+        return _device_is_online(dev_com)
+
+    def go_online_all(self, reconnect: bool = False):
+        for dev in self.devices.values():
+            try:
+                dev.dev.GoOnline(reconnect)
+            except Exception:
+                pass
+
+    def close(self):
+        try:
+            for dev in self.devices.values():
+                try:
+                    dev.dev.GoOffline()
+                except Exception:
+                    pass
+        finally:
+            try:
+                self.app.Quit()
+            except Exception:
+                pass
+
+    def __getitem__(self, longname: str) -> CanapeVariable:
+        if ":" not in longname:
+            raise ValueError("Use 'Device:Variable'")
+        devname, varname = longname.split(":", 1)
+        if devname not in self.devices:
+            try:
+                dev_com = self.app.Project.Devices.Item(devname)
+                self.devices[devname] = CanapeDevice(self.app, dev_com, devname)
+            except Exception:
+                raise KeyError(f"Device '{devname}' not found.")
+        key = f"{devname}:{varname}"
+        if key in self._var_cache:
+            return self._var_cache[key]
+        var = CanapeVariable(self.app, self.devices[devname].dev, devname, varname)
+        self._var_cache[key] = var
+        return var
+
+    @staticmethod
+    def _normalize_task_signals(
+        signals: Optional[Iterable[Union[str, CanapeVariable]]],
+        kind: str,
+    ) -> List[_TaskSignalRef]:
+        out: List[_TaskSignalRef] = []
+        if not signals:
+            return out
+        for item in signals:
+            if item is None:
+                continue
+            if isinstance(item, CanapeVariable):
+                out.append(_TaskSignalRef(item.device_name, item.varname))
+            elif isinstance(item, str):
+                if ":" not in item:
+                    raise ValueError(f"Invalid {kind} signal '{item}', expected 'Device:Signal'")
+                dev, sig = item.split(":", 1)
+                out.append(_TaskSignalRef(dev, sig))
+            else:
+                raise TypeError(f"{kind}_signals entries must be 'Device:Signal' or CanapeVariable")
+        return out
+
+    # --------------- Recorder Context Manager ---------------
+
+    @contextmanager
+    def recorder(
+        self,
+        *signals: Union[CanapeVariable, str],
+        task: str = "100ms",
+        sampling_time: Optional[int] = 100,
+        mdf_path: Optional[str] = None,
+        vector_signals: Optional[Iterable[Union[str, CanapeVariable]]] = None,
+        vector_task: str = "cyclic",
+        vector_sampling_time: Optional[int] = None,
+        can_signals: Optional[Iterable[Union[str, CanapeVariable]]] = None,
+        can_task: str = "can",
+        can_sampling_time: Optional[int] = None,
+        prefer_raw: bool = False,
+        prefer_enum_numeric: bool = True,
+        normalize_time_zero: bool = True,
+        # Online handling
+        ensure_all_devices_online: bool = True,
+        require_all_online: bool = False,
+        online_timeout_s: float = 5.0,
+        # Isolation settings
+        clear_tasks_before: bool = True,
+        clear_tasks_after: bool = False,
+        disable_global_save2mdf: bool = True,
+        restore_previous_save2mdf: bool = True,
+        # NEW: task clearing specification
+        tasks_to_clear: Optional[Union[str, Iterable[str]]] = None,
+        clear_all_devices_tasks: bool = True,
+        # Time base & measurement
+        reset_time_base: bool = True,
+        start_delay_s: float = 0.05,
+        debug_leak_check: bool = False,
+    ):
+        """
+        tasks_to_clear parameter:
+            None  -> only the tasks this recorder will actually use (task, vector_task, can_task if relevant).
+            "*"   -> clear ALL tasks on (all project devices if clear_all_devices_tasks=True else only used devices).
+            list/iterable of task names -> clear only those names (if they exist) on the chosen devices.
+
+        clear_all_devices_tasks:
+            True  -> apply clearing logic to every device in Project.Devices
+            False -> only to devices used by this recorder run.
+        """
+        # ---- Build variable list ----
+        var_list: List[CanapeVariable] = []
+        for item in signals:
+            if item is None:
+                continue
+            if isinstance(item, CanapeVariable):
+                var_list.append(item)
+            elif isinstance(item, str):
+                var_list.append(self[item])
+            else:
+                raise TypeError("signals must be CanapeVariable or 'Device:Variable' strings.")
+
+        vector_refs = self._normalize_task_signals(vector_signals, "vector")
+        can_refs = self._normalize_task_signals(can_signals, "can")
+
+        if (len(var_list) + len(vector_refs) + len(can_refs)) == 0:
+            raise TypeError("Provide at least one of signals / vector_signals / can_signals.")
+
+        # Collect devices used
+        devices_used: Set[str] = set()
+        for v in var_list: devices_used.add(v.device_name)
+        for r in vector_refs: devices_used.add(r.device_name)
+        for r in can_refs: devices_used.add(r.device_name)
+
+        # Ensure devices exist / add from project if possible
+        for devname in list(devices_used):
+            if devname not in self.devices:
+                try:
+                    dev_com = self.app.Project.Devices.Item(devname)
+                    self.devices[devname] = CanapeDevice(self.app, dev_com, devname)
+                except Exception:
+                    raise KeyError(f"Device '{devname}' not added and not found in project.")
+
+        # Ensure online
+        if ensure_all_devices_online:
+            offline = []
+            for devname in devices_used:
+                dev_com = self.devices[devname].dev
+                if _device_is_online(dev_com):
+                    continue
+                try:
+                    dev_com.GoOnline(False)
+                except Exception:
+                    try:
+                        dev_com.GoOnline()
+                    except Exception:
+                        pass
+                end = time.time() + online_timeout_s
+                while time.time() < end and not _device_is_online(dev_com):
+                    time.sleep(0.05)
+                if not _device_is_online(dev_com):
+                    offline.append(devname)
+            if offline:
+                msg = f"Could not bring devices online: {', '.join(offline)}"
+                if require_all_online:
+                    raise RuntimeError(msg)
+                else:
+                    print("WARN:", msg)
+
+        # Stop any running measurement
+        try:
+            self.app.Measurement.Stop()
+        except Exception:
+            pass
+
+        if reset_time_base:
+            for meth in ("ResetTime","ResetTimeBase","ResetTimeOrigin","ResetMeasurementTime","SetTimeZero"):
+                try:
+                    fn = getattr(self.app.Measurement, meth)
+                    if callable(fn):
+                        fn()
+                except Exception:
+                    pass
+
+        # Prepare sets of tasks used
+        tasks_used_names: Set[str] = set()
+        if var_list: tasks_used_names.add(task)
+        if vector_refs: tasks_used_names.add(vector_task)
+        if can_refs: tasks_used_names.add(can_task)
+
+        # Resolve tasks_to_clear specification
+        wildcard_clear = False
+        tasks_to_clear_spec: Set[str] = set()
+        if tasks_to_clear is None:
+            tasks_to_clear_spec = set(tasks_used_names)
+        elif isinstance(tasks_to_clear, str):
+            if tasks_to_clear.strip() == "*":
+                wildcard_clear = True
+            else:
+                tasks_to_clear_spec.add(tasks_to_clear.strip())
+        else:
+            for tname in tasks_to_clear:
+                if isinstance(tname, str):
+                    if tname.strip() == "*":
+                        wildcard_clear = True
+                    else:
+                        tasks_to_clear_spec.add(tname.strip())
+
+        proj = getattr(self.app, "Project", None)
+        devices_coll = getattr(proj, "Devices", None) if proj else None
+
+        # Decide which devices to operate on for clearing / global operations
+        if clear_all_devices_tasks and devices_coll is not None:
+            # All project devices for clearing/global Save2MDF disable
+            target_devices_for_clearing = []
+            for dev in _iter_collection(devices_coll):
+                try:
+                    dname = dev.Name
+                except Exception:
+                    continue
+                target_devices_for_clearing.append((dname, dev))
+        else:
+            # Only used devices
+            target_devices_for_clearing = []
+            for dname in devices_used:
+                target_devices_for_clearing.append((dname, self.devices[dname].dev))
+
+        # Optional global disable Save2MDF
+        disabled_items: List[Dict[str, Any]] = []
+        if disable_global_save2mdf and devices_coll is not None:
+            for dev in _iter_collection(devices_coll if clear_all_devices_tasks else []):
+                # if not clearing all devices, only disable on used devices
+                if not clear_all_devices_tasks and getattr(dev, "Name", None) not in devices_used:
+                    continue
+                try:
+                    dev_name = dev.Name
+                except Exception:
+                    continue
+                tasks = getattr(dev, "Tasks", None)
+                if tasks is None:
+                    continue
+                for t in _iter_collection(tasks):
+                    try:
+                        tname = t.Name
+                        channels = getattr(t, "Channels", None)
+                        if channels is None:
+                            continue
+                        for ch in _iter_collection(channels):
+                            try:
+                                ch_name = ch.Name
+                                prev = bool(ch.Save2MDF)
+                            except Exception:
+                                continue
+                            try:
+                                ch.Save2MDF = False
+                            except Exception:
+                                pass
+                            disabled_items.append({
+                                'dev_name': dev_name,
+                                'task_name': tname,
+                                'ch_name': ch_name,
+                                'prev_save2mdf': prev
+                            })
+                    except Exception:
+                        pass
+
+        # Clear tasks BEFORE if requested
+        tasks_used_objects: Set[Any] = set()
+        if clear_tasks_before:
+            for dname, dev_com in target_devices_for_clearing:
+                tasks_obj = getattr(dev_com, "Tasks", None)
+                if tasks_obj is None:
+                    continue
+                for t in _iter_collection(tasks_obj):
+                    try:
+                        tname = t.Name
+                    except Exception:
+                        continue
+                    if wildcard_clear or tname in tasks_to_clear_spec:
+                        try:
+                            t.Channels.Clear()
+                        except Exception:
+                            pass
+                    # Track only tasks we will actually attach channels to (for possible after-clearing)
+                    if tname in tasks_used_names:
+                        tasks_used_objects.add(t)
+        else:
+            # even if not clearing tasks, gather objects for used tasks (needed for after-clearing if enabled)
+            for devname in devices_used:
+                dev_com = self.devices[devname].dev
+                for tname in tasks_used_names:
+                    try:
+                        tsk = dev_com.Tasks(tname)
+                        tasks_used_objects.add(tsk)
+                    except Exception:
+                        raise KeyError(f"Task '{tname}' not found on device '{devname}'")
+
+        # Helper to set sampling time
+        def _ensure_task_sampling(dev_com, task_name: str, st: Optional[int]):
+            tsk = dev_com.Tasks(task_name)
+            if st is not None:
+                try:
+                    tsk.SamplingTime = int(st)
+                except Exception:
+                    pass
+            return tsk
+
+        # Track touched channels (for Save2MDF restore)
+        touched_items: List[Dict[str, Any]] = []
+
+        def _add_channel(dev_name: str, task_name: str, ch_name: str, sampling: Optional[int]):
+            dev_com = self.devices[dev_name].dev
+            tsk = _ensure_task_sampling(dev_com, task_name, sampling if task_name in tasks_used_names else None)
+            existed_before = False
+            prev_save = None
+            try:
+                cobj = tsk.Channels(ch_name)
+                existed_before = True
+                try:
+                    prev_save = bool(cobj.Save2MDF)
+                except Exception:
+                    prev_save = None
+                try:
+                    cobj.Save2MDF = True
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    tsk.Channels.Add(ch_name)
+                    try:
+                        tsk.Channels(ch_name).Save2MDF = True
+                    except Exception:
+                        pass
+                except Exception:
+                    try:
+                        tsk.Channels(ch_name).Save2MDF = True
+                        existed_before = True
+                    except Exception:
+                        pass
+            touched_items.append({
+                'dev_name': dev_name,
+                'task_name': task_name,
+                'ch_name': ch_name,
+                'existed_before': existed_before,
+                'prev_save2mdf': prev_save
+            })
+
+        # ECU channels
+        if var_list:
+            by_dev: Dict[str, List[CanapeVariable]] = {}
+            for v in var_list:
+                by_dev.setdefault(v.device_name, []).append(v)
+            for devname, group in by_dev.items():
+                for v in group:
+                    try:
+                        self.devices[devname].dev.CalibrationObjects.Add(v.varname)
+                    except Exception:
+                        pass
+                    _add_channel(devname, task, v.varname, sampling_time)
+
+        # Vector channels
+        if vector_refs:
+            by_dev: Dict[str, List[_TaskSignalRef]] = {}
+            for r in vector_refs:
+                by_dev.setdefault(r.device_name, []).append(r)
+            for devname, group in by_dev.items():
+                for r in group:
+                    _add_channel(devname, vector_task, r.signal_name, vector_sampling_time)
+
+        # CAN channels
+        if can_refs:
+            by_dev: Dict[str, List[_TaskSignalRef]] = {}
+            for r in can_refs:
+                by_dev.setdefault(r.device_name, []).append(r)
+            for devname, group in by_dev.items():
+                for r in group:
+                    _add_channel(devname, can_task, r.signal_name, can_sampling_time)
+
+        # Optional leak check (only meaningful if not clearing first)
+        if debug_leak_check and devices_coll is not None and not clear_tasks_before:
+            touched_keys = {(e['dev_name'], e['task_name'], e['ch_name']) for e in touched_items}
+            leaks = []
+            for dev in _iter_collection(devices_coll):
+                try: dname = dev.Name
+                except Exception: continue
+                tasks = getattr(dev, "Tasks", None)
+                if tasks is None: continue
+                for t in _iter_collection(tasks):
+                    try: tname = t.Name
+                    except Exception: continue
+                    chs = getattr(t, "Channels", None)
+                    if chs is None: continue
+                    for ch in _iter_collection(chs):
+                        try:
+                            cname = ch.Name
+                            s2m = bool(ch.Save2MDF)
+                        except Exception:
+                            continue
+                        if s2m and (dname, tname, cname) not in touched_keys:
+                            leaks.append((dname, tname, cname))
+            if leaks:
+                print("WARN: Non-requested channels still enabled:")
+                for d, tname, c in leaks:
+                    print(f"  {d}.{tname}:{c}")
+
+        # MF4 file path
+        if mdf_path is None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            mdf_path = os.path.abspath(f"canape_recording_{stamp}.mf4")
+        _ensure_parent_dir(mdf_path)
+        if os.path.exists(mdf_path):
+            try:
+                os.remove(mdf_path)
+            except Exception:
+                base, ext = os.path.splitext(mdf_path)
+                mdf_path = f"{base}_{int(time.time())}{ext}"
+
+        # Configure measurement (best-effort)
+        for prop, val in (("AppendToMDF", False), ("OverwriteMDF", True), ("OverwriteMDFFiles", True)):
+            try: setattr(self.app.Measurement, prop, val)
+            except Exception: pass
+        for prop, val in (("UseAbsoluteTime", False),
+                          ("AbsoluteTimeInMDF", False),
+                          ("MDFAbsoluteTime", False),
+                          ("StoreAbsoluteTime", False),
+                          ("TimeMode", "Relative")):
+            try: setattr(self.app.Measurement, prop, val)
+            except Exception: pass
+        try:
+            self.app.Measurement.MDFFilename = mdf_path
+        except Exception:
+            pass
+
+        if start_delay_s > 0:
+            time.sleep(start_delay_s)
+        try:
+            self.app.Measurement.Start()
+        except Exception:
+            pass
+
+        rec = RecorderResult(
+            self.app,
+            var_list=var_list,
+            vector_refs=vector_refs,
+            can_refs=can_refs,
+            mdf_path=mdf_path,
+            prefer_raw=prefer_raw,
+            prefer_enum_numeric=prefer_enum_numeric,
+            normalize_time_zero=normalize_time_zero,
+            touched_items=touched_items,
+            disabled_items=disabled_items,
+            restore_previous_save2mdf=(restore_previous_save2mdf and not clear_tasks_after),
+            clear_tasks_after=clear_tasks_after,
+            tasks_used=tasks_used_objects,
+            tasks_to_clear_spec=tasks_to_clear_spec,
+            wildcard_clear=wildcard_clear,
+            clear_all_devices_tasks=clear_all_devices_tasks
+        )
+        try:
+            yield rec
+        finally:
+            rec.finalize()
