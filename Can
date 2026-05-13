@@ -1,0 +1,568 @@
+"""
+CAN DBC Reader Module
+Reads CAN messages from Vector CAN device using DBC file
+Provides functions to:
+- Read messages by ID or name
+- Extract signal values by signal name
+- Display all signals and values from a message
+"""
+
+import can
+import cantools
+from typing import Dict, Optional, List, Tuple
+from datetime import datetime
+
+
+class CANDBCReader:
+    """Class to read CAN messages using DBC file and Vector CAN device"""
+    
+    def __init__(self, dbc_file_path: str, channel: int = 0, bitrate: int = 500000):
+        """
+        Initialize CAN reader with DBC file
+        
+        Args:
+            dbc_file_path (str): Path to the DBC file
+            channel (int): Vector CAN channel (default: 0)
+            bitrate (int): CAN bus bitrate in bits/sec (default: 500000)
+        
+        Raises:
+            FileNotFoundError: If DBC file not found
+            Exception: If Vector CAN device connection fails
+        """
+        try:
+            self.db = cantools.database.load_file(dbc_file_path)
+            print(f"✓ DBC file loaded: {dbc_file_path}")
+        except FileNotFoundError:
+            raise FileNotFoundError(f"DBC file not found: {dbc_file_path}")
+        
+        try:
+            self.bus = can.Bus(interface='vector', channel=channel, bitrate=bitrate)
+            print(f"✓ Vector CAN bus initialized (Channel: {channel}, Bitrate: {bitrate})")
+        except Exception as e:
+            raise Exception(f"Failed to initialize Vector CAN bus: {e}")
+    
+    # ==================== Message Information Functions ====================
+    
+    def get_message_by_id(self, message_id: int) -> Optional[cantools.db.can.Message]:
+        """
+        Get message object by CAN ID
+        
+        Args:
+            message_id (int): CAN message ID (decimal or hex)
+        
+        Returns:
+            Message object or None if not found
+        """
+        try:
+            return self.db.get_message_by_frame_id(message_id)
+        except KeyError:
+            print(f"⚠️  Message ID {hex(message_id)} not found in DBC")
+            return None
+    
+    def get_message_by_name(self, message_name: str) -> Optional[cantools.db.can.Message]:
+        """
+        Get message object by message name
+        
+        Args:
+            message_name (str): Name of the message
+        
+        Returns:
+            Message object or None if not found
+        """
+        try:
+            return self.db.get_message_by_name(message_name)
+        except KeyError:
+            print(f"⚠️  Message '{message_name}' not found in DBC")
+            return None
+    
+    def list_all_messages(self) -> List[Dict]:
+        """
+        List all messages in DBC file
+        
+        Returns:
+            List of dictionaries with message info
+        """
+        messages_info = []
+        for msg in self.db.messages:
+            messages_info.append({
+                'id': msg.frame_id,
+                'id_hex': hex(msg.frame_id),
+                'name': msg.name,
+                'dlc': msg.length,
+                'signal_count': len(msg.signals)
+            })
+        return messages_info
+    
+    def print_all_messages(self) -> None:
+        """Print all messages in DBC file in formatted table"""
+        print("\n" + "="*80)
+        print(f"{'Message ID':<15} {'Name':<30} {'DLC':<8} {'Signals':<10}")
+        print("="*80)
+        for msg in self.db.messages:
+            print(f"{hex(msg.frame_id):<15} {msg.name:<30} {msg.length:<8} {len(msg.signals):<10}")
+        print("="*80 + "\n")
+    
+    # ==================== Signal Information Functions ====================
+    
+    def get_signals_by_message_id(self, message_id: int) -> Optional[Dict]:
+        """
+        Get all signals and their metadata for a message by ID
+        
+        Args:
+            message_id (int): CAN message ID
+        
+        Returns:
+            Dictionary with signal info or None if message not found
+        """
+        message = self.get_message_by_id(message_id)
+        if not message:
+            return None
+        
+        signals_info = {}
+        for signal in message.signals:
+            signals_info[signal.name] = {
+                'unit': signal.unit,
+                'scale': signal.scale,
+                'offset': signal.offset,
+                'minimum': signal.minimum,
+                'maximum': signal.maximum,
+                'initial': signal.initial,
+                'receivers': signal.receivers
+            }
+        return signals_info
+    
+    def get_signals_by_message_name(self, message_name: str) -> Optional[Dict]:
+        """
+        Get all signals and their metadata for a message by name
+        
+        Args:
+            message_name (str): Name of the message
+        
+        Returns:
+            Dictionary with signal info or None if message not found
+        """
+        message = self.get_message_by_name(message_name)
+        if not message:
+            return None
+        
+        signals_info = {}
+        for signal in message.signals:
+            signals_info[signal.name] = {
+                'unit': signal.unit,
+                'scale': signal.scale,
+                'offset': signal.offset,
+                'minimum': signal.minimum,
+                'maximum': signal.maximum,
+                'initial': signal.initial,
+                'receivers': signal.receivers
+            }
+        return signals_info
+    
+    def print_signals_by_message_id(self, message_id: int) -> None:
+        """
+        Print all signals for a message by ID in formatted table
+        
+        Args:
+            message_id (int): CAN message ID
+        """
+        message = self.get_message_by_id(message_id)
+        if not message:
+            return
+        
+        print("\n" + "="*120)
+        print(f"Message: {message.name} (ID: {hex(message_id)})")
+        print("="*120)
+        print(f"{'Signal Name':<25} {'Unit':<15} {'Scale':<12} {'Offset':<12} {'Min':<12} {'Max':<12}")
+        print("-"*120)
+        for signal in message.signals:
+            print(f"{signal.name:<25} {str(signal.unit):<15} {signal.scale:<12} {signal.offset:<12} {signal.minimum:<12} {signal.maximum:<12}")
+        print("="*120 + "\n")
+    
+    def print_signals_by_message_name(self, message_name: str) -> None:
+        """
+        Print all signals for a message by name in formatted table
+        
+        Args:
+            message_name (str): Name of the message
+        """
+        message = self.get_message_by_name(message_name)
+        if not message:
+            return
+        
+        print("\n" + "="*120)
+        print(f"Message: {message_name} (ID: {hex(message.frame_id)})")
+        print("="*120)
+        print(f"{'Signal Name':<25} {'Unit':<15} {'Scale':<12} {'Offset':<12} {'Min':<12} {'Max':<12}")
+        print("-"*120)
+        for signal in message.signals:
+            print(f"{signal.name:<25} {str(signal.unit):<15} {signal.scale:<12} {signal.offset:<12} {signal.minimum:<12} {signal.maximum:<12}")
+        print("="*120 + "\n")
+    
+    # ==================== Message Reading Functions ====================
+    
+    def read_message_by_id(self, message_id: int, timeout: float = 1.0) -> Optional[Dict]:
+        """
+        Read a message from CAN bus by message ID and get all signal values
+        
+        Args:
+            message_id (int): CAN message ID to read
+            timeout (float): Timeout in seconds (default: 1.0)
+        
+        Returns:
+            Dictionary with:
+                - 'id': Message ID
+                - 'name': Message name
+                - 'rx_time': Timestamp when message was received
+                - 'signals': Dictionary of signal names and values
+            Returns None if message not received or ID not found
+        """
+        message = self.get_message_by_id(message_id)
+        if not message:
+            return None
+        
+        msg = self.bus.recv(timeout=timeout)
+        if msg is None:
+            print(f"⚠️  No message received within {timeout}s timeout")
+            return None
+        
+        if msg.arbitration_id != message_id:
+            print(f"⚠️  Received different message ID: {hex(msg.arbitration_id)}")
+            return None
+        
+        try:
+            decoded_signals = message.decode(msg.data)
+            result = {
+                'id': hex(message_id),
+                'name': message.name,
+                'rx_time': datetime.fromtimestamp(msg.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                'timestamp': msg.timestamp,
+                'dlc': msg.dlc,
+                'signals': decoded_signals
+            }
+            return result
+        except ValueError as e:
+            print(f"⚠️  Error decoding message: {e}")
+            return None
+    
+    def read_message_by_name(self, message_name: str, timeout: float = 1.0) -> Optional[Dict]:
+        """
+        Read a message from CAN bus by message name and get all signal values
+        
+        Args:
+            message_name (str): Name of the message to read
+            timeout (float): Timeout in seconds (default: 1.0)
+        
+        Returns:
+            Dictionary with:
+                - 'id': Message ID
+                - 'name': Message name
+                - 'rx_time': Timestamp when message was received
+                - 'signals': Dictionary of signal names and values
+            Returns None if message not received or name not found
+        """
+        message = self.get_message_by_name(message_name)
+        if not message:
+            return None
+        
+        message_id = message.frame_id
+        
+        msg = self.bus.recv(timeout=timeout)
+        if msg is None:
+            print(f"⚠️  No message received within {timeout}s timeout")
+            return None
+        
+        if msg.arbitration_id != message_id:
+            print(f"⚠️  Received different message ID: {hex(msg.arbitration_id)}")
+            return None
+        
+        try:
+            decoded_signals = message.decode(msg.data)
+            result = {
+                'id': hex(message_id),
+                'name': message_name,
+                'rx_time': datetime.fromtimestamp(msg.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                'timestamp': msg.timestamp,
+                'dlc': msg.dlc,
+                'signals': decoded_signals
+            }
+            return result
+        except ValueError as e:
+            print(f"⚠️  Error decoding message: {e}")
+            return None
+    
+    # ==================== Signal Value Reading Functions ====================
+    
+    def get_signal_value_by_id_and_name(self, message_id: int, signal_name: str, 
+                                       timeout: float = 1.0) -> Optional[Tuple[float, str, datetime]]:
+        """
+        Get a specific signal value by message ID and signal name
+        
+        Args:
+            message_id (int): CAN message ID
+            signal_name (str): Name of the signal
+            timeout (float): Timeout in seconds
+        
+        Returns:
+            Tuple of (signal_value, signal_unit, rx_time)
+            Returns None if signal not found or message not received
+        """
+        message = self.get_message_by_id(message_id)
+        if not message:
+            return None
+        
+        # Verify signal exists
+        try:
+            signal = message.get_signal_by_name(signal_name)
+        except KeyError:
+            print(f"⚠️  Signal '{signal_name}' not found in message {hex(message_id)}")
+            return None
+        
+        msg = self.bus.recv(timeout=timeout)
+        if msg is None:
+            print(f"⚠️  No message received within {timeout}s timeout")
+            return None
+        
+        if msg.arbitration_id != message_id:
+            print(f"⚠️  Received different message ID: {hex(msg.arbitration_id)}")
+            return None
+        
+        try:
+            decoded_signals = message.decode(msg.data)
+            signal_value = decoded_signals.get(signal_name)
+            signal_unit = signal.unit
+            rx_time = datetime.fromtimestamp(msg.timestamp)
+            
+            return (signal_value, signal_unit, rx_time)
+        except (ValueError, KeyError) as e:
+            print(f"⚠️  Error reading signal: {e}")
+            return None
+    
+    def get_signal_value_by_name_and_signal(self, message_name: str, signal_name: str, 
+                                           timeout: float = 1.0) -> Optional[Tuple[float, str, datetime]]:
+        """
+        Get a specific signal value by message name and signal name
+        
+        Args:
+            message_name (str): Name of the message
+            signal_name (str): Name of the signal
+            timeout (float): Timeout in seconds
+        
+        Returns:
+            Tuple of (signal_value, signal_unit, rx_time)
+            Returns None if signal not found or message not received
+        """
+        message = self.get_message_by_name(message_name)
+        if not message:
+            return None
+        
+        # Verify signal exists
+        try:
+            signal = message.get_signal_by_name(signal_name)
+        except KeyError:
+            print(f"⚠️  Signal '{signal_name}' not found in message '{message_name}'")
+            return None
+        
+        message_id = message.frame_id
+        
+        msg = self.bus.recv(timeout=timeout)
+        if msg is None:
+            print(f"⚠️  No message received within {timeout}s timeout")
+            return None
+        
+        if msg.arbitration_id != message_id:
+            print(f"⚠️  Received different message ID: {hex(msg.arbitration_id)}")
+            return None
+        
+        try:
+            decoded_signals = message.decode(msg.data)
+            signal_value = decoded_signals.get(signal_name)
+            signal_unit = signal.unit
+            rx_time = datetime.fromtimestamp(msg.timestamp)
+            
+            return (signal_value, signal_unit, rx_time)
+        except (ValueError, KeyError) as e:
+            print(f"⚠️  Error reading signal: {e}")
+            return None
+    
+    # ==================== Continuous Reading Functions ====================
+    
+    def continuous_read_by_id(self, message_id: int, duration: int = 10, 
+                             print_output: bool = True) -> List[Dict]:
+        """
+        Continuously read a message by ID for specified duration
+        
+        Args:
+            message_id (int): CAN message ID
+            duration (int): Duration to read in seconds
+            print_output (bool): Whether to print results
+        
+        Returns:
+            List of dictionaries with message data
+        """
+        message = self.get_message_by_id(message_id)
+        if not message:
+            return []
+        
+        messages_data = []
+        start_time = datetime.now()
+        
+        print(f"\n📊 Reading message {hex(message_id)} for {duration} seconds...")
+        
+        while (datetime.now() - start_time).total_seconds() < duration:
+            msg = self.bus.recv(timeout=0.1)
+            if msg and msg.arbitration_id == message_id:
+                try:
+                    decoded = message.decode(msg.data)
+                    rx_time = datetime.fromtimestamp(msg.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    
+                    data = {
+                        'rx_time': rx_time,
+                        'signals': decoded
+                    }
+                    messages_data.append(data)
+                    
+                    if print_output:
+                        print(f"[{rx_time}] {decoded}")
+                except ValueError:
+                    pass
+        
+        print(f"✓ Received {len(messages_data)} messages\n")
+        return messages_data
+    
+    def continuous_read_by_name(self, message_name: str, duration: int = 10, 
+                               print_output: bool = True) -> List[Dict]:
+        """
+        Continuously read a message by name for specified duration
+        
+        Args:
+            message_name (str): Name of the message
+            duration (int): Duration to read in seconds
+            print_output (bool): Whether to print results
+        
+        Returns:
+            List of dictionaries with message data
+        """
+        message = self.get_message_by_name(message_name)
+        if not message:
+            return []
+        
+        message_id = message.frame_id
+        messages_data = []
+        start_time = datetime.now()
+        
+        print(f"\n📊 Reading message '{message_name}' for {duration} seconds...")
+        
+        while (datetime.now() - start_time).total_seconds() < duration:
+            msg = self.bus.recv(timeout=0.1)
+            if msg and msg.arbitration_id == message_id:
+                try:
+                    decoded = message.decode(msg.data)
+                    rx_time = datetime.fromtimestamp(msg.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    
+                    data = {
+                        'rx_time': rx_time,
+                        'signals': decoded
+                    }
+                    messages_data.append(data)
+                    
+                    if print_output:
+                        print(f"[{rx_time}] {decoded}")
+                except ValueError:
+                    pass
+        
+        print(f"✓ Received {len(messages_data)} messages\n")
+        return messages_data
+    
+    # ==================== Utility Functions ====================
+    
+    def print_message_data(self, message_data: Dict) -> None:
+        """
+        Print message data in a formatted way
+        
+        Args:
+            message_data (Dict): Message data dictionary from read functions
+        """
+        if not message_data:
+            print("⚠️  No message data to display")
+            return
+        
+        print("\n" + "="*80)
+        print(f"Message Name: {message_data['name']}")
+        print(f"Message ID:   {message_data['id']}")
+        print(f"RX Time:      {message_data['rx_time']}")
+        print(f"DLC:          {message_data['dlc']}")
+        print("="*80)
+        print(f"{'Signal Name':<30} {'Value':<20} {'Unit':<15}")
+        print("-"*80)
+        
+        for signal_name, signal_value in message_data['signals'].items():
+            message = self.get_message_by_name(message_data['name'])
+            signal = message.get_signal_by_name(signal_name)
+            unit = signal.unit
+            print(f"{signal_name:<30} {str(signal_value):<20} {str(unit):<15}")
+        
+        print("="*80 + "\n")
+    
+    def close(self) -> None:
+        """Close CAN bus connection"""
+        try:
+            self.bus.shutdown()
+            print("✓ CAN bus connection closed")
+        except Exception as e:
+            print(f"⚠️  Error closing CAN bus: {e}")
+
+
+# ==================== Example Usage ====================
+
+if __name__ == '__main__':
+    # Initialize CAN reader
+    try:
+        can_reader = CANDBCReader('your_file.dbc', channel=0, bitrate=500000)
+    except Exception as e:
+        print(f"Error: {e}")
+        exit(1)
+    
+    # Example 1: List all messages
+    print("\n### Example 1: List all messages ###")
+    can_reader.print_all_messages()
+    
+    # Example 2: Get signals by message ID (0x123 as example)
+    print("\n### Example 2: Get signals by message ID ###")
+    can_reader.print_signals_by_message_id(0x123)
+    
+    # Example 3: Read message by ID
+    print("\n### Example 3: Read message by ID ###")
+    msg_data = can_reader.read_message_by_id(0x123, timeout=2.0)
+    if msg_data:
+        can_reader.print_message_data(msg_data)
+    
+    # Example 4: Read message by name
+    print("\n### Example 4: Read message by name ###")
+    msg_data = can_reader.read_message_by_name('EngineStatus', timeout=2.0)
+    if msg_data:
+        can_reader.print_message_data(msg_data)
+    
+    # Example 5: Get specific signal value by ID and signal name
+    print("\n### Example 5: Get specific signal value by ID and signal name ###")
+    result = can_reader.get_signal_value_by_id_and_name(0x123, 'RPM', timeout=2.0)
+    if result:
+        value, unit, rx_time = result
+        print(f"Signal: RPM")
+        print(f"Value: {value} {unit}")
+        print(f"RX Time: {rx_time}")
+    
+    # Example 6: Get specific signal value by message name and signal name
+    print("\n### Example 6: Get specific signal value by message name and signal name ###")
+    result = can_reader.get_signal_value_by_name_and_signal('EngineStatus', 'Speed', timeout=2.0)
+    if result:
+        value, unit, rx_time = result
+        print(f"Signal: Speed")
+        print(f"Value: {value} {unit}")
+        print(f"RX Time: {rx_time}")
+    
+    # Example 7: Continuous read
+    print("\n### Example 7: Continuous read by message ID ###")
+    messages = can_reader.continuous_read_by_id(0x123, duration=5, print_output=True)
+    
+    # Close connection
+    can_reader.close()
