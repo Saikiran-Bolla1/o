@@ -1,509 +1,778 @@
 """
-CAN DBC Reader Module
-Reads CAN messages from Vector CAN device using DBC file
-Provides functions to:
-- Read messages by ID or name
-- Extract signal values by signal name
-- Display all signals and values from a message
+CAN/J1939 DBC Reader Module with PGN Support
+Handles reading CAN messages using PGN (Parameter Group Number) from J1939 protocol
+Priority and Source Address may vary - all matching messages are captured
 """
 
 import can
 import cantools
-from typing import Dict, Optional, List, Tuple
 from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Any
+import struct
+import time
 
 
-class CANDBCReader:
-    """Class to read CAN messages using DBC file and Vector CAN device"""
+class PGNDBC:
+    """
+    Helper class to extract PGN information from CAN messages
+    J1939 Frame Format: Priority (3 bits) | Reserved (1 bit) | Data Page (1 bit) | PDU Format (8 bits) | PDU Specific (8 bits) | Source Address (8 bits)
+    """
     
-    def __init__(self, dbc_file_path: str, channel: int = 0, bitrate: int = 500000):
+    @staticmethod
+    def extract_pgn_from_can_id(can_id: int) -> Tuple[int, int, int]:
         """
-        Initialize CAN reader with DBC file
+        Extract PGN, Priority, and Source Address from 29-bit CAN ID (J1939)
         
         Args:
-            dbc_file_path (str): Path to the DBC file
-            channel (int): Vector CAN channel (default: 0)
-            bitrate (int): CAN bus bitrate in bits/sec (default: 500000)
+            can_id: 29-bit CAN identifier
+            
+        Returns:
+            Tuple of (pgn, priority, source_address)
+        """
+        priority = (can_id >> 26) & 0x07  # Bits 28-26
+        reserved = (can_id >> 25) & 0x01  # Bit 25
+        data_page = (can_id >> 24) & 0x01  # Bit 24
+        pdu_format = (can_id >> 16) & 0xFF  # Bits 23-16
+        pdu_specific = (can_id >> 8) & 0xFF  # Bits 15-8
+        source_address = can_id & 0xFF  # Bits 7-0
         
-        Raises:
-            FileNotFoundError: If DBC file not found
-            Exception: If Vector CAN device connection fails
+        # PGN calculation
+        if pdu_format < 240:  # PDU1 format
+            pgn = (pdu_format << 8) | 0x00  # PS byte is 0 for PDU1
+        else:  # PDU2 format
+            pgn = (pdu_format << 8) | pdu_specific
+        
+        return pgn, priority, source_address
+    
+    @staticmethod
+    def create_can_id_from_pgn(pgn: int, priority: int = 6, source_address: int = 0) -> int:
+        """
+        Create 29-bit CAN ID from PGN, Priority, and Source Address
+        
+        Args:
+            pgn: Parameter Group Number
+            priority: Priority (0-7, default 6)
+            source_address: Source Address (0-255, default 0)
+            
+        Returns:
+            29-bit CAN identifier
+        """
+        priority = priority & 0x07
+        pdu_format = (pgn >> 8) & 0xFF
+        pdu_specific = pgn & 0xFF
+        source_address = source_address & 0xFF
+        
+        can_id = (priority << 26) | (0 << 25) | (0 << 24) | (pdu_format << 16) | (pdu_specific << 8) | source_address
+        return can_id
+
+
+class CANDBCReaderPGN:
+    """
+    CAN DBC Reader with PGN support for J1939 protocol
+    Reads CAN messages using PGN and handles variable priority and source addresses
+    """
+    
+    def __init__(self, dbc_file: str, channel: int = 0, bitrate: int = 500000, 
+                 is_j1939: bool = True, interface: str = 'vector'):
+        """
+        Initialize CAN DBC Reader with PGN support
+        
+        Args:
+            dbc_file: Path to DBC file
+            channel: CAN channel (default 0)
+            bitrate: CAN bitrate (default 500000)
+            is_j1939: Enable J1939/PGN mode (default True)
+            interface: CAN interface type (default 'vector')
         """
         try:
-            self.db = cantools.database.load_file(dbc_file_path)
-            print(f"✓ DBC file loaded: {dbc_file_path}")
-        except FileNotFoundError:
-            raise FileNotFoundError(f"DBC file not found: {dbc_file_path}")
+            self.db = cantools.database.load_file(dbc_file)
+            print(f"✓ DBC file loaded: {dbc_file}")
+        except Exception as e:
+            print(f"✗ Failed to load DBC file: {e}")
+            raise
         
         try:
-            self.bus = can.Bus(interface='vector', channel=channel, bitrate=bitrate)
-            print(f"✓ Vector CAN bus initialized (Channel: {channel}, Bitrate: {bitrate})")
+            self.bus = can.Bus(interface=interface, channel=channel, bitrate=bitrate)
+            print(f"✓ CAN bus initialized: {interface}, Channel: {channel}, Bitrate: {bitrate}")
         except Exception as e:
-            raise Exception(f"Failed to initialize Vector CAN bus: {e}")
+            print(f"✗ Failed to initialize CAN bus: {e}")
+            raise
+        
+        self.is_j1939 = is_j1939
+        self.pgn_to_messages = self._build_pgn_map()
     
-    # ==================== Message Information Functions ====================
+    def _build_pgn_map(self) -> Dict[int, List[Dict[str, Any]]]:
+        """
+        Build a mapping of PGN to all matching messages in DBC
+        
+        Returns:
+            Dictionary mapping PGN -> List of message info dicts
+        """
+        pgn_map = {}
+        
+        for message in self.db.messages:
+            if self.is_j1939:
+                # Extract PGN from message frame_id
+                pgn, priority, source = PGNDBC.extract_pgn_from_can_id(message.frame_id)
+            else:
+                # For non-J1939, use frame_id as PGN
+                pgn = message.frame_id
+                priority = 0
+                source = 0
+            
+            if pgn not in pgn_map:
+                pgn_map[pgn] = []
+            
+            pgn_map[pgn].append({
+                'message': message,
+                'pgn': pgn,
+                'priority': priority,
+                'source_address': source,
+                'frame_id': message.frame_id,
+                'name': message.name
+            })
+        
+        return pgn_map
+    
+    # ================== Message Lookup Functions ==================
+    
+    def get_message_by_pgn(self, pgn: int) -> List[Dict[str, Any]]:
+        """
+        Get all messages matching a PGN
+        
+        Args:
+            pgn: Parameter Group Number
+            
+        Returns:
+            List of message info dictionaries
+        """
+        return self.pgn_to_messages.get(pgn, [])
     
     def get_message_by_id(self, message_id: int) -> Optional[cantools.db.can.Message]:
         """
-        Get message object by CAN ID
+        Get message by CAN frame ID
         
         Args:
-            message_id (int): CAN message ID (decimal or hex)
-        
+            message_id: CAN frame ID
+            
         Returns:
-            Message object or None if not found
+            Message object or None
         """
-        try:
-            return self.db.get_message_by_frame_id(message_id)
-        except KeyError:
-            print(f"⚠️  Message ID {hex(message_id)} not found in DBC")
-            return None
+        return self.db.get_message_by_frame_id(message_id)
     
     def get_message_by_name(self, message_name: str) -> Optional[cantools.db.can.Message]:
         """
-        Get message object by message name
+        Get message by name
         
         Args:
-            message_name (str): Name of the message
-        
+            message_name: Message name
+            
         Returns:
-            Message object or None if not found
+            Message object or None
         """
         try:
             return self.db.get_message_by_name(message_name)
         except KeyError:
-            print(f"⚠️  Message '{message_name}' not found in DBC")
             return None
     
-    def list_all_messages(self) -> List[Dict]:
+    # ================== List/Print Functions ==================
+    
+    def list_all_messages(self) -> List[Dict[str, Any]]:
         """
-        List all messages in DBC file
+        List all messages in DBC
         
         Returns:
-            List of dictionaries with message info
+            List of message dictionaries with PGN info
         """
-        messages_info = []
-        for msg in self.db.messages:
-            messages_info.append({
-                'id': msg.frame_id,
-                'id_hex': hex(msg.frame_id),
-                'name': msg.name,
-                'dlc': msg.length,
-                'signal_count': len(msg.signals)
-            })
-        return messages_info
-    
-    def print_all_messages(self) -> None:
-        """Print all messages in DBC file in formatted table"""
-        print("\n" + "="*80)
-        print(f"{'Message ID':<15} {'Name':<30} {'DLC':<8} {'Signals':<10}")
-        print("="*80)
-        for msg in self.db.messages:
-            print(f"{hex(msg.frame_id):<15} {msg.name:<30} {msg.length:<8} {len(msg.signals):<10}")
-        print("="*80 + "\n")
-    
-    # ==================== Signal Information Functions ====================
-    
-    def get_signals_by_message_id(self, message_id: int) -> Optional[Dict]:
-        """
-        Get all signals and their metadata for a message by ID
-        
-        Args:
-            message_id (int): CAN message ID
-        
-        Returns:
-            Dictionary with signal info or None if message not found
-        """
-        message = self.get_message_by_id(message_id)
-        if not message:
-            return None
-        
-        signals_info = {}
-        for signal in message.signals:
-            signals_info[signal.name] = {
-                'unit': signal.unit,
-                'scale': signal.scale,
-                'offset': signal.offset,
-                'minimum': signal.minimum,
-                'maximum': signal.maximum,
-                'initial': signal.initial,
-                'receivers': signal.receivers
-            }
-        return signals_info
-    
-    def get_signals_by_message_name(self, message_name: str) -> Optional[Dict]:
-        """
-        Get all signals and their metadata for a message by name
-        
-        Args:
-            message_name (str): Name of the message
-        
-        Returns:
-            Dictionary with signal info or None if message not found
-        """
-        message = self.get_message_by_name(message_name)
-        if not message:
-            return None
-        
-        signals_info = {}
-        for signal in message.signals:
-            signals_info[signal.name] = {
-                'unit': signal.unit,
-                'scale': signal.scale,
-                'offset': signal.offset,
-                'minimum': signal.minimum,
-                'maximum': signal.maximum,
-                'initial': signal.initial,
-                'receivers': signal.receivers
-            }
-        return signals_info
-    
-    def print_signals_by_message_id(self, message_id: int) -> None:
-        """
-        Print all signals for a message by ID in formatted table
-        
-        Args:
-            message_id (int): CAN message ID
-        """
-        message = self.get_message_by_id(message_id)
-        if not message:
-            return
-        
-        print("\n" + "="*120)
-        print(f"Message: {message.name} (ID: {hex(message_id)})")
-        print("="*120)
-        print(f"{'Signal Name':<25} {'Unit':<15} {'Scale':<12} {'Offset':<12} {'Min':<12} {'Max':<12}")
-        print("-"*120)
-        for signal in message.signals:
-            print(f"{signal.name:<25} {str(signal.unit):<15} {signal.scale:<12} {signal.offset:<12} {signal.minimum:<12} {signal.maximum:<12}")
-        print("="*120 + "\n")
-    
-    def print_signals_by_message_name(self, message_name: str) -> None:
-        """
-        Print all signals for a message by name in formatted table
-        
-        Args:
-            message_name (str): Name of the message
-        """
-        message = self.get_message_by_name(message_name)
-        if not message:
-            return
-        
-        print("\n" + "="*120)
-        print(f"Message: {message_name} (ID: {hex(message.frame_id)})")
-        print("="*120)
-        print(f"{'Signal Name':<25} {'Unit':<15} {'Scale':<12} {'Offset':<12} {'Min':<12} {'Max':<12}")
-        print("-"*120)
-        for signal in message.signals:
-            print(f"{signal.name:<25} {str(signal.unit):<15} {signal.scale:<12} {signal.offset:<12} {signal.minimum:<12} {signal.maximum:<12}")
-        print("="*120 + "\n")
-    
-    # ==================== Message Reading Functions ====================
-    
-    def read_message_by_id(self, message_id: int, timeout: float = 1.0) -> Optional[Dict]:
-        """
-        Read a message from CAN bus by message ID and get all signal values
-        
-        Args:
-            message_id (int): CAN message ID to read
-            timeout (float): Timeout in seconds (default: 1.0)
-        
-        Returns:
-            Dictionary with:
-                - 'id': Message ID
-                - 'name': Message name
-                - 'rx_time': Timestamp when message was received
-                - 'signals': Dictionary of signal names and values
-            Returns None if message not received or ID not found
-        """
-        message = self.get_message_by_id(message_id)
-        if not message:
-            return None
-        
-        msg = self.bus.recv(timeout=timeout)
-        if msg is None:
-            print(f"⚠️  No message received within {timeout}s timeout")
-            return None
-        
-        if msg.arbitration_id != message_id:
-            print(f"⚠️  Received different message ID: {hex(msg.arbitration_id)}")
-            return None
-        
-        try:
-            decoded_signals = message.decode(msg.data)
-            result = {
-                'id': hex(message_id),
-                'name': message.name,
-                'rx_time': datetime.fromtimestamp(msg.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
-                'timestamp': msg.timestamp,
-                'dlc': msg.dlc,
-                'signals': decoded_signals
-            }
-            return result
-        except ValueError as e:
-            print(f"⚠️  Error decoding message: {e}")
-            return None
-    
-    def read_message_by_name(self, message_name: str, timeout: float = 1.0) -> Optional[Dict]:
-        """
-        Read a message from CAN bus by message name and get all signal values
-        
-        Args:
-            message_name (str): Name of the message to read
-            timeout (float): Timeout in seconds (default: 1.0)
-        
-        Returns:
-            Dictionary with:
-                - 'id': Message ID
-                - 'name': Message name
-                - 'rx_time': Timestamp when message was received
-                - 'signals': Dictionary of signal names and values
-            Returns None if message not received or name not found
-        """
-        message = self.get_message_by_name(message_name)
-        if not message:
-            return None
-        
-        message_id = message.frame_id
-        
-        msg = self.bus.recv(timeout=timeout)
-        if msg is None:
-            print(f"⚠️  No message received within {timeout}s timeout")
-            return None
-        
-        if msg.arbitration_id != message_id:
-            print(f"⚠️  Received different message ID: {hex(msg.arbitration_id)}")
-            return None
-        
-        try:
-            decoded_signals = message.decode(msg.data)
-            result = {
-                'id': hex(message_id),
-                'name': message_name,
-                'rx_time': datetime.fromtimestamp(msg.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
-                'timestamp': msg.timestamp,
-                'dlc': msg.dlc,
-                'signals': decoded_signals
-            }
-            return result
-        except ValueError as e:
-            print(f"⚠️  Error decoding message: {e}")
-            return None
-    
-    # ==================== Signal Value Reading Functions ====================
-    
-    def get_signal_value_by_id_and_name(self, message_id: int, signal_name: str, 
-                                       timeout: float = 1.0) -> Optional[Tuple[float, str, datetime]]:
-        """
-        Get a specific signal value by message ID and signal name
-        
-        Args:
-            message_id (int): CAN message ID
-            signal_name (str): Name of the signal
-            timeout (float): Timeout in seconds
-        
-        Returns:
-            Tuple of (signal_value, signal_unit, rx_time)
-            Returns None if signal not found or message not received
-        """
-        message = self.get_message_by_id(message_id)
-        if not message:
-            return None
-        
-        # Verify signal exists
-        try:
-            signal = message.get_signal_by_name(signal_name)
-        except KeyError:
-            print(f"⚠️  Signal '{signal_name}' not found in message {hex(message_id)}")
-            return None
-        
-        msg = self.bus.recv(timeout=timeout)
-        if msg is None:
-            print(f"⚠️  No message received within {timeout}s timeout")
-            return None
-        
-        if msg.arbitration_id != message_id:
-            print(f"⚠️  Received different message ID: {hex(msg.arbitration_id)}")
-            return None
-        
-        try:
-            decoded_signals = message.decode(msg.data)
-            signal_value = decoded_signals.get(signal_name)
-            signal_unit = signal.unit
-            rx_time = datetime.fromtimestamp(msg.timestamp)
+        messages_list = []
+        for message in self.db.messages:
+            if self.is_j1939:
+                pgn, priority, source = PGNDBC.extract_pgn_from_can_id(message.frame_id)
+            else:
+                pgn = message.frame_id
+                priority = 0
+                source = 0
             
-            return (signal_value, signal_unit, rx_time)
-        except (ValueError, KeyError) as e:
-            print(f"⚠️  Error reading signal: {e}")
+            messages_list.append({
+                'name': message.name,
+                'frame_id': hex(message.frame_id),
+                'pgn': hex(pgn) if self.is_j1939 else pgn,
+                'priority': priority if self.is_j1939 else 'N/A',
+                'source_address': source if self.is_j1939 else 'N/A',
+                'dlc': message.length,
+                'signals': len(message.signals)
+            })
+        return messages_list
+    
+    def print_all_messages(self):
+        """Print all messages in formatted table"""
+        messages = self.list_all_messages()
+        print("\n" + "="*120)
+        print(f"{'Message Name':<30} {'Frame ID':<12} {'PGN':<12} {'Priority':<10} {'Source':<10} {'DLC':<5} {'Signals':<8}")
+        print("="*120)
+        for msg in messages:
+            print(f"{msg['name']:<30} {msg['frame_id']:<12} {msg['pgn']:<12} {str(msg['priority']):<10} {str(msg['source_address']):<10} {msg['dlc']:<5} {msg['signals']:<8}")
+        print("="*120 + "\n")
+    
+    def print_signals_by_pgn(self, pgn: int):
+        """
+        Print all signals for messages matching a PGN
+        
+        Args:
+            pgn: Parameter Group Number
+        """
+        messages = self.get_message_by_pgn(pgn)
+        if not messages:
+            print(f"✗ No messages found for PGN: {hex(pgn)}")
+            return
+        
+        print(f"\n{'='*100}")
+        print(f"PGN: {hex(pgn)} - Found {len(messages)} message(s)")
+        print(f"{'='*100}")
+        
+        for msg_info in messages:
+            message = msg_info['message']
+            print(f"\nMessage: {message.name} | Frame ID: {hex(message.frame_id)} | Priority: {msg_info['priority']} | Source: {msg_info['source_address']}")
+            print(f"{'-'*100}")
+            print(f"{'Signal Name':<30} {'Unit':<15} {'Scale':<12} {'Offset':<12} {'Min':<15} {'Max':<15}")
+            print(f"{'-'*100}")
+            
+            for signal in message.signals:
+                print(f"{signal.name:<30} {str(signal.unit):<15} {str(signal.scale):<12} {str(signal.offset):<12} {str(signal.minimum):<15} {str(signal.maximum):<15}")
+            print(f"{'='*100}\n")
+    
+    def print_signals_by_message_id(self, message_id: int):
+        """
+        Print all signals for a message by ID
+        
+        Args:
+            message_id: CAN frame ID
+        """
+        message = self.get_message_by_id(message_id)
+        if not message:
+            print(f"✗ No message found for ID: {hex(message_id)}")
+            return
+        
+        if self.is_j1939:
+            pgn, priority, source = PGNDBC.extract_pgn_from_can_id(message_id)
+        else:
+            pgn = message_id
+            priority = 0
+            source = 0
+        
+        print(f"\n{'='*100}")
+        print(f"Message: {message.name} | Frame ID: {hex(message_id)} | PGN: {hex(pgn)} | Priority: {priority} | Source: {source}")
+        print(f"{'-'*100}")
+        print(f"{'Signal Name':<30} {'Unit':<15} {'Scale':<12} {'Offset':<12} {'Min':<15} {'Max':<15}")
+        print(f"{'-'*100}")
+        
+        for signal in message.signals:
+            print(f"{signal.name:<30} {str(signal.unit):<15} {str(signal.scale):<12} {str(signal.offset):<12} {str(signal.minimum):<15} {str(signal.maximum):<15}")
+        print(f"{'='*100}\n")
+    
+    # ================== Read Message Functions ==================
+    
+    def read_message_by_pgn(self, pgn: int, timeout: float = 1.0, 
+                           specific_priority: Optional[int] = None, 
+                           specific_source: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """
+        Read CAN message by PGN from bus
+        Priority and Source address may vary - captures first matching message
+        
+        Args:
+            pgn: Parameter Group Number to listen for
+            timeout: Read timeout in seconds
+            specific_priority: Filter by specific priority (optional)
+            specific_source: Filter by specific source address (optional)
+            
+        Returns:
+            Dictionary with message data or None
+            {
+                'pgn': pgn,
+                'name': message_name,
+                'frame_id': frame_id,
+                'priority': priority,
+                'source_address': source_address,
+                'rx_time': datetime,
+                'signals': {signal_name: value, ...}
+            }
+        """
+        start_time = time.time()
+        expected_messages = self.get_message_by_pgn(pgn)
+        
+        if not expected_messages:
+            print(f"✗ PGN {hex(pgn)} not found in DBC")
             return None
+        
+        while time.time() - start_time < timeout:
+            try:
+                msg = self.bus.recv(timeout=0.1)
+                if msg is None:
+                    continue
+                
+                if self.is_j1939:
+                    msg_pgn, msg_priority, msg_source = PGNDBC.extract_pgn_from_can_id(msg.arbitration_id)
+                else:
+                    msg_pgn = msg.arbitration_id
+                    msg_priority = 0
+                    msg_source = 0
+                
+                # Check if PGN matches
+                if msg_pgn != pgn:
+                    continue
+                
+                # Check optional filters
+                if specific_priority is not None and msg_priority != specific_priority:
+                    continue
+                if specific_source is not None and msg_source != specific_source:
+                    continue
+                
+                # Decode message
+                try:
+                    message = self.get_message_by_id(msg.arbitration_id)
+                    if not message:
+                        # Try to find any message with matching PGN
+                        message = expected_messages[0]['message']
+                    
+                    decoded_signals = message.decode(msg.data)
+                    
+                    return {
+                        'pgn': hex(pgn),
+                        'name': message.name,
+                        'frame_id': hex(msg.arbitration_id),
+                        'priority': msg_priority if self.is_j1939 else 'N/A',
+                        'source_address': msg_source if self.is_j1939 else 'N/A',
+                        'rx_time': datetime.now(),
+                        'signals': decoded_signals
+                    }
+                except Exception as e:
+                    print(f"⚠️  Decode error: {e}")
+                    continue
+                    
+            except Exception as e:
+                continue
+        
+        return None
+    
+    def read_message_by_id(self, message_id: int, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
+        """
+        Read CAN message by specific frame ID
+        
+        Args:
+            message_id: CAN frame ID
+            timeout: Read timeout in seconds
+            
+        Returns:
+            Dictionary with message data or None
+        """
+        message = self.get_message_by_id(message_id)
+        if not message:
+            print(f"✗ Message ID {hex(message_id)} not found in DBC")
+            return None
+        
+        if self.is_j1939:
+            pgn, priority, source = PGNDBC.extract_pgn_from_can_id(message_id)
+        else:
+            pgn = message_id
+            priority = 0
+            source = 0
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                msg = self.bus.recv(timeout=0.1)
+                if msg is None:
+                    continue
+                
+                # Check if frame ID matches exactly
+                if msg.arbitration_id != message_id:
+                    continue
+                
+                try:
+                    decoded_signals = message.decode(msg.data)
+                    
+                    return {
+                        'pgn': hex(pgn),
+                        'name': message.name,
+                        'frame_id': hex(message_id),
+                        'priority': priority if self.is_j1939 else 'N/A',
+                        'source_address': source if self.is_j1939 else 'N/A',
+                        'rx_time': datetime.now(),
+                        'signals': decoded_signals
+                    }
+                except Exception as e:
+                    print(f"⚠️  Decode error: {e}")
+                    continue
+                    
+            except Exception as e:
+                continue
+        
+        return None
+    
+    def read_message_by_name(self, message_name: str, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
+        """
+        Read CAN message by message name
+        
+        Args:
+            message_name: Message name
+            timeout: Read timeout in seconds
+            
+        Returns:
+            Dictionary with message data or None
+        """
+        message = self.get_message_by_name(message_name)
+        if not message:
+            print(f"✗ Message '{message_name}' not found in DBC")
+            return None
+        
+        if self.is_j1939:
+            pgn, priority, source = PGNDBC.extract_pgn_from_can_id(message.frame_id)
+        else:
+            pgn = message.frame_id
+            priority = 0
+            source = 0
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                msg = self.bus.recv(timeout=0.1)
+                if msg is None:
+                    continue
+                
+                # Check if frame ID matches
+                if msg.arbitration_id != message.frame_id:
+                    continue
+                
+                try:
+                    decoded_signals = message.decode(msg.data)
+                    
+                    return {
+                        'pgn': hex(pgn),
+                        'name': message_name,
+                        'frame_id': hex(message.frame_id),
+                        'priority': priority if self.is_j1939 else 'N/A',
+                        'source_address': source if self.is_j1939 else 'N/A',
+                        'rx_time': datetime.now(),
+                        'signals': decoded_signals
+                    }
+                except Exception as e:
+                    print(f"⚠️  Decode error: {e}")
+                    continue
+                    
+            except Exception as e:
+                continue
+        
+        return None
+    
+    # ================== Read Signal Functions ==================
+    
+    def get_signal_value_by_pgn_and_signal(self, pgn: int, signal_name: str, 
+                                          timeout: float = 1.0,
+                                          specific_priority: Optional[int] = None,
+                                          specific_source: Optional[int] = None) -> Optional[Tuple[Any, str, datetime, int, int]]:
+        """
+        Get specific signal value by PGN and signal name
+        
+        Args:
+            pgn: Parameter Group Number
+            signal_name: Signal name
+            timeout: Read timeout in seconds
+            specific_priority: Filter by specific priority (optional)
+            specific_source: Filter by specific source address (optional)
+            
+        Returns:
+            Tuple of (signal_value, unit, rx_time, priority, source_address) or None
+        """
+        msg_data = self.read_message_by_pgn(pgn, timeout, specific_priority, specific_source)
+        if msg_data is None:
+            print(f"✗ Failed to read PGN {hex(pgn)}")
+            return None
+        
+        signals = msg_data['signals']
+        if signal_name not in signals:
+            print(f"✗ Signal '{signal_name}' not found in message")
+            return None
+        
+        # Get signal unit
+        message = self.get_message_by_id(int(msg_data['frame_id'], 16))
+        signal = message.get_signal_by_name(signal_name)
+        unit = signal.unit if signal else 'N/A'
+        
+        priority = msg_data['priority']
+        source = msg_data['source_address']
+        
+        return signals[signal_name], unit, msg_data['rx_time'], priority, source
+    
+    def get_signal_value_by_id_and_signal(self, message_id: int, signal_name: str, 
+                                         timeout: float = 1.0) -> Optional[Tuple[Any, str, datetime]]:
+        """
+        Get specific signal value by message ID and signal name
+        
+        Args:
+            message_id: CAN frame ID
+            signal_name: Signal name
+            timeout: Read timeout in seconds
+            
+        Returns:
+            Tuple of (signal_value, unit, rx_time) or None
+        """
+        msg_data = self.read_message_by_id(message_id, timeout)
+        if msg_data is None:
+            print(f"✗ Failed to read message ID {hex(message_id)}")
+            return None
+        
+        signals = msg_data['signals']
+        if signal_name not in signals:
+            print(f"✗ Signal '{signal_name}' not found in message")
+            return None
+        
+        # Get signal unit
+        message = self.get_message_by_id(message_id)
+        signal = message.get_signal_by_name(signal_name)
+        unit = signal.unit if signal else 'N/A'
+        
+        return signals[signal_name], unit, msg_data['rx_time']
     
     def get_signal_value_by_name_and_signal(self, message_name: str, signal_name: str, 
-                                           timeout: float = 1.0) -> Optional[Tuple[float, str, datetime]]:
+                                           timeout: float = 1.0) -> Optional[Tuple[Any, str, datetime]]:
         """
-        Get a specific signal value by message name and signal name
+        Get specific signal value by message name and signal name
         
         Args:
-            message_name (str): Name of the message
-            signal_name (str): Name of the signal
-            timeout (float): Timeout in seconds
-        
-        Returns:
-            Tuple of (signal_value, signal_unit, rx_time)
-            Returns None if signal not found or message not received
-        """
-        message = self.get_message_by_name(message_name)
-        if not message:
-            return None
-        
-        # Verify signal exists
-        try:
-            signal = message.get_signal_by_name(signal_name)
-        except KeyError:
-            print(f"⚠️  Signal '{signal_name}' not found in message '{message_name}'")
-            return None
-        
-        message_id = message.frame_id
-        
-        msg = self.bus.recv(timeout=timeout)
-        if msg is None:
-            print(f"⚠️  No message received within {timeout}s timeout")
-            return None
-        
-        if msg.arbitration_id != message_id:
-            print(f"⚠️  Received different message ID: {hex(msg.arbitration_id)}")
-            return None
-        
-        try:
-            decoded_signals = message.decode(msg.data)
-            signal_value = decoded_signals.get(signal_name)
-            signal_unit = signal.unit
-            rx_time = datetime.fromtimestamp(msg.timestamp)
+            message_name: Message name
+            signal_name: Signal name
+            timeout: Read timeout in seconds
             
-            return (signal_value, signal_unit, rx_time)
-        except (ValueError, KeyError) as e:
-            print(f"⚠️  Error reading signal: {e}")
-            return None
-    
-    # ==================== Continuous Reading Functions ====================
-    
-    def continuous_read_by_id(self, message_id: int, duration: int = 10, 
-                             print_output: bool = True) -> List[Dict]:
+        Returns:
+            Tuple of (signal_value, unit, rx_time) or None
         """
-        Continuously read a message by ID for specified duration
+        msg_data = self.read_message_by_name(message_name, timeout)
+        if msg_data is None:
+            print(f"✗ Failed to read message '{message_name}'")
+            return None
+        
+        signals = msg_data['signals']
+        if signal_name not in signals:
+            print(f"✗ Signal '{signal_name}' not found in message")
+            return None
+        
+        # Get signal unit
+        message = self.get_message_by_name(message_name)
+        signal = message.get_signal_by_name(signal_name)
+        unit = signal.unit if signal else 'N/A'
+        
+        return signals[signal_name], unit, msg_data['rx_time']
+    
+    # ================== Continuous Read Functions ==================
+    
+    def continuous_read_by_pgn(self, pgn: int, duration: float = 10.0,
+                              specific_priority: Optional[int] = None,
+                              specific_source: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Read CAN message by PGN continuously for specified duration
+        Captures all messages with matching PGN (priority and source may vary)
         
         Args:
-            message_id (int): CAN message ID
-            duration (int): Duration to read in seconds
-            print_output (bool): Whether to print results
-        
+            pgn: Parameter Group Number
+            duration: Duration in seconds
+            specific_priority: Filter by specific priority (optional)
+            specific_source: Filter by specific source address (optional)
+            
         Returns:
-            List of dictionaries with message data
+            List of message dictionaries with timestamps
         """
+        messages = []
+        start_time = time.time()
+        expected_messages = self.get_message_by_pgn(pgn)
+        
+        if not expected_messages:
+            print(f"✗ PGN {hex(pgn)} not found in DBC")
+            return messages
+        
+        print(f"📡 Reading PGN {hex(pgn)} for {duration} seconds...")
+        
+        while time.time() - start_time < duration:
+            try:
+                msg = self.bus.recv(timeout=0.1)
+                if msg is None:
+                    continue
+                
+                if self.is_j1939:
+                    msg_pgn, msg_priority, msg_source = PGNDBC.extract_pgn_from_can_id(msg.arbitration_id)
+                else:
+                    msg_pgn = msg.arbitration_id
+                    msg_priority = 0
+                    msg_source = 0
+                
+                # Check if PGN matches
+                if msg_pgn != pgn:
+                    continue
+                
+                # Check optional filters
+                if specific_priority is not None and msg_priority != specific_priority:
+                    continue
+                if specific_source is not None and msg_source != specific_source:
+                    continue
+                
+                try:
+                    message = self.get_message_by_id(msg.arbitration_id)
+                    if not message:
+                        message = expected_messages[0]['message']
+                    
+                    decoded_signals = message.decode(msg.data)
+                    
+                    messages.append({
+                        'pgn': hex(pgn),
+                        'name': message.name,
+                        'frame_id': hex(msg.arbitration_id),
+                        'priority': msg_priority if self.is_j1939 else 'N/A',
+                        'source_address': msg_source if self.is_j1939 else 'N/A',
+                        'rx_time': datetime.now(),
+                        'signals': decoded_signals
+                    })
+                    print(f"✓ Received: {message.name} (Priority: {msg_priority}, Source: {msg_source})")
+                    
+                except Exception as e:
+                    print(f"⚠️  Decode error: {e}")
+                    continue
+                    
+            except Exception as e:
+                continue
+        
+        print(f"📊 Captured {len(messages)} message(s)\n")
+        return messages
+    
+    def continuous_read_by_id(self, message_id: int, duration: float = 10.0) -> List[Dict[str, Any]]:
+        """
+        Read CAN message by specific frame ID continuously
+        
+        Args:
+            message_id: CAN frame ID
+            duration: Duration in seconds
+            
+        Returns:
+            List of message dictionaries with timestamps
+        """
+        messages = []
+        start_time = time.time()
+        
         message = self.get_message_by_id(message_id)
         if not message:
-            return []
+            print(f"✗ Message ID {hex(message_id)} not found in DBC")
+            return messages
         
-        messages_data = []
-        start_time = datetime.now()
+        if self.is_j1939:
+            pgn, priority, source = PGNDBC.extract_pgn_from_can_id(message_id)
+        else:
+            pgn = message_id
+            priority = 0
+            source = 0
         
-        print(f"\n📊 Reading message {hex(message_id)} for {duration} seconds...")
+        print(f"📡 Reading Message {message.name} ({hex(message_id)}) for {duration} seconds...")
         
-        while (datetime.now() - start_time).total_seconds() < duration:
-            msg = self.bus.recv(timeout=0.1)
-            if msg and msg.arbitration_id == message_id:
+        while time.time() - start_time < duration:
+            try:
+                msg = self.bus.recv(timeout=0.1)
+                if msg is None:
+                    continue
+                
+                if msg.arbitration_id != message_id:
+                    continue
+                
                 try:
-                    decoded = message.decode(msg.data)
-                    rx_time = datetime.fromtimestamp(msg.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    decoded_signals = message.decode(msg.data)
                     
-                    data = {
-                        'rx_time': rx_time,
-                        'signals': decoded
-                    }
-                    messages_data.append(data)
+                    messages.append({
+                        'pgn': hex(pgn),
+                        'name': message.name,
+                        'frame_id': hex(message_id),
+                        'priority': priority if self.is_j1939 else 'N/A',
+                        'source_address': source if self.is_j1939 else 'N/A',
+                        'rx_time': datetime.now(),
+                        'signals': decoded_signals
+                    })
                     
-                    if print_output:
-                        print(f"[{rx_time}] {decoded}")
-                except ValueError:
-                    pass
+                except Exception as e:
+                    print(f"⚠️  Decode error: {e}")
+                    continue
+                    
+            except Exception as e:
+                continue
         
-        print(f"✓ Received {len(messages_data)} messages\n")
-        return messages_data
+        print(f"📊 Captured {len(messages)} message(s)\n")
+        return messages
     
-    def continuous_read_by_name(self, message_name: str, duration: int = 10, 
-                               print_output: bool = True) -> List[Dict]:
+    # ================== Utility Functions ==================
+    
+    def print_message_data(self, message_data: Dict[str, Any]):
         """
-        Continuously read a message by name for specified duration
+        Print message data in formatted table
         
         Args:
-            message_name (str): Name of the message
-            duration (int): Duration to read in seconds
-            print_output (bool): Whether to print results
-        
-        Returns:
-            List of dictionaries with message data
+            message_data: Message dictionary
         """
-        message = self.get_message_by_name(message_name)
-        if not message:
-            return []
-        
-        message_id = message.frame_id
-        messages_data = []
-        start_time = datetime.now()
-        
-        print(f"\n📊 Reading message '{message_name}' for {duration} seconds...")
-        
-        while (datetime.now() - start_time).total_seconds() < duration:
-            msg = self.bus.recv(timeout=0.1)
-            if msg and msg.arbitration_id == message_id:
-                try:
-                    decoded = message.decode(msg.data)
-                    rx_time = datetime.fromtimestamp(msg.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                    
-                    data = {
-                        'rx_time': rx_time,
-                        'signals': decoded
-                    }
-                    messages_data.append(data)
-                    
-                    if print_output:
-                        print(f"[{rx_time}] {decoded}")
-                except ValueError:
-                    pass
-        
-        print(f"✓ Received {len(messages_data)} messages\n")
-        return messages_data
-    
-    # ==================== Utility Functions ====================
-    
-    def print_message_data(self, message_data: Dict) -> None:
-        """
-        Print message data in a formatted way
-        
-        Args:
-            message_data (Dict): Message data dictionary from read functions
-        """
-        if not message_data:
-            print("⚠️  No message data to display")
+        if message_data is None:
+            print("✗ No message data to display")
             return
         
-        print("\n" + "="*80)
-        print(f"Message Name: {message_data['name']}")
-        print(f"Message ID:   {message_data['id']}")
-        print(f"RX Time:      {message_data['rx_time']}")
-        print(f"DLC:          {message_data['dlc']}")
-        print("="*80)
-        print(f"{'Signal Name':<30} {'Value':<20} {'Unit':<15}")
-        print("-"*80)
+        print("\n" + "="*100)
+        print(f"Message: {message_data['name']}")
+        print(f"Frame ID: {message_data['frame_id']} | PGN: {message_data['pgn']} | Priority: {message_data['priority']} | Source: {message_data['source_address']}")
+        print(f"RX Time: {message_data['rx_time']}")
+        print("="*100)
+        print(f"{'Signal Name':<40} {'Value':<20} {'Unit':<15}")
+        print("-"*100)
         
-        for signal_name, signal_value in message_data['signals'].items():
-            message = self.get_message_by_name(message_data['name'])
-            signal = message.get_signal_by_name(signal_name)
-            unit = signal.unit
-            print(f"{signal_name:<30} {str(signal_value):<20} {str(unit):<15}")
-        
-        print("="*80 + "\n")
+        for signal_name, value in message_data['signals'].items():
+            print(f"{signal_name:<40} {str(value):<20} {'':<15}")
+        print("="*100 + "\n")
     
-    def close(self) -> None:
+    def get_pgn_from_frame_id(self, frame_id: int) -> int:
+        """
+        Extract PGN from CAN frame ID
+        
+        Args:
+            frame_id: CAN frame ID
+            
+        Returns:
+            PGN value
+        """
+        if self.is_j1939:
+            pgn, _, _ = PGNDBC.extract_pgn_from_can_id(frame_id)
+            return pgn
+        return frame_id
+    
+    def get_priority_from_frame_id(self, frame_id: int) -> int:
+        """
+        Extract Priority from CAN frame ID (J1939 only)
+        
+        Args:
+            frame_id: CAN frame ID
+            
+        Returns:
+            Priority value
+        """
+        if self.is_j1939:
+            _, priority, _ = PGNDBC.extract_pgn_from_can_id(frame_id)
+            return priority
+        return 0
+    
+    def get_source_address_from_frame_id(self, frame_id: int) -> int:
+        """
+        Extract Source Address from CAN frame ID (J1939 only)
+        
+        Args:
+            frame_id: CAN frame ID
+            
+        Returns:
+            Source Address value
+        """
+        if self.is_j1939:
+            _, _, source = PGNDBC.extract_pgn_from_can_id(frame_id)
+            return source
+        return 0
+    
+    def close(self):
         """Close CAN bus connection"""
         try:
             self.bus.shutdown()
@@ -512,57 +781,59 @@ class CANDBCReader:
             print(f"⚠️  Error closing CAN bus: {e}")
 
 
-# ==================== Example Usage ====================
+# ================== Example Usage ==================
 
 if __name__ == '__main__':
-    # Initialize CAN reader
-    try:
-        can_reader = CANDBCReader('your_file.dbc', channel=0, bitrate=500000)
-    except Exception as e:
-        print(f"Error: {e}")
-        exit(1)
+    # Initialize
+    reader = CANDBCReaderPGN('can_database.dbc', channel=0, bitrate=500000, is_j1939=True)
     
     # Example 1: List all messages
-    print("\n### Example 1: List all messages ###")
-    can_reader.print_all_messages()
+    print("\n" + "="*120)
+    print("EXAMPLE 1: List All Messages")
+    print("="*120)
+    reader.print_all_messages()
     
-    # Example 2: Get signals by message ID (0x123 as example)
-    print("\n### Example 2: Get signals by message ID ###")
-    can_reader.print_signals_by_message_id(0x123)
+    # Example 2: Get PGN info
+    pgn_example = 0xFECA  # Example PGN
+    print(f"\n" + "="*120)
+    print(f"EXAMPLE 2: Messages for PGN {hex(pgn_example)}")
+    print("="*120)
+    messages = reader.get_message_by_pgn(pgn_example)
+    for msg in messages:
+        print(f"  • {msg['name']} (Frame ID: {hex(msg['frame_id'])}, Priority: {msg['priority']}, Source: {msg['source_address']})")
     
-    # Example 3: Read message by ID
-    print("\n### Example 3: Read message by ID ###")
-    msg_data = can_reader.read_message_by_id(0x123, timeout=2.0)
+    # Example 3: Print signals by PGN
+    print(f"\n" + "="*120)
+    print(f"EXAMPLE 3: Signals for PGN {hex(pgn_example)}")
+    print("="*120)
+    reader.print_signals_by_pgn(pgn_example)
+    
+    # Example 4: Read message by PGN (with variable priority/source)
+    print(f"\n" + "="*120)
+    print(f"EXAMPLE 4: Read Message by PGN {hex(pgn_example)}")
+    print("="*120)
+    msg_data = reader.read_message_by_pgn(pgn_example, timeout=2.0)
     if msg_data:
-        can_reader.print_message_data(msg_data)
+        reader.print_message_data(msg_data)
     
-    # Example 4: Read message by name
-    print("\n### Example 4: Read message by name ###")
-    msg_data = can_reader.read_message_by_name('EngineStatus', timeout=2.0)
-    if msg_data:
-        can_reader.print_message_data(msg_data)
-    
-    # Example 5: Get specific signal value by ID and signal name
-    print("\n### Example 5: Get specific signal value by ID and signal name ###")
-    result = can_reader.get_signal_value_by_id_and_name(0x123, 'RPM', timeout=2.0)
+    # Example 5: Read specific signal by PGN and signal name
+    print(f"\n" + "="*120)
+    print(f"EXAMPLE 5: Read Signal by PGN and Signal Name")
+    print("="*120)
+    result = reader.get_signal_value_by_pgn_and_signal(pgn_example, 'SignalName', timeout=2.0)
     if result:
-        value, unit, rx_time = result
-        print(f"Signal: RPM")
-        print(f"Value: {value} {unit}")
+        value, unit, rx_time, priority, source = result
+        print(f"Signal Value: {value} {unit}")
         print(f"RX Time: {rx_time}")
+        print(f"Priority: {priority}, Source Address: {source}")
     
-    # Example 6: Get specific signal value by message name and signal name
-    print("\n### Example 6: Get specific signal value by message name and signal name ###")
-    result = can_reader.get_signal_value_by_name_and_signal('EngineStatus', 'Speed', timeout=2.0)
-    if result:
-        value, unit, rx_time = result
-        print(f"Signal: Speed")
-        print(f"Value: {value} {unit}")
-        print(f"RX Time: {rx_time}")
-    
-    # Example 7: Continuous read
-    print("\n### Example 7: Continuous read by message ID ###")
-    messages = can_reader.continuous_read_by_id(0x123, duration=5, print_output=True)
+    # Example 6: Continuous read by PGN
+    print(f"\n" + "="*120)
+    print(f"EXAMPLE 6: Continuous Read by PGN {hex(pgn_example)}")
+    print("="*120)
+    messages_list = reader.continuous_read_by_pgn(pgn_example, duration=5.0)
+    for msg in messages_list:
+        print(f"✓ {msg['name']} - Priority: {msg['priority']}, Source: {msg['source_address']}, Time: {msg['rx_time']}")
     
     # Close connection
-    can_reader.close()
+    reader.close()
