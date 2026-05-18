@@ -1,676 +1,162 @@
-"""
-CAN Message Reader and Parser
-Supports both normal CAN and J1939 protocols
-Reads messages from Vector CAN device and parses using DBC file
-"""
-
 import can
+import datetime
 import cantools
-from typing import Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum
-import struct
 
-
-class CANProtocol(Enum):
-    """Supported CAN protocols"""
-    NORMAL_CAN = "normal_can"
-    J1939 = "j1939"
-
-
-# Global protocol declaration
-GLOBAL_CAN_PROTOCOL = CANProtocol.NORMAL_CAN
-
-
-@dataclass
-class CANMessage:
-    """Data class for parsed CAN message"""
-    timestamp: float
-    arbitration_id: int
-    data: bytes
-    dlc: int
-    is_extended_frame: bool
-    is_remote_frame: bool
-    protocol: CANProtocol
-    pgn: Optional[int] = None
-    ps: Optional[int] = None
-    ps_destination: Optional[int] = None
-    priority: Optional[int] = None
-
-
-@dataclass
-class ParsedSignal:
-    """Data class for parsed signal"""
-    name: str
-    value: Union[int, float, str]
-    unit: str
-    raw_value: Union[int, float]
-    receivers: List[str]
-
-
-@dataclass
-class ParsedCANMessage:
-    """Data class for fully parsed CAN message"""
-    timestamp: float
-    message_id: int
-    message_name: str
-    protocol: CANProtocol
-    signals: Dict[str, ParsedSignal]
-    raw_data: bytes
-    pgn: Optional[int] = None
-    source_address: Optional[int] = None
-    destination_address: Optional[int] = None
-    priority: Optional[int] = None
-
-
-class J1939Handler:
-    """Handler for J1939 protocol specific operations"""
-
-    @staticmethod
-    def extract_pgn(arbitration_id: int) -> int:
+class CANReader:
+    def __init__(self, channel=0, bitrate=500000, dbc_file=None, filters=None):
         """
-        Extract PGN (Parameter Group Number) from CAN ID
-        
-        J1939 Message ID format (29-bit):
-        Bits 24-28: Priority (5 bits) 
-        Bits 16-23: Reserved (8 bits)
-        Bits 8-15:  PDU Format (PF) (8 bits)
-        Bits 0-7:   PDU Specific (PS) or Destination Address (8 bits)
-        
-        Args:
-            arbitration_id: 29-bit extended CAN ID
-            
-        Returns:
-            PGN value (16-bit)
+        Initialize Vector CAN interface
         """
-        ps = (arbitration_id >> 0) & 0xFF
-        pf = (arbitration_id >> 8) & 0xFF
-        
-        if pf < 240:  # PDU1 format
-            pgn = (pf << 8)
-        else:  # PDU2 format
-            pgn = (pf << 8) | ps
-            
-        return pgn
+        self.bus = can.interface.Bus(
+            bustype='vector',
+            channel=channel,
+            bitrate=bitrate
+        )
 
-    @staticmethod
-    def extract_source_address(arbitration_id: int) -> int:
-        """
-        Extract source address from CAN ID
-        
-        J1939 source address is in bits 0-7
-        """
-        return (arbitration_id >> 0) & 0xFF
+        self.last_timestamps = {}  # For cycle time
+        self.db = None
+        self.pgn_map = {}
 
-    @staticmethod
-    def extract_destination_address(arbitration_id: int) -> int:
-        """
-        Extract destination address from CAN ID (PDU1 format only)
-        
-        In PDU1 format (PF < 240), the PS field (bits 0-7) contains the destination address
-        In PDU2 format (PF >= 240), there is no specific destination address
-        """
-        pf = (arbitration_id >> 8) & 0xFF
-        if pf < 240:  # PDU1 format
-            # Destination address is in bits 0-7 (PS field in PDU1)
-            return (arbitration_id >> 0) & 0xFF
-        return None
+        if dbc_file:
+            self.load_dbc(dbc_file)
 
-    @staticmethod
-    def extract_priority(arbitration_id: int) -> int:
-        """
-        Extract priority from CAN ID
-        
-        Priority is in bits 24-28 (5 bits)
-        """
-        return (arbitration_id >> 24) & 0x1F
+        if filters:
+            self.set_filters(filters)
 
-    @staticmethod
-    def create_pgn_from_components(priority: int, reserved: int, pdu_format: int, 
-                                  pdu_specific: int) -> int:
-        """
-        Create J1939 CAN ID from components
-        
-        J1939 Message ID format (29-bit):
-        Bits 24-28: Priority (5 bits)
-        Bits 16-23: Reserved (8 bits)
-        Bits 8-15:  PDU Format (8 bits)
-        Bits 0-7:   PDU Specific (8 bits)
-        
-        Args:
-            priority: 5-bit priority (0-31)
-            reserved: 8-bit reserved field (0-255)
-            pdu_format: 8-bit PDU format
-            pdu_specific: 8-bit PDU specific (PS) or destination address
-            
-        Returns:
-            29-bit extended CAN ID
-        """
-        can_id = ((priority & 0x1F) << 24)
-        can_id |= ((reserved & 0xFF) << 16)
-        can_id |= ((pdu_format & 0xFF) << 8)
-        can_id |= (pdu_specific & 0xFF)
-        return can_id
-
-
-class CANMessageReader:
-    """Main class for reading and parsing CAN messages"""
-
-    def __init__(self, dbc_file: str, protocol: CANProtocol = CANProtocol.NORMAL_CAN,
-                 interface: str = 'vector', channel: int = 0, bitrate: int = 250000):
-        """
-        Initialize CAN message reader
-        
-        Args:
-            dbc_file: Path to DBC file
-            protocol: CAN protocol (NORMAL_CAN or J1939)
-            interface: CAN interface type (default: vector)
-            channel: CAN channel number
-            bitrate: CAN bitrate in bits per second
-        """
-        self.protocol = protocol
-        self.dbc_file = dbc_file
+    # DBC Load + PGN Mapping
+    def load_dbc(self, dbc_file):
         self.db = cantools.database.load_file(dbc_file)
-        self.interface = interface
-        self.channel = channel
-        self.bitrate = bitrate
-        self.bus = None
-        self.j1939_handler = J1939Handler()
 
-    def connect(self) -> bool:
-        """
-        Connect to CAN device
-        
-        Returns:
-            True if connection successful, False otherwise
-        """
-        try:
-            self.bus = can.Bus(
-                interface=self.interface,
-                channel=self.channel,
-                bitrate=self.bitrate,
-                is_fd=False
-            )
-            print(f"Connected to CAN device on channel {self.channel} at {self.bitrate} bps")
-            return True
-        except Exception as e:
-            print(f"Failed to connect to CAN device: {e}")
-            return False
+        self.pgn_map = {}
+        for msg in self.db.messages:
+            if msg.is_extended_frame:
+                pgn = self.extract_pgn_from_dbc_id(msg.frame_id)
+                self.pgn_map[pgn] = msg
 
-    def disconnect(self):
-        """Disconnect from CAN device"""
-        if self.bus:
-            self.bus.shutdown()
-            print("Disconnected from CAN device")
+    # Filters
+    def set_filters(self, filter_list):
+        self.bus.set_filters(filter_list)
 
-    def read_message(self, timeout: float = 1.0) -> Optional[CANMessage]:
-        """
-        Read a single CAN message from the bus
-        
-        Args:
-            timeout: Read timeout in seconds
-            
-        Returns:
-            CANMessage object or None if timeout
-        """
-        if not self.bus:
-            raise RuntimeError("CAN bus not connected. Call connect() first.")
+    # PGN extraction (correct J1939)
+    def get_pgn(self, arbitration_id):
+        pf = (arbitration_id >> 16) & 0xFF
+        ps = (arbitration_id >> 8) & 0xFF
 
-        msg = self.bus.recv(timeout=timeout)
-        if msg is None:
+        if pf >= 240:  # PDU2
+            return (pf << 8) | ps
+        else:          # PDU1
+            return (pf << 8)
+
+    def extract_pgn_from_dbc_id(self, frame_id):
+        return self.get_pgn(frame_id)
+
+    # Cycle Time (all IDs)
+    def calculate_cycle_time(self, msg):
+        msg_id = msg.arbitration_id
+        cycle = None
+
+        if msg_id in self.last_timestamps:
+            cycle = (msg.timestamp - self.last_timestamps[msg_id]) * 1000  # ms
+
+        self.last_timestamps[msg_id] = msg.timestamp
+        return cycle
+
+    # Cycle Time (specific ID)
+    def get_specific_cycle_time(self, msg, target_id):
+        if msg.arbitration_id != target_id:
+            return None
+        return self.calculate_cycle_time(msg)
+
+    # Standard CAN decode
+    def decode_standard(self, msg):
+        if not self.db or msg.is_extended_id:
             return None
 
-        can_msg = CANMessage(
-            timestamp=msg.timestamp,
-            arbitration_id=msg.arbitration_id,
-            data=msg.data,
-            dlc=msg.dlc,
-            is_extended_frame=msg.is_extended_id,
-            is_remote_frame=msg.is_remote_frame,
-            protocol=self.protocol
-        )
-
-        # Extract J1939 specific fields
-        if self.protocol == CANProtocol.J1939:
-            can_msg.pgn = self.j1939_handler.extract_pgn(msg.arbitration_id)
-            can_msg.ps = (msg.arbitration_id >> 0) & 0xFF
-            can_msg.ps_destination = self.j1939_handler.extract_destination_address(msg.arbitration_id)
-            can_msg.priority = self.j1939_handler.extract_priority(msg.arbitration_id)
-
-        return can_msg
-
-    def read_messages(self, count: int, timeout: float = 1.0) -> List[CANMessage]:
-        """
-        Read multiple CAN messages
-        
-        Args:
-            count: Number of messages to read
-            timeout: Timeout per message in seconds
-            
-        Returns:
-            List of CANMessage objects
-        """
-        messages = []
-        for _ in range(count):
-            msg = self.read_message(timeout=timeout)
-            if msg:
-                messages.append(msg)
-        return messages
-
-    def get_message_by_id(self, message_id: int) -> Optional[cantools.database.Message]:
-        """
-        Get message definition from DBC by message ID
-        
-        Args:
-            message_id: CAN message ID
-            
-        Returns:
-            Message object or None
-        """
         try:
-            return self.db.get_message_by_frame_id(message_id)
-        except KeyError:
+            return self.db.decode_message(msg.arbitration_id, msg.data)
+        except:
             return None
 
-    def get_message_by_name(self, message_name: str) -> Optional[cantools.database.Message]:
-        """
-        Get message definition from DBC by message name
-        
-        Args:
-            message_name: CAN message name
-            
-        Returns:
-            Message object or None
-        """
-        try:
-            return self.db.get_message_by_name(message_name)
-        except KeyError:
-            return None
+    # J1939 PGN-based decode
+    def decode_j1939_by_pgn(self, msg):
+        if not self.db or not msg.is_extended_id:
+            return None, None, None
 
-    def get_message_by_pgn(self, pgn: int) -> Optional[cantools.database.Message]:
-        """
-        Get message definition from DBC by PGN (J1939 protocol)
-        
-        Args:
-            pgn: Parameter Group Number
-            
-        Returns:
-            Message object or None
-        """
-        if self.protocol != CANProtocol.J1939:
-            raise ValueError("PGN lookup only supported for J1939 protocol")
+        pgn = self.get_pgn(msg.arbitration_id)
 
-        for message in self.db.messages:
-            # Try to match PGN - usually encoded in message ID or name
+        if pgn in self.pgn_map:
+            message_def = self.pgn_map[pgn]
+
             try:
-                msg_pgn = self.j1939_handler.extract_pgn(message.frame_id)
-                if msg_pgn == pgn:
-                    return message
-            except:
-                pass
+                decoded = message_def.decode(msg.data)
+                return pgn, message_def.name, decoded
+            except Exception as e:
+                return pgn, message_def.name, f"Decode Error: {e}"
 
-        return None
+        return pgn, None, None
 
-    def parse_message_by_id(self, can_msg: CANMessage, message_id: int) -> Optional[ParsedCANMessage]:
-        """
-        Parse CAN message using message ID
-        
-        Args:
-            can_msg: Raw CAN message
-            message_id: Message ID to look up in DBC
+    # Main Read Loop
+    def read_messages(self, target_id=None):
+        print("Listening to CAN bus...\n")
+
+        while True:
+            msg = self.bus.recv(timeout=1)
+
+            if not msg:
+                continue
+
+            # Timestamp
+            ts = msg.timestamp
+            human_time = datetime.datetime.fromtimestamp(ts)
+
+            # Cycle time (global)
+            cycle = self.calculate_cycle_time(msg)
+
+            # Cycle time (specific ID)
+            specific_cycle = None
+            if target_id:
+                specific_cycle = self.get_specific_cycle_time(msg, target_id)
+
+            # Decode based on frame type
+            if msg.is_extended_id:
+                pgn, name, decoded = self.decode_j1939_by_pgn(msg)
+                print(f"[{human_time}] J1939 - ID: 0x{msg.arbitration_id:08x}, PGN: 0x{pgn:04x}, Name: {name}")
+                print(f"    Data: {msg.data.hex()}")
+                print(f"    Decoded: {decoded}")
+                if cycle:
+                    print(f"    Cycle Time: {cycle:.2f} ms")
+                if specific_cycle:
+                    print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
+            else:
+                decoded = self.decode_standard(msg)
+                print(f"[{human_time}] Standard - ID: 0x{msg.arbitration_id:03x}")
+                print(f"    Data: {msg.data.hex()}")
+                print(f"    Decoded: {decoded}")
+                if cycle:
+                    print(f"    Cycle Time: {cycle:.2f} ms")
+                if specific_cycle:
+                    print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
             
-        Returns:
-            ParsedCANMessage or None if not found
-        """
-        msg_def = self.get_message_by_id(message_id)
-        if not msg_def:
-            return None
-
-        return self._parse_message_definition(can_msg, msg_def)
-
-    def parse_message_by_name(self, can_msg: CANMessage, message_name: str) -> Optional[ParsedCANMessage]:
-        """
-        Parse CAN message using message name
-        
-        Args:
-            can_msg: Raw CAN message
-            message_name: Message name to look up in DBC
-            
-        Returns:
-            ParsedCANMessage or None if not found
-        """
-        msg_def = self.get_message_by_name(message_name)
-        if not msg_def:
-            return None
-
-        return self._parse_message_definition(can_msg, msg_def)
-
-    def parse_message_by_pgn(self, can_msg: CANMessage, pgn: int) -> Optional[ParsedCANMessage]:
-        """
-        Parse CAN message using PGN (J1939 protocol)
-        
-        Args:
-            can_msg: Raw CAN message
-            pgn: Parameter Group Number
-            
-        Returns:
-            ParsedCANMessage or None if not found
-        """
-        if self.protocol != CANProtocol.J1939:
-            raise ValueError("PGN parsing only supported for J1939 protocol")
-
-        msg_def = self.get_message_by_pgn(pgn)
-        if not msg_def:
-            return None
-
-        return self._parse_message_definition(can_msg, msg_def)
-
-    def parse_message_auto(self, can_msg: CANMessage) -> Optional[ParsedCANMessage]:
-        """
-        Automatically parse CAN message (detects protocol and uses appropriate method)
-        
-        Args:
-            can_msg: Raw CAN message
-            
-        Returns:
-            ParsedCANMessage or None if not found
-        """
-        if self.protocol == CANProtocol.J1939:
-            pgn = can_msg.pgn
-            if pgn is not None:
-                return self.parse_message_by_pgn(can_msg, pgn)
-        else:
-            return self.parse_message_by_id(can_msg, can_msg.arbitration_id)
-
-        return None
-
-    def _parse_message_definition(self, can_msg: CANMessage, 
-                                 msg_def: cantools.database.Message) -> ParsedCANMessage:
-        """
-        Internal method to parse message using definition
-        
-        Args:
-            can_msg: Raw CAN message
-            msg_def: Message definition from DBC
-            
-        Returns:
-            ParsedCANMessage
-        """
-        # Decode signals
-        decoded_data = msg_def.decode(can_msg.data, allow_truncated=True)
-
-        signals = {}
-        for signal_name, signal_value in decoded_data.items():
-            signal_def = msg_def.get_signal_by_name(signal_name)
-            
-            signals[signal_name] = ParsedSignal(
-                name=signal_name,
-                value=signal_value,
-                unit=signal_def.unit or "",
-                raw_value=signal_value,
-                receivers=signal_def.receivers or []
-            )
-
-        # Get source and destination for J1939
-        source_addr = None
-        dest_addr = None
-        priority = None
-        pgn = None
-
-        if self.protocol == CANProtocol.J1939:
-            source_addr = self.j1939_handler.extract_source_address(can_msg.arbitration_id)
-            dest_addr = self.j1939_handler.extract_destination_address(can_msg.arbitration_id)
-            priority = self.j1939_handler.extract_priority(can_msg.arbitration_id)
-            pgn = can_msg.pgn
-
-        return ParsedCANMessage(
-            timestamp=can_msg.timestamp,
-            message_id=msg_def.frame_id,
-            message_name=msg_def.name,
-            protocol=self.protocol,
-            signals=signals,
-            raw_data=can_msg.data,
-            pgn=pgn,
-            source_address=source_addr,
-            destination_address=dest_addr,
-            priority=priority
-        )
-
-    def get_message_timing(self, message_id: int) -> Optional[Dict]:
-        """
-        Get timing information for a message
-        
-        Args:
-            message_id: Message ID
-            
-        Returns:
-            Dictionary with timing info or None
-        """
-        msg_def = self.get_message_by_id(message_id)
-        if not msg_def:
-            return None
-
-        return {
-            "message_id": msg_def.frame_id,
-            "message_name": msg_def.name,
-            "cycle_time": msg_def.cycle_time,
-            "is_multiplexed": msg_def.is_multiplexed(),
-            "length": msg_def.length,
-            "senders": msg_def.senders
-        }
-
-    def get_signal_values(self, can_msg: CANMessage, message_id: int) -> Optional[Dict]:
-        """
-        Get all signal values from a message by message ID
-        
-        Args:
-            can_msg: Raw CAN message
-            message_id: Message ID
-            
-        Returns:
-            Dictionary of signal values or None
-        """
-        parsed = self.parse_message_by_id(can_msg, message_id)
-        if not parsed:
-            return None
-
-        return {name: sig.value for name, sig in parsed.signals.items()}
-
-    def get_signal_values_by_name(self, can_msg: CANMessage, message_name: str) -> Optional[Dict]:
-        """
-        Get all signal values from a message by message name
-        
-        Args:
-            can_msg: Raw CAN message
-            message_name: Message name
-            
-        Returns:
-            Dictionary of signal values or None
-        """
-        parsed = self.parse_message_by_name(can_msg, message_name)
-        if not parsed:
-            return None
-
-        return {name: sig.value for name, sig in parsed.signals.items()}
-
-    def get_signal_values_by_pgn(self, can_msg: CANMessage, pgn: int) -> Optional[Dict]:
-        """
-        Get all signal values from a message by PGN (J1939 protocol)
-        
-        Args:
-            can_msg: Raw CAN message
-            pgn: Parameter Group Number
-            
-        Returns:
-            Dictionary of signal values or None
-        """
-        parsed = self.parse_message_by_pgn(can_msg, pgn)
-        if not parsed:
-            return None
-
-        return {name: sig.value for name, sig in parsed.signals.items()}
-
-    def get_message_data_by_id(self, can_msg: CANMessage, message_id: int) -> Optional[Dict]:
-        """
-        Get complete message data by message ID
-        
-        Args:
-            can_msg: Raw CAN message
-            message_id: Message ID
-            
-        Returns:
-            Dictionary with message data or None
-        """
-        parsed = self.parse_message_by_id(can_msg, message_id)
-        if not parsed:
-            return None
-
-        return self._format_parsed_message(parsed)
-
-    def get_message_data_by_name(self, can_msg: CANMessage, message_name: str) -> Optional[Dict]:
-        """
-        Get complete message data by message name
-        
-        Args:
-            can_msg: Raw CAN message
-            message_name: Message name
-            
-        Returns:
-            Dictionary with message data or None
-        """
-        parsed = self.parse_message_by_name(can_msg, message_name)
-        if not parsed:
-            return None
-
-        return self._format_parsed_message(parsed)
-
-    def get_message_data_by_pgn(self, can_msg: CANMessage, pgn: int) -> Optional[Dict]:
-        """
-        Get complete message data by PGN (J1939 protocol)
-        
-        Args:
-            can_msg: Raw CAN message
-            pgn: Parameter Group Number
-            
-        Returns:
-            Dictionary with message data or None
-        """
-        parsed = self.parse_message_by_pgn(can_msg, pgn)
-        if not parsed:
-            return None
-
-        return self._format_parsed_message(parsed)
-
-    def _format_parsed_message(self, parsed: ParsedCANMessage) -> Dict:
-        """
-        Format parsed message for display
-        
-        Args:
-            parsed: ParsedCANMessage object
-            
-        Returns:
-            Formatted dictionary
-        """
-        data = {
-            "timestamp": datetime.fromtimestamp(parsed.timestamp).isoformat(),
-            "rx_time_ms": parsed.timestamp * 1000,
-            "message_id": hex(parsed.message_id),
-            "message_name": parsed.message_name,
-            "protocol": parsed.protocol.value,
-            "raw_data": parsed.raw_data.hex(),
-            "signals": {}
-        }
-
-        for name, sig in parsed.signals.items():
-            data["signals"][name] = {
-                "value": sig.value,
-                "unit": sig.unit,
-                "raw_value": sig.raw_value,
-                "receivers": sig.receivers
-            }
-
-        if parsed.protocol == CANProtocol.J1939:
-            data["pgn"] = hex(parsed.pgn) if parsed.pgn else None
-            data["source_address"] = hex(parsed.source_address) if parsed.source_address else None
-            data["destination_address"] = hex(parsed.destination_address) if parsed.destination_address else None
-            data["priority"] = parsed.priority
-
-        return data
-
-    def print_message_info(self, parsed: ParsedCANMessage):
-        """
-        Print formatted message information
-        
-        Args:
-            parsed: ParsedCANMessage object
-        """
-        print(f"\n{'='*60}")
-        print(f"Timestamp: {datetime.fromtimestamp(parsed.timestamp).isoformat()}")
-        print(f"Message: {parsed.message_name} (0x{parsed.message_id:X})")
-        print(f"Protocol: {parsed.protocol.value}")
-
-        if parsed.protocol == CANProtocol.J1939:
-            print(f"PGN: 0x{parsed.pgn:X}")
-            print(f"Priority: {parsed.priority}")
-            print(f"Source Address: 0x{parsed.source_address:02X}")
-            if parsed.destination_address:
-                print(f"Destination Address: 0x{parsed.destination_address:02X}")
-
-        print(f"Raw Data: {parsed.raw_data.hex()}")
-        print(f"\nSignals:")
-        for name, sig in parsed.signals.items():
-            print(f"  {name}: {sig.value} {sig.unit}")
-        print(f"{'='*60}\n")
+            print("-" * 60)
 
 
 # Example usage
 if __name__ == "__main__":
-    # Set global protocol
-    global GLOBAL_CAN_PROTOCOL
-    GLOBAL_CAN_PROTOCOL = CANProtocol.NORMAL_CAN
-
-    # Initialize reader
-    reader = CANMessageReader(
-        dbc_file="path/to/your/file.dbc",
-        protocol=GLOBAL_CAN_PROTOCOL,
-        interface="vector",
-        channel=0,
-        bitrate=250000
-    )
-
-    # Connect to CAN device
-    if reader.connect():
-        try:
-            # Read and parse single message
-            raw_msg = reader.read_message(timeout=1.0)
-            if raw_msg:
-                # Parse by message name
-                message_name = "EngineStatus"  # Example message name from DBC
-                parsed = reader.parse_message_by_name(raw_msg, message_name)
-                if parsed:
-                    reader.print_message_info(parsed)
-
-                    # Get timing info
-                    msg_def = reader.get_message_by_name(message_name)
-                    if msg_def:
-                        timing = reader.get_message_timing(msg_def.frame_id)
-                        print(f"Timing info: {timing}")
-
-                    # Get signal values by message name
-                    signals = reader.get_signal_values_by_name(raw_msg, message_name)
-                    print(f"Signal values: {signals}")
-
-                    # Get full message data by message name
-                    msg_data = reader.get_message_data_by_name(raw_msg, message_name)
-                    print(f"Message data: {msg_data}")
-
-            # Read multiple messages
-            messages = reader.read_messages(count=10, timeout=1.0)
-            for msg in messages:
-                parsed = reader.parse_message_auto(msg)
-                if parsed:
-                    reader.print_message_info(parsed)
-
-        finally:
-            reader.disconnect()
+    # Without DBC file
+    reader = CANReader(channel=0, bitrate=500000)
+    
+    # With DBC file (uncomment and provide path)
+    # reader = CANReader(channel=0, bitrate=500000, dbc_file="path/to/your.dbc")
+    
+    # With filters (example)
+    # filters = [{"can_id": 0x123, "can_mask": 0x7FF}]
+    # reader = CANReader(channel=0, bitrate=500000, filters=filters)
+    
+    try:
+        # Read all messages
+        reader.read_messages()
+        
+        # Or read with specific target ID for cycle time monitoring
+        # reader.read_messages(target_id=0x123)
+    except KeyboardInterrupt:
+        print("\nStopped by user")
