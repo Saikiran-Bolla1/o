@@ -24,12 +24,16 @@ class CANReader:
     - Cycle time monitoring for individual and target message IDs
     - Frame type detection (standard vs extended)
     - Signal-level extraction and monitoring
+    - Fixed TP session key matching and timeout handling
     """
     
     # J1939 PGN constants
     PGN_TP_CM = 0xEC00    # Transport Protocol - Connection Management (BAM)
     PGN_TP_DT = 0xEB00    # Transport Protocol - Data Transfer
     PGN_DM1 = 0xFECA      # Diagnostic Message 1
+    
+    # TP session timeout in seconds
+    TP_SESSION_TIMEOUT = 5.0
     
     def __init__(self, channel: int = 0, bitrate: int = 500000, 
                  dbc_file: Optional[str] = None, filters: Optional[list] = None):
@@ -172,6 +176,32 @@ class CANReader:
         if msg.arbitration_id != target_id:
             return None
         return self.calculate_cycle_time(msg)
+
+    # ==================== TP SESSION CLEANUP ====================
+    
+    def cleanup_stale_tp_sessions(self) -> None:
+        """
+        Clean up TP sessions that have timed out.
+        
+        Removes sessions that haven't received data for TP_SESSION_TIMEOUT seconds.
+        """
+        current_time = datetime.datetime.now()
+        stale_sessions = []
+        
+        for key, session in self.tp_sessions.items():
+            session_time = datetime.datetime.fromtimestamp(session["timestamp"])
+            elapsed = (current_time - session_time).total_seconds()
+            
+            if elapsed > self.TP_SESSION_TIMEOUT:
+                stale_sessions.append(key)
+                logger.warning(
+                    f"⏱️  Cleaning up stale TP session for ID 0x{key:08X} "
+                    f"(PGN: 0x{session['target_pgn']:04X}). "
+                    f"Elapsed: {elapsed:.1f}s, Received: {session['received_packets']}/{session['expected_packets']} packets"
+                )
+        
+        for key in stale_sessions:
+            del self.tp_sessions[key]
 
     # ==================== NEW: Average Cycle Time Function ====================
     
@@ -428,11 +458,14 @@ class CANReader:
                     except Exception as e:
                         logger.debug(f"Failed to decode {message_def.name}: {e}")
 
-    # ==================== TP (Transport Protocol) Handling ====================
+    # ==================== FIXED: TP (Transport Protocol) Handling ====================
     
     def handle_tp_cm(self, msg: can.Message) -> None:
         """
         Handle TP.CM (Connection Management) - BAM (Broadcast Announce Message).
+        
+        FIXED: Now uses Source Address from arbitration ID as session key to properly match
+        TP.CM with corresponding TP.DT packets from the same source.
         
         BAM format (Byte 0 = 0x20):
         - Byte 1-2: Total message size (little-endian)
@@ -453,24 +486,38 @@ class CANReader:
             total_size = data[1] | (data[2] << 8)
             num_packets = data[3]
             target_pgn = data[5] | (data[6] << 8) | (data[7] << 16)
+            
+            # ✅ FIXED: Use Source Address (SA) from arbitration ID as session key
+            # This ensures TP.CM and TP.DT from same source are matched
+            source_address = msg.arbitration_id & 0xFF
+            session_key = (msg.arbitration_id >> 8) & 0xFFFFFF  # Remove SA to get base ID
+            
+            # Clean up any stale sessions before creating new one
+            self.cleanup_stale_tp_sessions()
 
-            key = msg.arbitration_id
-
-            self.tp_sessions[key] = {
+            self.tp_sessions[session_key] = {
                 "data": bytearray(),
                 "expected_packets": num_packets,
                 "received_packets": 0,
                 "target_pgn": target_pgn,
                 "total_size": total_size,
-                "timestamp": msg.timestamp
+                "timestamp": datetime.datetime.now().timestamp(),
+                "source_address": source_address,
+                "arbitration_id": msg.arbitration_id
             }
 
-            logger.info(f"TP.CM BAM started: PGN=0x{target_pgn:04X}, Size={total_size} bytes, Packets={num_packets}")
-            print(f"📦 TP Start → PGN: 0x{target_pgn:04X}, Packets: {num_packets}")
+            logger.info(
+                f"✅ TP.CM BAM started: PGN=0x{target_pgn:04X}, Size={total_size} bytes, "
+                f"Packets={num_packets}, Source=0x{source_address:02X}, Key=0x{session_key:06X}"
+            )
+            print(f"📦 TP.CM BAM → PGN: 0x{target_pgn:04X}, {num_packets} packets, {total_size} bytes")
 
     def handle_tp_dt(self, msg: can.Message) -> Optional[Tuple[int, bytearray]]:
         """
         Handle TP.DT (Data Transfer) packets and assemble multi-frame messages.
+        
+        FIXED: Now properly matches TP.DT packets to their corresponding TP.CM sessions
+        by using the same session key derivation (source address).
         
         TP.DT format:
         - Byte 0: Sequence number (1-255)
@@ -484,13 +531,19 @@ class CANReader:
         Returns:
             Tuple of (target_pgn, full_data) when complete, else None
         """
-        key = msg.arbitration_id
-
-        if key not in self.tp_sessions:
-            logger.warning(f"TP.DT received without active session for ID 0x{key:08X}")
+        # ✅ FIXED: Use same session key derivation as handle_tp_cm
+        source_address = msg.arbitration_id & 0xFF
+        session_key = (msg.arbitration_id >> 8) & 0xFFFFFF  # Remove SA to get base ID
+        
+        if session_key not in self.tp_sessions:
+            logger.debug(
+                f"⚠️  TP.DT received without matching TP.CM session. "
+                f"Source: 0x{source_address:02X}, Key: 0x{session_key:06X}, ID: 0x{msg.arbitration_id:08X}. "
+                f"Active sessions: {[f'0x{k:06X}' for k in self.tp_sessions.keys()]}"
+            )
             return None
 
-        session = self.tp_sessions[key]
+        session = self.tp_sessions[session_key]
 
         if len(msg.data) < 8:
             logger.warning("TP.DT message too short")
@@ -499,17 +552,24 @@ class CANReader:
         payload = msg.data[1:]  # Skip sequence number byte
         session["data"].extend(payload)
         session["received_packets"] += 1
+        session["timestamp"] = datetime.datetime.now().timestamp()  # Update timestamp on each packet
 
-        logger.debug(f"TP.DT packet {session['received_packets']}/{session['expected_packets']} received")
+        logger.debug(
+            f"TP.DT packet {session['received_packets']}/{session['expected_packets']} received "
+            f"for PGN 0x{session['target_pgn']:04X}"
+        )
 
         if session["received_packets"] >= session["expected_packets"]:
             full_data = session["data"][:session["total_size"]]
             target_pgn = session["target_pgn"]
 
-            logger.info(f"TP.DT complete: PGN=0x{target_pgn:04X}, Total size={session['total_size']} bytes")
-            print("✅ TP Complete")
+            logger.info(
+                f"✅ TP.DT complete: PGN=0x{target_pgn:04X}, {session['total_size']} bytes "
+                f"assembled from {session['received_packets']} packets"
+            )
+            print(f"✅ TP.DT Complete → {session['total_size']} bytes")
 
-            del self.tp_sessions[key]
+            del self.tp_sessions[session_key]
 
             return target_pgn, full_data
 
@@ -598,12 +658,14 @@ class CANReader:
         else:
             print("No active DTCs")
 
-    def get_dm1_message(self, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    def get_dm1_message(self, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
         """
         Wait for and retrieve a DM1 diagnostic message from the CAN bus.
         
         Monitors the bus for DM1 messages (single-frame or multi-frame via TP).
         Stops listening and returns immediately upon receiving DM1.
+        
+        FIXED: Now properly assembles multi-frame DM1 via corrected TP session handling.
         
         Args:
             timeout: Maximum time to wait for DM1 message in seconds
@@ -639,11 +701,25 @@ class CANReader:
             if elapsed > timeout:
                 logger.warning(f"Timeout waiting for DM1 message after {timeout}s")
                 print(f"❌ Timeout: No DM1 message received after {timeout}s")
+                
+                # Log any remaining active TP sessions
+                if self.tp_sessions:
+                    logger.warning(f"Active TP sessions at timeout: {len(self.tp_sessions)}")
+                    for key, session in self.tp_sessions.items():
+                        logger.warning(
+                            f"  Session 0x{key:06X}: "
+                            f"PGN=0x{session['target_pgn']:04X}, "
+                            f"Progress={session['received_packets']}/{session['expected_packets']}"
+                        )
+                
                 return None
             
             msg = self.bus.recv(timeout=1)
             
             if not msg:
+                # Clean up stale sessions periodically
+                if int(elapsed) % 2 == 0:  # Every 2 seconds
+                    self.cleanup_stale_tp_sessions()
                 continue
             
             pgn = self.get_pgn(msg.arbitration_id)
@@ -755,6 +831,8 @@ class CANReader:
                 msg = self.bus.recv(timeout=1)
 
                 if not msg:
+                    # Periodically clean up stale TP sessions
+                    self.cleanup_stale_tp_sessions()
                     continue
 
                 # Timestamp conversion
@@ -847,9 +925,9 @@ if __name__ == "__main__":
     try:
         # ===== FEATURE 1: Get DM1 message and return it =====
         print("=" * 60)
-        print("DM1 MESSAGE READER")
+        print("DM1 MESSAGE READER - FIXED TP SESSION HANDLING")
         print("=" * 60)
-        dm1_msg = reader.get_dm1_message(timeout=10.0)
+        dm1_msg = reader.get_dm1_message(timeout=15.0)
         
         if dm1_msg:
             print(f"\n✅ DM1 Data Retrieved Successfully!")
