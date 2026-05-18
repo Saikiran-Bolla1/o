@@ -6,9 +6,10 @@ import j1939
 logging.getLogger('j1939').setLevel(logging.DEBUG)
 logging.getLogger('can').setLevel(logging.DEBUG)
 
-def dm1_receive(lamp_status, dtc_list):
+def dm1_receive(priority, lamp_status, dtc_list, timestamp):
     """Callback for receiving DM1 messages"""
-    print(f"DM1 Received - Lamp Status: {lamp_status}")
+    print(f"DM1 Received - Priority: {priority}, Timestamp: {timestamp}")
+    print(f"Lamp Status: {lamp_status}")
     print(f"Active DTCs: {dtc_list}")
     for dtc in dtc_list:
         print(f"  SPN: {dtc['spn']}, FMI: {dtc['fmi']}, OC: {dtc.get('oc', 0)}")
