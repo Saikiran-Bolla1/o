@@ -1,0 +1,138 @@
+import logging
+import time
+import can
+import j1939
+import cantools
+import queue
+
+# -------------------- LOGGING --------------------
+logging.getLogger('j1939').setLevel(logging.WARNING)
+logging.getLogger('can').setLevel(logging.WARNING)
+
+# -------------------- GLOBAL STORAGE --------------------
+msg_queue = queue.Queue()
+dm1_data_store = []
+
+# -------------------- LOAD DBC --------------------
+DBC_FILE = "your_file.dbc"   # <-- change this
+db = cantools.database.load_file(DBC_FILE)
+
+# -------------------- HELPERS --------------------
+def build_can_id(priority, pgn, sa):
+    """Build 29-bit CAN ID from J1939 fields"""
+    return (priority << 26) | (pgn << 8) | sa
+
+# -------------------- CALLBACKS --------------------
+def on_message(priority, pgn, sa, timestamp, data):
+    """Capture all J1939 messages"""
+    msg = {
+        "priority": priority,
+        "pgn": pgn,
+        "sa": sa,
+        "timestamp": timestamp,
+        "data": bytes(data)
+    }
+    msg_queue.put(msg)
+
+def dm1_receive(lamp_status, dtc_list):
+    """Handle DM1 messages"""
+    dm1_entry = {
+        "lamp_status": lamp_status,
+        "dtcs": dtc_list
+    }
+    dm1_data_store.append(dm1_entry)
+
+    print("\n[DM1 RECEIVED]")
+    print(f"Lamp Status: {lamp_status}")
+    for dtc in dtc_list:
+        print(f"  SPN: {dtc['spn']} | FMI: {dtc['fmi']} | OC: {dtc.get('oc', 0)}")
+
+# -------------------- DECODER --------------------
+def decode_messages():
+    """Decode all queued messages using DBC"""
+    decoded_msgs = []
+
+    while not msg_queue.empty():
+        msg = msg_queue.get()
+
+        can_id = build_can_id(msg["priority"], msg["pgn"], msg["sa"])
+
+        try:
+            decoded = db.decode_message(can_id, msg["data"])
+
+            decoded_msgs.append({
+                "timestamp": msg["timestamp"],
+                "pgn": hex(msg["pgn"]),
+                "sa": hex(msg["sa"]),
+                "signals": decoded
+            })
+
+        except Exception:
+            # Ignore messages not in DBC
+            pass
+
+    return decoded_msgs
+
+# -------------------- MAIN --------------------
+def main():
+    print("Initializing J1939 + DBC Decoder (Vector)")
+
+    ecu = j1939.ElectronicControlUnit()
+
+    ecu.connect(
+        bustype='vector',
+        app_name='CANalyzer',
+        channel=0,
+        bitrate=250000
+    )
+
+    # Subscribe to all raw messages
+    ecu.subscribe(on_message)
+
+    # Create Controller Application
+    name = j1939.Name(
+        arbitrary_address_capable=0,
+        industry_group=j1939.Name.IndustryGroup.Industrial,
+        vehicle_system_instance=1,
+        vehicle_system=1,
+        function=1,
+        function_instance=1,
+        ecu_instance=1,
+        manufacturer_code=666,
+        identity_number=1234567
+    )
+
+    ca = j1939.ControllerApplication(name, 0xF1)
+    ecu.add_ca(controller_application=ca)
+
+    # DM1 handler
+    dm1 = j1939.Dm1(ca)
+    dm1.subscribe(dm1_receive)
+
+    ca.start()
+
+    print("Listening for messages... (60 seconds)")
+    time.sleep(60)
+
+    print("\nDecoding messages using DBC...")
+    decoded_msgs = decode_messages()
+
+    # -------------------- OUTPUT --------------------
+    print("\n========== DBC DECODED MESSAGES ==========")
+    for msg in decoded_msgs:
+        print(f"\nPGN: {msg['pgn']} | SA: {msg['sa']}")
+        for sig, val in msg["signals"].items():
+            print(f"  {sig}: {val}")
+
+    print("\n========== DM1 DATA ==========")
+    for dm1_entry in dm1_data_store:
+        print(dm1_entry)
+
+    # -------------------- CLEANUP --------------------
+    print("\nShutting down...")
+    ca.stop()
+    ecu.disconnect()
+
+# -------------------- ENTRY --------------------
+if __name__ == '__main__':
+    main()
