@@ -1,4 +1,3 @@
-
 import can
 import datetime
 import cantools
@@ -152,16 +151,52 @@ class CANReader:
         self.last_timestamps[msg_id] = timestamp
         return cycle
 
-    # J1939 PGN-based decode (primary method)
-    def decode_j1939_message(self, msg):
+    # Smart decode that handles variable data sizes
+    def decode_with_variable_size(self, message_def, data_bytes):
         """
-        Decode J1939 message using PGN
+        Decode CAN message handling variable data sizes
+        
+        Args:
+            message_def: cantools message definition
+            data_bytes: Raw data bytes from CAN message
         
         Returns:
-            tuple: (pgn, message_name, decoded_data, source_address)
+            Decoded dictionary or error message
+        """
+        try:
+            expected_length = message_def.length
+            actual_length = len(data_bytes)
+            
+            # Check if data size matches expected
+            if actual_length == expected_length:
+                # Perfect match - decode normally
+                return message_def.decode(data_bytes)
+            
+            elif actual_length < expected_length:
+                # Data is shorter than expected - pad with zeros
+                print(f"    WARNING: Received {actual_length} bytes but DBC expects {expected_length} bytes. Padding with zeros.")
+                padded_data = data_bytes + b'\x00' * (expected_length - actual_length)
+                return message_def.decode(padded_data)
+            
+            else:  # actual_length > expected_length
+                # Data is longer than expected - truncate
+                print(f"    WARNING: Received {actual_length} bytes but DBC expects {expected_length} bytes. Truncating to {expected_length} bytes.")
+                truncated_data = data_bytes[:expected_length]
+                return message_def.decode(truncated_data)
+        
+        except Exception as e:
+            return f"Decode Error: {str(e)}"
+
+    # J1939 PGN-based decode with variable size handling
+    def decode_j1939_message(self, msg):
+        """
+        Decode J1939 message using PGN with variable data size handling
+        
+        Returns:
+            tuple: (pgn, message_name, decoded_data, source_address, warning)
         """
         if not self.db or not msg.is_extended_id:
-            return None, None, None, None
+            return None, None, None, None, None
         
         # Extract PGN from the message ID
         pgn = self.get_pgn_from_id(msg.arbitration_id)
@@ -174,28 +209,46 @@ class CANReader:
             message_def = self.pgn_map[pgn]
             
             try:
-                decoded = message_def.decode(msg.data)
-                return pgn, message_def.name, decoded, source_address
+                # Use smart decoder that handles variable sizes
+                decoded = self.decode_with_variable_size(message_def, msg.data)
+                
+                # Check if there was a size mismatch warning
+                warning = None
+                if isinstance(decoded, str) and "Decode Error" in decoded:
+                    warning = decoded
+                    decoded = None
+                elif len(msg.data) != message_def.length:
+                    warning = f"Size mismatch: DBC expects {message_def.length} bytes, received {len(msg.data)} bytes"
+                
+                return pgn, message_def.name, decoded, source_address, warning
             except Exception as e:
-                return pgn, message_def.name, f"Decode Error: {e}", source_address
+                return pgn, message_def.name, f"Decode Error: {e}", source_address, str(e)
         
-        return pgn, None, None, source_address
+        return pgn, None, None, source_address, None
 
-    # Normal CAN decode (fallback)
+    # Normal CAN decode with variable size handling
     def decode_normal_message(self, msg):
-        """Decode normal CAN message using full ID"""
+        """Decode normal CAN message using full ID with variable size handling"""
         if not self.db:
-            return None
+            return None, None
         
         try:
             if msg.arbitration_id in self.pgn_map:
                 message_def = self.pgn_map[msg.arbitration_id]
-                decoded = message_def.decode(msg.data)
-                return decoded
-        except:
-            pass
+                decoded = self.decode_with_variable_size(message_def, msg.data)
+                
+                warning = None
+                if isinstance(decoded, str) and "Decode Error" in decoded:
+                    warning = decoded
+                    decoded = None
+                elif len(msg.data) != message_def.length:
+                    warning = f"Size mismatch: DBC expects {message_def.length} bytes, received {len(msg.data)} bytes"
+                
+                return decoded, warning
+        except Exception as e:
+            return None, str(e)
         
-        return None
+        return None, None
 
     # Main Read Loop
     def read_messages(self, target_pgn=None, target_id=None):
@@ -210,11 +263,11 @@ class CANReader:
         print(f"Protocol Type: {self.protocol_type.upper()}")
         
         if self.protocol_type == "j1939":
-            print("Mode: J1939 - Decoding based on PGN")
+            print("Mode: J1939 - Decoding based on PGN (Variable data size supported)")
             if target_pgn:
                 print(f"Monitoring cycle time for PGN: 0x{target_pgn:04x}")
         else:
-            print("Mode: Normal CAN - Decoding based on full CAN ID")
+            print("Mode: Normal CAN - Decoding based on full CAN ID (Variable data size supported)")
             if target_id:
                 print(f"Monitoring cycle time for ID: 0x{target_id:x}")
         
@@ -234,6 +287,7 @@ class CANReader:
                 # J1939 Protocol Handling
                 if not msg.is_extended_id:
                     print(f"[{human_time}] WARNING: Received standard ID message in J1939 mode - ignoring")
+                    print("-" * 80)
                     continue
                 
                 # Extract J1939 information
@@ -249,8 +303,8 @@ class CANReader:
                 if target_pgn and pgn == target_pgn:
                     specific_cycle = cycle
                 
-                # Decode message using PGN
-                decoded_pgn, msg_name, decoded_data, src_addr = self.decode_j1939_message(msg)
+                # Decode message using PGN with variable size handling
+                decoded_pgn, msg_name, decoded_data, src_addr, warning = self.decode_j1939_message(msg)
                 
                 # Print message details
                 print(f"[{human_time}] J1939 Message:")
@@ -258,10 +312,20 @@ class CANReader:
                 print(f"    PGN: 0x{pgn:04x} | Priority: {priority} | Source: 0x{source:02x}")
                 print(f"    Data Length: {msg.dlc} bytes | Data: {msg.data.hex().upper()}")
                 
+                # Show DBC expected length if available
+                if pgn in self.pgn_map:
+                    expected_len = self.pgn_map[pgn].length
+                    if expected_len != msg.dlc:
+                        print(f"    ** DBC expects {expected_len} bytes for this message **")
+                
                 if cycle:
                     print(f"    Cycle Time (PGN 0x{pgn:04x}): {cycle:.2f} ms")
                 if specific_cycle:
                     print(f"    ** Target PGN Cycle Time: {specific_cycle:.2f} ms **")
+                
+                # Show warning if size mismatch occurred
+                if warning:
+                    print(f"    ⚠️  Warning: {warning}")
                 
                 # Show decoded data
                 if msg_name:
@@ -269,9 +333,15 @@ class CANReader:
                     if isinstance(decoded_data, dict):
                         print(f"    Decoded Data:")
                         for key, value in decoded_data.items():
-                            print(f"        {key}: {value}")
+                            # Handle physical values with units if available
+                            if isinstance(value, (int, float)):
+                                print(f"        {key}: {value}")
+                            else:
+                                print(f"        {key}: {value}")
                     elif decoded_data:
                         print(f"    Decoded: {decoded_data}")
+                    else:
+                        print(f"    Unable to decode message data")
                 else:
                     if self.db:
                         print(f"    No DBC definition found for PGN 0x{pgn:04x}")
@@ -288,24 +358,37 @@ class CANReader:
                 if target_id and msg.arbitration_id == target_id:
                     specific_cycle = cycle
                 
-                # Decode message using full ID
-                decoded_data = self.decode_normal_message(msg)
+                # Decode message using full ID with variable size handling
+                decoded_data, warning = self.decode_normal_message(msg)
                 
                 # Print message details
                 print(f"[{human_time}] Normal CAN Message:")
                 print(f"    ID: 0x{msg.arbitration_id:03x} ({'Extended' if msg.is_extended_id else 'Standard'})")
                 print(f"    Data Length: {msg.dlc} bytes | Data: {msg.data.hex().upper()}")
                 
+                # Show DBC expected length if available
+                if msg.arbitration_id in self.pgn_map:
+                    expected_len = self.pgn_map[msg.arbitration_id].length
+                    if expected_len != msg.dlc:
+                        print(f"    ** DBC expects {expected_len} bytes for this message **")
+                
                 if cycle:
                     print(f"    Cycle Time (ID 0x{msg.arbitration_id:x}): {cycle:.2f} ms")
                 if specific_cycle:
                     print(f"    ** Target ID Cycle Time: {specific_cycle:.2f} ms **")
                 
+                # Show warning if size mismatch occurred
+                if warning:
+                    print(f"    ⚠️  Warning: {warning}")
+                
                 # Show decoded data
                 if decoded_data and isinstance(decoded_data, dict):
                     print(f"    Decoded Data:")
                     for key, value in decoded_data.items():
-                        print(f"        {key}: {value}")
+                        if isinstance(value, (int, float)):
+                            print(f"        {key}: {value}")
+                        else:
+                            print(f"        {key}: {value}")
                 elif decoded_data:
                     print(f"    Decoded: {decoded_data}")
                 else:
@@ -319,8 +402,8 @@ class CANReader:
 
 # Example usage
 if __name__ == "__main__":
-    # Example 1: J1939 mode with DBC file
-    print("Example 1: J1939 Protocol")
+    # Example 1: J1939 mode with variable data size handling
+    print("Example 1: J1939 Protocol with Variable Data Size Support")
     reader_j1939 = CANReader(
         channel=0, 
         bitrate=500000, 
@@ -328,32 +411,12 @@ if __name__ == "__main__":
         protocol_type="j1939"
     )
     
-    # Example 2: J1939 with PGN-based filter
-    # pgn_filters = [{"pgn": 0xFEF1, "source": 0x12}]  # Filter for specific PGN and source
-    # reader_j1939 = CANReader(
-    #     channel=0, 
-    #     bitrate=500000, 
-    #     dbc_file="j1939.dbc",
-    #     filters=pgn_filters,
-    #     protocol_type="j1939"
-    # )
-    
-    # Example 3: Normal CAN mode
+    # Example 2: Normal CAN mode with variable data size handling
     # reader_normal = CANReader(
     #     channel=0, 
     #     bitrate=500000, 
     #     dbc_file="standard.dbc",
     #     protocol_type="normal"
-    # )
-    
-    # Example 4: J1939 with full ID filter
-    # id_filters = [{"can_id": 0x18FEF200, "can_mask": 0x1FFFFFFF, "extended": True}]
-    # reader_j1939 = CANReader(
-    #     channel=0, 
-    #     bitrate=500000, 
-    #     dbc_file="j1939.dbc",
-    #     filters=id_filters,
-    #     protocol_type="j1939"
     # )
     
     try:
