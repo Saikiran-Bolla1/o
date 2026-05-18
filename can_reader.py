@@ -2,7 +2,8 @@ import can
 import datetime
 import cantools
 import logging
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,6 +23,7 @@ class CANReader:
     - DM1 (Diagnostic Message 1) parsing with lamp status and DTC decoding
     - Cycle time monitoring for individual and target message IDs
     - Frame type detection (standard vs extended)
+    - Signal-level extraction and monitoring
     """
     
     # J1939 PGN constants
@@ -55,6 +57,8 @@ class CANReader:
         self.db = None
         self.pgn_map = {}
         self.tp_sessions = {}          # TP session storage for multi-frame messages
+        self.message_id_map = {}       # Maps message name/id to actual ID
+        self.signal_cache = {}         # Caches latest signal values
 
         if dbc_file:
             self.load_dbc(dbc_file)
@@ -64,7 +68,7 @@ class CANReader:
 
     def load_dbc(self, dbc_file: str) -> None:
         """
-        Load DBC database file and build PGN map.
+        Load DBC database file and build PGN map and message ID map.
         
         Args:
             dbc_file: Path to DBC file
@@ -74,12 +78,19 @@ class CANReader:
             logger.info(f"DBC file loaded: {dbc_file}")
 
             self.pgn_map = {}
+            self.message_id_map = {}
+            
             for msg in self.db.messages:
                 if msg.is_extended_frame:
                     pgn = self.extract_pgn_from_dbc_id(msg.frame_id)
                     self.pgn_map[pgn] = msg
+                
+                # Build message ID map (both by ID and by name)
+                self.message_id_map[msg.frame_id] = msg
+                self.message_id_map[msg.name] = msg
             
             logger.info(f"PGN map created with {len(self.pgn_map)} messages")
+            logger.info(f"Message ID map created with {len(self.message_id_map)} messages")
         except Exception as e:
             logger.error(f"Failed to load DBC file: {e}")
             raise
@@ -161,6 +172,261 @@ class CANReader:
         if msg.arbitration_id != target_id:
             return None
         return self.calculate_cycle_time(msg)
+
+    # ==================== NEW: Average Cycle Time Function ====================
+    
+    def get_average_cycle_time(self, message_id: int, num_samples: int = 10, timeout: float = 30.0) -> Optional[float]:
+        """
+        Calculate average cycle time for a specific message ID over multiple consecutive messages.
+        
+        Captures consecutive messages and computes the average time interval between them.
+        
+        Args:
+            message_id: Target message ID (arbitration ID) to monitor
+            num_samples: Number of consecutive messages to sample (default: 10)
+            timeout: Maximum time to wait for samples in seconds (default: 30.0)
+            
+        Returns:
+            Average cycle time in milliseconds, or None if timeout reached
+            
+        Example:
+            avg_cycle = reader.get_average_cycle_time(message_id=0x123, num_samples=10)
+            if avg_cycle:
+                print(f"Average cycle time: {avg_cycle:.2f} ms")
+        """
+        logger.info(f"Starting cycle time measurement for ID 0x{message_id:X} ({num_samples} samples)...")
+        
+        cycle_times = []
+        last_timestamp = None
+        start_time = datetime.datetime.now()
+        messages_received = 0
+        
+        while len(cycle_times) < num_samples - 1:  # num_samples - 1 because we need pairs
+            elapsed = (datetime.datetime.now() - start_time).total_seconds()
+            if elapsed > timeout:
+                logger.warning(f"Timeout: Collected {messages_received} messages, {len(cycle_times)} cycle times")
+                if cycle_times:
+                    avg = sum(cycle_times) / len(cycle_times)
+                    logger.info(f"Partial average: {avg:.2f} ms")
+                    return avg
+                return None
+            
+            msg = self.bus.recv(timeout=1)
+            
+            if not msg or msg.arbitration_id != message_id:
+                continue
+            
+            messages_received += 1
+            current_timestamp = msg.timestamp
+            
+            if last_timestamp is not None:
+                cycle_time = (current_timestamp - last_timestamp) * 1000  # Convert to ms
+                cycle_times.append(cycle_time)
+                logger.debug(f"Sample {len(cycle_times)}: {cycle_time:.2f} ms")
+            
+            last_timestamp = current_timestamp
+        
+        if cycle_times:
+            avg_cycle = sum(cycle_times) / len(cycle_times)
+            min_cycle = min(cycle_times)
+            max_cycle = max(cycle_times)
+            
+            logger.info(f"✅ Cycle time measurement complete!")
+            logger.info(f"   Average: {avg_cycle:.2f} ms")
+            logger.info(f"   Min: {min_cycle:.2f} ms")
+            logger.info(f"   Max: {max_cycle:.2f} ms")
+            logger.info(f"   Total messages: {messages_received}")
+            
+            print(f"\n📊 Cycle Time Statistics (ID: 0x{message_id:X})")
+            print(f"   Samples: {len(cycle_times)}")
+            print(f"   Average: {avg_cycle:.2f} ms")
+            print(f"   Min: {min_cycle:.2f} ms")
+            print(f"   Max: {max_cycle:.2f} ms")
+            print(f"   Total messages received: {messages_received}\n")
+            
+            return avg_cycle
+        
+        return None
+
+    # ==================== NEW: Read Message with Signal Names and Values ====================
+    
+    def read_message_signals(self, message_id: Optional[int] = None, 
+                            message_name: Optional[str] = None, 
+                            timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+        """
+        Read a specific CAN message by ID or name and extract all signal names and values.
+        
+        Either message_id OR message_name must be provided. If both are provided, message_id takes precedence.
+        
+        Args:
+            message_id: CAN message ID (arbitration ID) - e.g., 0x123
+            message_name: CAN message name from DBC - e.g., "EngineStatus"
+            timeout: Maximum time to wait for the message in seconds (default: 5.0)
+            
+        Returns:
+            Dictionary with:
+            - timestamp: Message timestamp
+            - message_id: CAN ID
+            - message_name: Message name from DBC
+            - signals: Dict mapping signal_name -> signal_value
+            - raw_data: Raw hex data
+            
+            Returns None if timeout reached or message not found in DBC
+            
+        Example:
+            # By ID
+            msg_data = reader.read_message_signals(message_id=0x123)
+            # By name
+            msg_data = reader.read_message_signals(message_name="EngineStatus")
+            
+            if msg_data:
+                print(f"Signals: {msg_data['signals']}")
+                print(f"Signal values: {msg_data['signals'].get('EngineRPM')}")
+        """
+        if not self.db:
+            logger.error("No DBC file loaded. Cannot read message signals.")
+            return None
+        
+        if message_id is None and message_name is None:
+            logger.error("Either message_id or message_name must be provided")
+            return None
+        
+        # Resolve message definition
+        message_def = None
+        lookup_key = message_id if message_id is not None else message_name
+        lookup_type = "ID" if message_id is not None else "name"
+        
+        if message_id is not None:
+            message_def = self.message_id_map.get(message_id)
+        else:
+            message_def = self.message_id_map.get(message_name)
+        
+        if not message_def:
+            logger.error(f"Message with {lookup_type} {lookup_key} not found in DBC")
+            return None
+        
+        actual_message_id = message_def.frame_id
+        actual_message_name = message_def.name
+        
+        logger.info(f"Waiting for message '{actual_message_name}' (ID: 0x{actual_message_id:X})...")
+        
+        start_time = datetime.datetime.now()
+        
+        while True:
+            elapsed = (datetime.datetime.now() - start_time).total_seconds()
+            if elapsed > timeout:
+                logger.warning(f"Timeout waiting for message '{actual_message_name}' after {timeout}s")
+                return None
+            
+            msg = self.bus.recv(timeout=1)
+            
+            if not msg or msg.arbitration_id != actual_message_id:
+                continue
+            
+            try:
+                decoded = message_def.decode(msg.data)
+                
+                result = {
+                    "timestamp": datetime.datetime.fromtimestamp(msg.timestamp),
+                    "message_id": msg.arbitration_id,
+                    "message_name": actual_message_name,
+                    "signals": decoded,
+                    "raw_data": msg.data.hex()
+                }
+                
+                logger.info(f"✅ Message received: '{actual_message_name}'")
+                logger.info(f"   Signals: {decoded}")
+                
+                # Cache the signals
+                self.signal_cache[actual_message_name] = decoded
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"Failed to decode message: {e}")
+                return None
+
+    # ==================== NEW: Read Signal Value by Signal Name ====================
+    
+    def get_signal_value(self, signal_name: str, message_id: Optional[int] = None,
+                        message_name: Optional[str] = None, timeout: float = 5.0) -> Optional[Any]:
+        """
+        Get the value of a specific signal from a CAN message.
+        
+        Looks up the signal in the DBC and waits for the message containing it.
+        
+        Args:
+            signal_name: Name of the signal to read (e.g., "EngineRPM")
+            message_id: Optional CAN message ID (if not provided, searches all messages)
+            message_name: Optional CAN message name (if not provided, searches all messages)
+            timeout: Maximum time to wait for the message in seconds
+            
+        Returns:
+            Signal value (type depends on signal definition), or None if not found/timeout
+            
+        Example:
+            # Get specific signal value
+            rpm_value = reader.get_signal_value("EngineRPM", message_id=0x123)
+            
+            # Or search all messages for the signal
+            temp_value = reader.get_signal_value("EngineCoolantTemp")
+            
+            if rpm_value is not None:
+                print(f"Engine RPM: {rpm_value}")
+        """
+        if not self.db:
+            logger.error("No DBC file loaded. Cannot read signal value.")
+            return None
+        
+        # Check cache first
+        for msg_name, signals in self.signal_cache.items():
+            if signal_name in signals:
+                logger.debug(f"Found '{signal_name}' in cache: {signals[signal_name]}")
+                return signals[signal_name]
+        
+        # If specific message provided, read from it
+        if message_id is not None or message_name is not None:
+            msg_data = self.read_message_signals(message_id=message_id, 
+                                                message_name=message_name, 
+                                                timeout=timeout)
+            if msg_data and signal_name in msg_data['signals']:
+                return msg_data['signals'][signal_name]
+            else:
+                logger.warning(f"Signal '{signal_name}' not found in message")
+                return None
+        
+        # Search all messages for the signal
+        logger.info(f"Searching for signal '{signal_name}' in all messages...")
+        
+        start_time = datetime.datetime.now()
+        
+        while True:
+            elapsed = (datetime.datetime.now() - start_time).total_seconds()
+            if elapsed > timeout:
+                logger.warning(f"Timeout searching for signal '{signal_name}' after {timeout}s")
+                return None
+            
+            msg = self.bus.recv(timeout=1)
+            
+            if not msg:
+                continue
+            
+            # Try to decode with each message definition
+            for message_def in self.db.messages:
+                if message_def.frame_id == msg.arbitration_id:
+                    try:
+                        decoded = message_def.decode(msg.data)
+                        
+                        if signal_name in decoded:
+                            signal_value = decoded[signal_name]
+                            logger.info(f"✅ Found '{signal_name}' = {signal_value} in message '{message_def.name}'")
+                            
+                            # Cache the signals
+                            self.signal_cache[message_def.name] = decoded
+                            
+                            return signal_value
+                    except Exception as e:
+                        logger.debug(f"Failed to decode {message_def.name}: {e}")
 
     # ==================== TP (Transport Protocol) Handling ====================
     
@@ -545,25 +811,34 @@ class CANReader:
 
 if __name__ == "__main__":
     # Example 1: Basic usage without DBC
-    reader = CANReader(channel=0, bitrate=500000)
+    # reader = CANReader(channel=0, bitrate=500000)
     
-    # Example 2: With DBC file (uncomment to use)
-    # reader = CANReader(channel=0, bitrate=500000, dbc_file="path/to/your.dbc")
+    # Example 2: With DBC file
+    reader = CANReader(channel=0, bitrate=500000, dbc_file="path/to/your.dbc")
     
     # Example 3: With filters
     # filters = [{"can_id": 0x18FEF100, "can_mask": 0x1FFFFFFF}]
     # reader = CANReader(channel=0, bitrate=500000, filters=filters)
     
     try:
-        # Read all messages (with automatic TP and DM1 handling)
-        reader.read_messages()
+        # ===== NEW FEATURE 1: Get average cycle time over 10 samples =====
+        # avg_cycle = reader.get_average_cycle_time(message_id=0x123, num_samples=10)
+        # if avg_cycle:
+        #     print(f"Average cycle time: {avg_cycle:.2f} ms")
         
-        # Alternative: Wait for specific DM1 message
-        # dm1_msg = reader.get_dm1_message(timeout=10.0)
-        # if dm1_msg:
-        #     print(f"DM1 received at {dm1_msg['timestamp']}")
-        #     print(f"Raw data: {dm1_msg['raw_data']}")
-        #     reader.print_dm1(dm1_msg['decoded'])
+        # ===== NEW FEATURE 2: Read message by ID or name with all signals =====
+        # msg_data = reader.read_message_signals(message_name="EngineStatus")
+        # if msg_data:
+        #     print(f"Message: {msg_data['message_name']}")
+        #     print(f"All signals: {msg_data['signals']}")
+        
+        # ===== NEW FEATURE 3: Get specific signal value =====
+        # rpm_value = reader.get_signal_value("EngineRPM", message_id=0x123)
+        # if rpm_value is not None:
+        #     print(f"Engine RPM: {rpm_value}")
+        
+        # ===== Original: Read all messages =====
+        reader.read_messages()
         
     except KeyboardInterrupt:
         print("\nApplication terminated by user")
