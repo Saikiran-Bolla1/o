@@ -603,22 +603,42 @@ class CANReader:
         Wait for and retrieve a DM1 diagnostic message from the CAN bus.
         
         Monitors the bus for DM1 messages (single-frame or multi-frame via TP).
+        Stops listening and returns immediately upon receiving DM1.
         
         Args:
             timeout: Maximum time to wait for DM1 message in seconds
             
         Returns:
-            Dictionary with timestamp, arbitration_id, pgn, raw_data, and decoded DM1 data
+            Dictionary with timestamp, arbitration_id, pgn, raw_data, and decoded DM1 data:
+            {
+                "timestamp": datetime,
+                "arbitration_id": int,
+                "pgn": 0xFECA,
+                "raw_data": "hex_string",
+                "decoded": {
+                    "lamp_status": {...},
+                    "DTCs": [...]
+                }
+            }
             Returns None if timeout reached without receiving DM1
+            
+        Example:
+            dm1 = reader.get_dm1_message(timeout=10)
+            if dm1:
+                print(f"DM1 received at {dm1['timestamp']}")
+                print(f"Lamp Status: {dm1['decoded']['lamp_status']}")
+                print(f"DTCs: {dm1['decoded']['DTCs']}")
         """
         start_time = datetime.datetime.now()
         
         logger.info(f"Waiting for DM1 message (timeout: {timeout}s)...")
+        print(f"⏳ Listening for DM1 message... (timeout: {timeout}s)")
         
         while True:
             elapsed = (datetime.datetime.now() - start_time).total_seconds()
             if elapsed > timeout:
                 logger.warning(f"Timeout waiting for DM1 message after {timeout}s")
+                print(f"❌ Timeout: No DM1 message received after {timeout}s")
                 return None
             
             msg = self.bus.recv(timeout=1)
@@ -638,7 +658,8 @@ class CANReader:
                     "raw_data": msg.data.hex(),
                     "decoded": decoded
                 }
-                logger.info("DM1 message received (single-frame)")
+                logger.info("✅ DM1 message received (single-frame)")
+                self.print_dm1(decoded)
                 return result
             
             # Check for multi-frame DM1 via TP
@@ -658,7 +679,8 @@ class CANReader:
                             "raw_data": full_data.hex(),
                             "decoded": decoded
                         }
-                        logger.info("DM1 message received (multi-frame via TP)")
+                        logger.info("✅ DM1 message received (multi-frame via TP)")
+                        self.print_dm1(decoded)
                         return result
 
     # ==================== Standard CAN Message Decoding ====================
@@ -773,7 +795,9 @@ class CANReader:
                 # Standard J1939 decoding
                 elif msg.is_extended_id:
                     pgn, name, decoded = self.decode_j1939_by_pgn(msg)
-                    print(f"Name: {name}, Decoded: {decoded}")
+                    if name:
+                        print(f"Name: {name}")
+                    print(f"Decoded: {decoded}")
                 
                 # Standard CAN decoding
                 else:
@@ -821,24 +845,42 @@ if __name__ == "__main__":
     # reader = CANReader(channel=0, bitrate=500000, filters=filters)
     
     try:
-        # ===== NEW FEATURE 1: Get average cycle time over 10 samples =====
+        # ===== FEATURE 1: Get DM1 message and return it =====
+        print("=" * 60)
+        print("DM1 MESSAGE READER")
+        print("=" * 60)
+        dm1_msg = reader.get_dm1_message(timeout=10.0)
+        
+        if dm1_msg:
+            print(f"\n✅ DM1 Data Retrieved Successfully!")
+            print(f"Timestamp: {dm1_msg['timestamp']}")
+            print(f"Arbitration ID: 0x{dm1_msg['arbitration_id']:08X}")
+            print(f"PGN: 0x{dm1_msg['pgn']:04X}")
+            print(f"Raw Data (hex): {dm1_msg['raw_data']}")
+            print(f"\nDecoded DM1:")
+            print(f"  Lamp Status: {dm1_msg['decoded']['lamp_status']}")
+            print(f"  DTCs: {dm1_msg['decoded']['DTCs']}")
+        else:
+            print("❌ No DM1 message received within timeout period")
+        
+        # ===== FEATURE 2: Get average cycle time =====
         # avg_cycle = reader.get_average_cycle_time(message_id=0x123, num_samples=10)
         # if avg_cycle:
         #     print(f"Average cycle time: {avg_cycle:.2f} ms")
         
-        # ===== NEW FEATURE 2: Read message by ID or name with all signals =====
+        # ===== FEATURE 3: Read message by ID or name with all signals =====
         # msg_data = reader.read_message_signals(message_name="EngineStatus")
         # if msg_data:
         #     print(f"Message: {msg_data['message_name']}")
         #     print(f"All signals: {msg_data['signals']}")
         
-        # ===== NEW FEATURE 3: Get specific signal value =====
+        # ===== FEATURE 4: Get specific signal value =====
         # rpm_value = reader.get_signal_value("EngineRPM", message_id=0x123)
         # if rpm_value is not None:
         #     print(f"Engine RPM: {rpm_value}")
         
-        # ===== Original: Read all messages =====
-        reader.read_messages()
+        # ===== Original: Read all messages continuously =====
+        # reader.read_messages()
         
     except KeyboardInterrupt:
         print("\nApplication terminated by user")
