@@ -1,47 +1,26 @@
 import logging
 import time
-import can
 import j1939
 
 logging.getLogger('j1939').setLevel(logging.INFO)
-logging.getLogger('can').setLevel(logging.WARNING)
+logging.getLogger('can').setLevel(logging.INFO)
 
 
-# -----------------------------
-# DM1 CALLBACK (FULL DECODE)
-# -----------------------------
 def dm1_receive(priority, lamp_status, dtc_list, timestamp):
-    print("\n🔥 DM1 RECEIVED")
-    print(f"Priority: {priority} | Time: {timestamp}")
-
-    # Lamp status decoding
-    print("Lamp Status:")
-    print(f"  MIL: {lamp_status.mil}")
-    print(f"  RSL: {lamp_status.rsl}")
-    print(f"  AWL: {lamp_status.awl}")
-    print(f"  PL : {lamp_status.pl}")
+    print("\n===== DM1 Received =====")
+    print(f"Priority: {priority}, Timestamp: {timestamp}")
+    print(f"Lamp Status: {lamp_status}")
 
     if not dtc_list:
-        print("No active DTCs ✅")
+        print("No active DTCs")
         return
 
-    print("\nActive DTCs:")
-    for i, dtc in enumerate(dtc_list, 1):
-        spn = dtc['spn']
-        fmi = dtc['fmi']
-        oc = dtc.get('oc', 0)
-
-        print(f"  DTC {i}:")
-        print(f"     SPN: {spn}")
-        print(f"     FMI: {fmi}")
-        print(f"     OC : {oc}")
+    for dtc in dtc_list:
+        print(f"SPN: {dtc['spn']}, FMI: {dtc['fmi']}, OC: {dtc.get('oc', 0)}")
 
 
-# -----------------------------
-# MAIN
-# -----------------------------
 def main():
-    print("🚀 Initializing DM1 Reader (Vector + J1939)")
+    print("Initializing DM1 Reader (Vector)")
 
     ecu = j1939.ElectronicControlUnit()
 
@@ -52,11 +31,8 @@ def main():
         bitrate=250000
     )
 
-    # -----------------------------
-    # Controller Application
-    # -----------------------------
     name = j1939.Name(
-        arbitrary_address_capable=0,
+        arbitrary_address_capable=1,
         industry_group=j1939.Name.IndustryGroup.Industrial,
         vehicle_system_instance=1,
         vehicle_system=1,
@@ -67,32 +43,21 @@ def main():
         identity_number=1234567
     )
 
-    ca = j1939.ControllerApplication(name, 0xF1)
-    ecu.add_ca(controller_application=ca)
+    # Let stack choose address
+    ca = j1939.ControllerApplication(name, None)
+    ecu.add_ca(ca)
 
-    # -----------------------------
-    # DM1 Subscription (IMPORTANT)
-    # -----------------------------
     dm1 = j1939.Dm1(ca)
     dm1.subscribe(dm1_receive)
 
-    # OPTIONAL: Request DM1 (if ECU doesn't broadcast)
-    # dm1.request()
-
     ca.start()
 
-    print("📡 Listening for DM1 messages...")
+    print("Listening for DM1 messages for 120 seconds...")
+    time.sleep(120)
 
-    try:
-        while True:
-            time.sleep(1)
-
-    except KeyboardInterrupt:
-        print("\n🛑 Stopping...")
-
-    finally:
-        ca.stop()
-        ecu.disconnect()
+    print("Stopping...")
+    ca.stop()
+    ecu.disconnect()
 
 
 if __name__ == '__main__':
