@@ -1,0 +1,22 @@
+import can
+import j1939
+
+# 1. Setup the basic python-can bus
+bus = can.interface.Bus(channel='can0', bustype='socketcan')
+
+# 2. Attach the J1939 stack
+ecu = j1939.ElectronicControlUnit(bus=bus)
+
+class DM1Receiver(j1939.ControllerApplication):
+    def on_message(self, pgn, data):
+        # 3. Handle incoming PGNs (DM1 is PGN 65226 / 0xFECA)
+        if pgn == 65226: 
+            print(f"DM1 Message Received, Total Length: {len(data)}")
+            # Process your DM1 DTC array here
+
+ca = DM1Receiver(name="MyECU")
+ecu.add_controller_application(ca)
+
+# Run your listening loop
+while True:
+    ecu.process()
