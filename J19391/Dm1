@@ -3,24 +3,11 @@ import time
 import can
 import j1939
 
-# Enable debug logging
 logging.getLogger('j1939').setLevel(logging.DEBUG)
 logging.getLogger('can').setLevel(logging.DEBUG)
 
 def dm1_receive(lamp_status, dtc_list):
-    """Callback for receiving DM1 messages
-    
-    :param dict lamp_status:
-        Dictionary containing lamp status:
-        - 'pl':  Protect lamp
-        - 'awl': Amber warning lamp
-        - 'rsl': Red stop lamp  
-        - 'mil': Malfunction indicator lamp
-        
-    :param list dtc_list:
-        List of active Diagnostic Trouble Codes (DTCs)
-        Each DTC dict contains: 'spn', 'fmi', 'oc' (occurrence counter)
-    """
+    """Callback for receiving DM1 messages"""
     print(f"DM1 Received - Lamp Status: {lamp_status}")
     print(f"Active DTCs: {dtc_list}")
     for dtc in dtc_list:
@@ -29,25 +16,26 @@ def dm1_receive(lamp_status, dtc_list):
 def main():
     print("Initializing DM1 Reader with Vector CAN Driver")
     
-    # Create the ElectronicControlUnit
     ecu = j1939.ElectronicControlUnit()
     
-    # Connect using Vector CAN driver (CANalyzer)
+    # Connect using Vector CAN driver
     ecu.connect(
         bustype='vector',
-        app_name='CANalyzer',  # or 'CANoe'
+        app_name='CANalyzer',
         channel=0,
         bitrate=250000
     )
     
-    # Optional: Subscribe to all messages on the bus
+    # Subscribe to all messages
     def on_message(priority, pgn, sa, timestamp, data):
         if pgn == 0xFECA:  # DM1 PGN
-            print(f"Raw DM1 PGN {hex(pgn)} from {hex(sa)}: {data.hex()}")
+            # Convert bytearray to hex string
+            hex_data = ''.join(f'{byte:02x}' for byte in data)
+            print(f"Raw DM1 PGN {hex(pgn)} from {hex(sa)}: {hex_data}")
     
     ecu.subscribe(on_message)
     
-    # Create a Name descriptor for your CA
+    # Create CA
     name = j1939.Name(
         arbitrary_address_capable=0,
         industry_group=j1939.Name.IndustryGroup.Industrial,
@@ -60,18 +48,16 @@ def main():
         identity_number=1234567
     )
     
-    # Create and add Controller Application
     ca = j1939.ControllerApplication(name, 0xF1)
     ecu.add_ca(controller_application=ca)
     
-    # Create DM1 instance and subscribe to DM1 messages
+    # Subscribe to DM1 messages
     dm1 = j1939.Dm1(ca)
     dm1.subscribe(dm1_receive)
     
-    # Start the CA (triggers address claiming)
     ca.start()
     
-    print("Listening for DM1 messages... (running for 120 seconds)")
+    print("Listening for DM1 messages... (120 seconds)")
     time.sleep(120)
     
     print("Shutting down")
