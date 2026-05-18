@@ -1,0 +1,162 @@
+import can
+import datetime
+import cantools
+
+class CANReader:
+    def __init__(self, channel=0, bitrate=500000, dbc_file=None, filters=None):
+        """
+        Initialize Vector CAN interface
+        """
+        self.bus = can.interface.Bus(
+            bustype='vector',
+            channel=channel,
+            bitrate=bitrate
+        )
+
+        self.last_timestamps = {}  # For cycle time
+        self.db = None
+        self.pgn_map = {}
+
+        if dbc_file:
+            self.load_dbc(dbc_file)
+
+        if filters:
+            self.set_filters(filters)
+
+    # DBC Load + PGN Mapping
+    def load_dbc(self, dbc_file):
+        self.db = cantools.database.load_file(dbc_file)
+
+        self.pgn_map = {}
+        for msg in self.db.messages:
+            if msg.is_extended_frame:
+                pgn = self.extract_pgn_from_dbc_id(msg.frame_id)
+                self.pgn_map[pgn] = msg
+
+    # Filters
+    def set_filters(self, filter_list):
+        self.bus.set_filters(filter_list)
+
+    # PGN extraction (correct J1939)
+    def get_pgn(self, arbitration_id):
+        pf = (arbitration_id >> 16) & 0xFF
+        ps = (arbitration_id >> 8) & 0xFF
+
+        if pf >= 240:  # PDU2
+            return (pf << 8) | ps
+        else:          # PDU1
+            return (pf << 8)
+
+    def extract_pgn_from_dbc_id(self, frame_id):
+        return self.get_pgn(frame_id)
+
+    # Cycle Time (all IDs)
+    def calculate_cycle_time(self, msg):
+        msg_id = msg.arbitration_id
+        cycle = None
+
+        if msg_id in self.last_timestamps:
+            cycle = (msg.timestamp - self.last_timestamps[msg_id]) * 1000  # ms
+
+        self.last_timestamps[msg_id] = msg.timestamp
+        return cycle
+
+    # Cycle Time (specific ID)
+    def get_specific_cycle_time(self, msg, target_id):
+        if msg.arbitration_id != target_id:
+            return None
+        return self.calculate_cycle_time(msg)
+
+    # Standard CAN decode
+    def decode_standard(self, msg):
+        if not self.db or msg.is_extended_id:
+            return None
+
+        try:
+            return self.db.decode_message(msg.arbitration_id, msg.data)
+        except:
+            return None
+
+    # J1939 PGN-based decode
+    def decode_j1939_by_pgn(self, msg):
+        if not self.db or not msg.is_extended_id:
+            return None, None, None
+
+        pgn = self.get_pgn(msg.arbitration_id)
+
+        if pgn in self.pgn_map:
+            message_def = self.pgn_map[pgn]
+
+            try:
+                decoded = message_def.decode(msg.data)
+                return pgn, message_def.name, decoded
+            except Exception as e:
+                return pgn, message_def.name, f"Decode Error: {e}"
+
+        return pgn, None, None
+
+    # Main Read Loop
+    def read_messages(self, target_id=None):
+        print("Listening to CAN bus...\n")
+
+        while True:
+            msg = self.bus.recv(timeout=1)
+
+            if not msg:
+                continue
+
+            # Timestamp
+            ts = msg.timestamp
+            human_time = datetime.datetime.fromtimestamp(ts)
+
+            # Cycle time (global)
+            cycle = self.calculate_cycle_time(msg)
+
+            # Cycle time (specific ID)
+            specific_cycle = None
+            if target_id:
+                specific_cycle = self.get_specific_cycle_time(msg, target_id)
+
+            # Decode based on frame type
+            if msg.is_extended_id:
+                pgn, name, decoded = self.decode_j1939_by_pgn(msg)
+                print(f"[{human_time}] J1939 - ID: 0x{msg.arbitration_id:08x}, PGN: 0x{pgn:04x}, Name: {name}")
+                print(f"    Data: {msg.data.hex()}")
+                print(f"    Decoded: {decoded}")
+                if cycle:
+                    print(f"    Cycle Time: {cycle:.2f} ms")
+                if specific_cycle:
+                    print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
+            else:
+                decoded = self.decode_standard(msg)
+                print(f"[{human_time}] Standard - ID: 0x{msg.arbitration_id:03x}")
+                print(f"    Data: {msg.data.hex()}")
+                print(f"    Decoded: {decoded}")
+                if cycle:
+                    print(f"    Cycle Time: {cycle:.2f} ms")
+                if specific_cycle:
+                    print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
+            
+            print("-" * 60)
+
+
+# Example usage
+if __name__ == "__main__":
+    # Without DBC file
+    reader = CANReader(channel=0, bitrate=500000)
+    
+    # With DBC file (uncomment and provide path)
+    # reader = CANReader(channel=0, bitrate=500000, dbc_file="path/to/your.dbc")
+    
+    # With filters (example)
+    # filters = [{"can_id": 0x123, "can_mask": 0x7FF}]
+    # reader = CANReader(channel=0, bitrate=500000, filters=filters)
+    
+    try:
+        # Read all messages
+        reader.read_messages()
+        
+        # Or read with specific target ID for cycle time monitoring
+        # reader.read_messages(target_id=0x123)
+    except KeyboardInterrupt:
+        print("\nStopped by user")
