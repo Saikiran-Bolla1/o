@@ -72,6 +72,11 @@ class J1939Handler:
         """
         Extract PGN (Parameter Group Number) from CAN ID
         
+        J1939 Message ID format (29-bit):
+        Bits 26-28: Priority (3 bits)
+        Bits 8-15:  PDU Format (PF) (8 bits)
+        Bits 0-7:   PDU Specific (PS) or Destination Address (8 bits)
+        
         Args:
             arbitration_id: 29-bit extended CAN ID
             
@@ -90,20 +95,34 @@ class J1939Handler:
 
     @staticmethod
     def extract_source_address(arbitration_id: int) -> int:
-        """Extract source address from CAN ID"""
+        """
+        Extract source address from CAN ID
+        
+        J1939 source address is in bits 0-7
+        """
         return (arbitration_id >> 0) & 0xFF
 
     @staticmethod
     def extract_destination_address(arbitration_id: int) -> int:
-        """Extract destination address from CAN ID (PDU1 format only)"""
+        """
+        Extract destination address from CAN ID (PDU1 format only)
+        
+        In PDU1 format (PF < 240), the PS field (bits 0-7) contains the destination address
+        In PDU2 format (PF >= 240), there is no specific destination address
+        """
         pf = (arbitration_id >> 8) & 0xFF
         if pf < 240:  # PDU1 format
-            return (arbitration_id >> 8) & 0xFF
+            # Destination address is in bits 0-7 (PS field in PDU1)
+            return (arbitration_id >> 0) & 0xFF
         return None
 
     @staticmethod
     def extract_priority(arbitration_id: int) -> int:
-        """Extract priority from CAN ID"""
+        """
+        Extract priority from CAN ID
+        
+        Priority is in bits 26-28 (3 bits)
+        """
         return (arbitration_id >> 26) & 0x07
 
     @staticmethod
@@ -112,10 +131,16 @@ class J1939Handler:
         """
         Create J1939 CAN ID from components
         
+        J1939 Message ID format (29-bit):
+        Bits 26-28: Priority (3 bits)
+        Bits 8-15:  PDU Format (8 bits)
+        Bits 0-7:   PDU Specific (8 bits)
+        Source address is combined with other fields
+        
         Args:
             priority: 3-bit priority (0-7)
             pdu_format: 8-bit PDU format
-            pdu_specific: 8-bit PDU specific (PS)
+            pdu_specific: 8-bit PDU specific (PS) or destination address
             source: 8-bit source address
             
         Returns:
