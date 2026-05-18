@@ -1,11 +1,19 @@
+
 import can
 import datetime
 import cantools
 
 class CANReader:
-    def __init__(self, channel=0, bitrate=500000, dbc_file=None, filters=None):
+    def __init__(self, channel=0, bitrate=500000, dbc_file=None, filters=None, protocol_type="j1939"):
         """
         Initialize Vector CAN interface
+        
+        Args:
+            channel: CAN channel number
+            bitrate: CAN bitrate in bps
+            dbc_file: Path to DBC file (optional)
+            filters: CAN filters list (optional) - For J1939, can use full 29-bit ID or PGN
+            protocol_type: "j1939" or "normal" (J1939 is default)
         """
         self.bus = can.interface.Bus(
             bustype='vector',
@@ -16,6 +24,7 @@ class CANReader:
         self.last_timestamps = {}  # For cycle time
         self.db = None
         self.pgn_map = {}
+        self.protocol_type = protocol_type  # "j1939" or "normal"
 
         if dbc_file:
             self.load_dbc(dbc_file)
@@ -23,84 +32,193 @@ class CANReader:
         if filters:
             self.set_filters(filters)
 
-    # DBC Load + PGN Mapping
+    # DBC Load + PGN Mapping (J1939 specific)
     def load_dbc(self, dbc_file):
+        """Load DBC file and map messages by PGN for J1939"""
         self.db = cantools.database.load_file(dbc_file)
 
         self.pgn_map = {}
         for msg in self.db.messages:
-            if msg.is_extended_frame:
-                pgn = self.extract_pgn_from_dbc_id(msg.frame_id)
-                self.pgn_map[pgn] = msg
+            if self.protocol_type == "j1939":
+                # For J1939, map by PGN
+                if msg.is_extended_frame:
+                    pgn = self.extract_pgn_from_dbc_id(msg.frame_id)
+                    self.pgn_map[pgn] = msg
+            else:
+                # For normal CAN, map by full ID
+                self.pgn_map[msg.frame_id] = msg
 
-    # Filters
+    # Set hardware filters
     def set_filters(self, filter_list):
-        self.bus.set_filters(filter_list)
+        """
+        Set CAN hardware filters
+        
+        For J1939, filter_list can contain:
+        1. Full 29-bit IDs: {"can_id": 0x18FEF200, "can_mask": 0x1FFFFFFF, "extended": True}
+        2. PGN-based filters (converted to ID range)
+        """
+        processed_filters = []
+        
+        for f in filter_list:
+            if self.protocol_type == "j1939" and "pgn" in f:
+                # Convert PGN filter to full 29-bit ID filter
+                pgn = f["pgn"]
+                source = f.get("source", 0xFF)  # Source address mask
+                
+                # Build 29-bit ID from PGN
+                # J1939 ID structure: Priority(3) | Reserved(2) | Data Page(1) | PDU Format(8) | PDU Specific(8) | Source(8)
+                priority = f.get("priority", 6)  # Default priority 6
+                dp = (pgn >> 16) & 0x01  # Data Page
+                pf = (pgn >> 8) & 0xFF   # PDU Format
+                ps = pgn & 0xFF          # PDU Specific
+                
+                can_id = (priority << 26) | (dp << 24) | (pf << 16) | (ps << 8) | source
+                can_mask = 0x1FFFFFFF  # Mask all bits
+                
+                processed_filters.append({
+                    "can_id": can_id,
+                    "can_mask": can_mask,
+                    "extended": True
+                })
+            else:
+                # Use filter as-is
+                processed_filters.append(f)
+        
+        if processed_filters:
+            self.bus.set_filters(processed_filters)
 
-    # PGN extraction (correct J1939)
-    def get_pgn(self, arbitration_id):
+    # PGN extraction from J1939 arbitration ID (29-bit)
+    def get_pgn_from_id(self, arbitration_id):
+        """
+        Extract PGN from J1939 extended arbitration ID (29-bit)
+        
+        J1939 ID structure (29-bit):
+        Bits 28-26: Priority (3 bits)
+        Bits 25-24: Reserved (2 bits)
+        Bit 23: Data Page (1 bit)
+        Bits 16-22: PDU Format (PF) (8 bits)
+        Bits 8-15: PDU Specific (PS) (8 bits)
+        Bits 0-7: Source Address (SA) (8 bits)
+        """
+        # Extract PDU Format (PF) - bits 16-22
         pf = (arbitration_id >> 16) & 0xFF
+        
+        # Extract PDU Specific (PS) - bits 8-15
         ps = (arbitration_id >> 8) & 0xFF
-
-        if pf >= 240:  # PDU2
-            return (pf << 8) | ps
-        else:          # PDU1
-            return (pf << 8)
+        
+        # Extract Data Page (DP) - bit 23
+        dp = (arbitration_id >> 24) & 0x01
+        
+        # Calculate PGN according to J1939 standard
+        if pf < 240:  # PDU1 format (peer-to-peer)
+            pgn = (dp << 16) | (pf << 8)
+        else:  # PDU2 format (broadcast)
+            pgn = (dp << 16) | (pf << 8) | ps
+        
+        return pgn
 
     def extract_pgn_from_dbc_id(self, frame_id):
-        return self.get_pgn(frame_id)
+        """Extract PGN from DBC frame ID"""
+        return self.get_pgn_from_id(frame_id)
 
-    # Cycle Time (all IDs)
-    def calculate_cycle_time(self, msg):
-        msg_id = msg.arbitration_id
+    # Build full CAN ID from PGN
+    def build_id_from_pgn(self, pgn, source=0xFF, priority=6):
+        """
+        Build full 29-bit CAN ID from PGN for J1939
+        
+        Args:
+            pgn: Parameter Group Number (18-bit)
+            source: Source address (8-bit, default 0xFF for any)
+            priority: Priority (3-bit, 0-7, default 6)
+        
+        Returns:
+            29-bit CAN ID
+        """
+        dp = (pgn >> 16) & 0x01  # Data Page
+        pf = (pgn >> 8) & 0xFF   # PDU Format
+        ps = pgn & 0xFF          # PDU Specific
+        
+        can_id = (priority << 26) | (dp << 24) | (pf << 16) | (ps << 8) | source
+        return can_id
+
+    # Cycle Time calculation
+    def calculate_cycle_time(self, msg_id, timestamp):
+        """Calculate cycle time for a specific message ID"""
         cycle = None
-
+        
         if msg_id in self.last_timestamps:
-            cycle = (msg.timestamp - self.last_timestamps[msg_id]) * 1000  # ms
-
-        self.last_timestamps[msg_id] = msg.timestamp
+            cycle = (timestamp - self.last_timestamps[msg_id]) * 1000  # ms
+        
+        self.last_timestamps[msg_id] = timestamp
         return cycle
 
-    # Cycle Time (specific ID)
-    def get_specific_cycle_time(self, msg, target_id):
-        if msg.arbitration_id != target_id:
-            return None
-        return self.calculate_cycle_time(msg)
-
-    # Standard CAN decode
-    def decode_standard(self, msg):
-        if not self.db or msg.is_extended_id:
-            return None
-
-        try:
-            return self.db.decode_message(msg.arbitration_id, msg.data)
-        except Exception as e:
-            print(f"      Standard decode error: {e}")
-            return None
-
-    # J1939 PGN-based decode
-    def decode_j1939_by_pgn(self, msg):
+    # J1939 PGN-based decode (primary method)
+    def decode_j1939_message(self, msg):
+        """
+        Decode J1939 message using PGN
+        
+        Returns:
+            tuple: (pgn, message_name, decoded_data, source_address)
+        """
         if not self.db or not msg.is_extended_id:
-            return None, None, None
-
-        pgn = self.get_pgn(msg.arbitration_id)
-
+            return None, None, None, None
+        
+        # Extract PGN from the message ID
+        pgn = self.get_pgn_from_id(msg.arbitration_id)
+        
+        # Extract source address
+        source_address = msg.arbitration_id & 0xFF
+        
+        # Look up message by PGN
         if pgn in self.pgn_map:
             message_def = self.pgn_map[pgn]
-
+            
             try:
-                # Use db.decode_message with the frame_id from the message definition
-                decoded = self.db.decode_message(message_def.frame_id, msg.data)
-                return pgn, message_def.name, decoded
+                decoded = message_def.decode(msg.data)
+                return pgn, message_def.name, decoded, source_address
             except Exception as e:
-                print(f"      J1939 decode error for PGN 0x{pgn:04x}: {e}")
-                return pgn, message_def.name, f"Decode Error: {e}"
+                return pgn, message_def.name, f"Decode Error: {e}", source_address
+        
+        return pgn, None, None, source_address
 
-        return pgn, None, None
+    # Normal CAN decode (fallback)
+    def decode_normal_message(self, msg):
+        """Decode normal CAN message using full ID"""
+        if not self.db:
+            return None
+        
+        try:
+            if msg.arbitration_id in self.pgn_map:
+                message_def = self.pgn_map[msg.arbitration_id]
+                decoded = message_def.decode(msg.data)
+                return decoded
+        except:
+            pass
+        
+        return None
 
     # Main Read Loop
-    def read_messages(self, target_id=None):
+    def read_messages(self, target_pgn=None, target_id=None):
+        """
+        Read messages from CAN bus
+        
+        Args:
+            target_pgn: Specific PGN to monitor for cycle time (J1939 only)
+            target_id: Specific CAN ID to monitor for cycle time (normal CAN only)
+        """
         print("Listening to CAN bus...\n")
+        print(f"Protocol Type: {self.protocol_type.upper()}")
+        
+        if self.protocol_type == "j1939":
+            print("Mode: J1939 - Decoding based on PGN")
+            if target_pgn:
+                print(f"Monitoring cycle time for PGN: 0x{target_pgn:04x}")
+        else:
+            print("Mode: Normal CAN - Decoding based on full CAN ID")
+            if target_id:
+                print(f"Monitoring cycle time for ID: 0x{target_id:x}")
+        
+        print("-" * 80)
 
         while True:
             msg = self.bus.recv(timeout=1)
@@ -112,54 +230,143 @@ class CANReader:
             ts = msg.timestamp
             human_time = datetime.datetime.fromtimestamp(ts)
 
-            # Cycle time (global)
-            cycle = self.calculate_cycle_time(msg)
-
-            # Cycle time (specific ID)
-            specific_cycle = None
-            if target_id:
-                specific_cycle = self.get_specific_cycle_time(msg, target_id)
-
-            # Decode based on frame type
-            if msg.is_extended_id:
-                pgn, name, decoded = self.decode_j1939_by_pgn(msg)
-                print(f"[{human_time}] J1939 - ID: 0x{msg.arbitration_id:08x}, PGN: 0x{pgn:04x}, Name: {name}")
-                print(f"    Data: {msg.data.hex()}")
-                print(f"    Decoded: {decoded}")
+            if self.protocol_type == "j1939":
+                # J1939 Protocol Handling
+                if not msg.is_extended_id:
+                    print(f"[{human_time}] WARNING: Received standard ID message in J1939 mode - ignoring")
+                    continue
+                
+                # Extract J1939 information
+                pgn = self.get_pgn_from_id(msg.arbitration_id)
+                source = msg.arbitration_id & 0xFF
+                priority = (msg.arbitration_id >> 26) & 0x07
+                
+                # Calculate cycle time based on PGN
+                cycle = self.calculate_cycle_time(pgn, ts)
+                
+                # Calculate specific cycle time if target PGN specified
+                specific_cycle = None
+                if target_pgn and pgn == target_pgn:
+                    specific_cycle = cycle
+                
+                # Decode message using PGN
+                decoded_pgn, msg_name, decoded_data, src_addr = self.decode_j1939_message(msg)
+                
+                # Print message details
+                print(f"[{human_time}] J1939 Message:")
+                print(f"    Full ID: 0x{msg.arbitration_id:08x}")
+                print(f"    PGN: 0x{pgn:04x} | Priority: {priority} | Source: 0x{source:02x}")
+                print(f"    Data Length: {msg.dlc} bytes | Data: {msg.data.hex().upper()}")
+                
                 if cycle:
-                    print(f"    Cycle Time: {cycle:.2f} ms")
+                    print(f"    Cycle Time (PGN 0x{pgn:04x}): {cycle:.2f} ms")
                 if specific_cycle:
-                    print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
-            else:
-                decoded = self.decode_standard(msg)
-                print(f"[{human_time}] Standard - ID: 0x{msg.arbitration_id:03x}")
-                print(f"    Data: {msg.data.hex()}")
-                print(f"    Decoded: {decoded}")
-                if cycle:
-                    print(f"    Cycle Time: {cycle:.2f} ms")
-                if specific_cycle:
-                    print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
+                    print(f"    ** Target PGN Cycle Time: {specific_cycle:.2f} ms **")
+                
+                # Show decoded data
+                if msg_name:
+                    print(f"    Message Name: {msg_name}")
+                    if isinstance(decoded_data, dict):
+                        print(f"    Decoded Data:")
+                        for key, value in decoded_data.items():
+                            print(f"        {key}: {value}")
+                    elif decoded_data:
+                        print(f"    Decoded: {decoded_data}")
+                else:
+                    if self.db:
+                        print(f"    No DBC definition found for PGN 0x{pgn:04x}")
+                    else:
+                        print(f"    No DBC file loaded - raw data only")
             
-            print("-" * 60)
+            else:
+                # Normal CAN Protocol Handling
+                # Calculate cycle time based on full ID
+                cycle = self.calculate_cycle_time(msg.arbitration_id, ts)
+                
+                # Calculate specific cycle time if target ID specified
+                specific_cycle = None
+                if target_id and msg.arbitration_id == target_id:
+                    specific_cycle = cycle
+                
+                # Decode message using full ID
+                decoded_data = self.decode_normal_message(msg)
+                
+                # Print message details
+                print(f"[{human_time}] Normal CAN Message:")
+                print(f"    ID: 0x{msg.arbitration_id:03x} ({'Extended' if msg.is_extended_id else 'Standard'})")
+                print(f"    Data Length: {msg.dlc} bytes | Data: {msg.data.hex().upper()}")
+                
+                if cycle:
+                    print(f"    Cycle Time (ID 0x{msg.arbitration_id:x}): {cycle:.2f} ms")
+                if specific_cycle:
+                    print(f"    ** Target ID Cycle Time: {specific_cycle:.2f} ms **")
+                
+                # Show decoded data
+                if decoded_data and isinstance(decoded_data, dict):
+                    print(f"    Decoded Data:")
+                    for key, value in decoded_data.items():
+                        print(f"        {key}: {value}")
+                elif decoded_data:
+                    print(f"    Decoded: {decoded_data}")
+                else:
+                    if self.db:
+                        print(f"    No DBC definition found for ID 0x{msg.arbitration_id:x}")
+                    else:
+                        print(f"    No DBC file loaded - raw data only")
+            
+            print("-" * 80)
 
 
 # Example usage
 if __name__ == "__main__":
-    # Without DBC file
-    reader = CANReader(channel=0, bitrate=500000)
+    # Example 1: J1939 mode with DBC file
+    print("Example 1: J1939 Protocol")
+    reader_j1939 = CANReader(
+        channel=0, 
+        bitrate=500000, 
+        dbc_file="j1939.dbc",  # Your J1939 DBC file
+        protocol_type="j1939"
+    )
     
-    # With DBC file (uncomment and provide path)
-    # reader = CANReader(channel=0, bitrate=500000, dbc_file="path/to/your.dbc")
+    # Example 2: J1939 with PGN-based filter
+    # pgn_filters = [{"pgn": 0xFEF1, "source": 0x12}]  # Filter for specific PGN and source
+    # reader_j1939 = CANReader(
+    #     channel=0, 
+    #     bitrate=500000, 
+    #     dbc_file="j1939.dbc",
+    #     filters=pgn_filters,
+    #     protocol_type="j1939"
+    # )
     
-    # With filters (example)
-    # filters = [{"can_id": 0x123, "can_mask": 0x7FF}]
-    # reader = CANReader(channel=0, bitrate=500000, filters=filters)
+    # Example 3: Normal CAN mode
+    # reader_normal = CANReader(
+    #     channel=0, 
+    #     bitrate=500000, 
+    #     dbc_file="standard.dbc",
+    #     protocol_type="normal"
+    # )
+    
+    # Example 4: J1939 with full ID filter
+    # id_filters = [{"can_id": 0x18FEF200, "can_mask": 0x1FFFFFFF, "extended": True}]
+    # reader_j1939 = CANReader(
+    #     channel=0, 
+    #     bitrate=500000, 
+    #     dbc_file="j1939.dbc",
+    #     filters=id_filters,
+    #     protocol_type="j1939"
+    # )
     
     try:
-        # Read all messages
-        reader.read_messages()
+        # For J1939: Monitor specific PGN cycle time
+        reader_j1939.read_messages(target_pgn=0xFEF1)  # Monitor PGN 0xFEF1
         
-        # Or read with specific target ID for cycle time monitoring
-        # reader.read_messages(target_id=0x123)
+        # Or monitor all messages
+        # reader_j1939.read_messages()
+        
+        # For normal CAN: Monitor specific ID
+        # reader_normal.read_messages(target_id=0x123)
+        
     except KeyboardInterrupt:
         print("\nStopped by user")
+    except Exception as e:
+        print(f"Error: {e}")
