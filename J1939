@@ -3,9 +3,16 @@ import datetime
 import cantools
 
 class CANReader:
-    def __init__(self, channel=0, bitrate=500000, dbc_file=None, filters=None):
+    def __init__(self, channel=0, bitrate=500000, dbc_file=None, filters=None, protocol_type="j1939"):
         """
         Initialize Vector CAN interface
+        
+        Args:
+            channel: CAN channel number
+            bitrate: CAN bitrate in bps
+            dbc_file: Path to DBC file (optional)
+            filters: CAN filters list (optional)
+            protocol_type: "j1939" or "normal"
         """
         self.bus = can.interface.Bus(
             bustype='vector',
@@ -16,6 +23,7 @@ class CANReader:
         self.last_timestamps = {}  # For cycle time
         self.db = None
         self.pgn_map = {}
+        self.protocol_type = protocol_type
 
         if dbc_file:
             self.load_dbc(dbc_file)
@@ -95,9 +103,279 @@ class CANReader:
 
         return pgn, None, None
 
+    # DM1 Specific Parser (based on the DBC definition from images)
+    def parse_dm1_message(self, data_bytes):
+        """
+        Parse DM1 message according to the specification:
+        - PGN: 0xFECA (65226) - DM1 (Diagnostic Message 1)
+        - Message length: Up to 178 bytes (or more depending on DTC count)
+        - Byte Order: Intel (Little Endian)
+        
+        Signal layout from DBC:
+        - ProtectLampStatus: bits 0-1 (2 bits)
+        - AmberWarningLampStatus: bits 2-3 (2 bits)
+        - RedStopLampState: bits 4-5 (2 bits)
+        - MalfunctionIndicatorLampStatus: bits 6-7 (2 bits)
+        - FlashProtectLamp: bits 8-9 (2 bits)
+        - FlashAmberWarningLamp: bits 10-11 (2 bits)
+        - FlashRedStopLamp: bits 12-13 (2 bits)
+        - FlashMalfunctionIndicatorLamp: bits 14-15 (2 bits)
+        - DTC1: bits 16-47 (32 bits)
+        - DTC2: bits 48-79 (32 bits)
+        - ... continues for up to 20+ DTCs
+        
+        Each DTC is 32 bits (4 bytes) in Intel format:
+        - SPN (Suspect Parameter Number): 19 bits
+        - FMI (Failure Mode Identifier): 5 bits
+        - OC (Occurrence Count): 7 bits
+        - CM (Conversion Method): 1 bit
+        """
+        
+        if not data_bytes or len(data_bytes) < 2:
+            return None
+        
+        result = {
+            "timestamp": datetime.datetime.now(),
+            "message_type": "DM1 (Diagnostic Message 1)",
+            "pgn": 0xFECA
+        }
+        
+        # Helper function to extract bits from bytes (Intel/Little Endian)
+        def extract_bits(data, start_bit, length):
+            """Extract bits from byte array (Intel byte order, little-endian bits)"""
+            result = 0
+            for i in range(length):
+                byte_index = (start_bit + i) // 8
+                bit_index = (start_bit + i) % 8
+                if byte_index < len(data):
+                    if (data[byte_index] >> bit_index) & 1:
+                        result |= (1 << i)
+            return result
+        
+        # Parse Lamp Status Fields (2 bits each, values 0-3)
+        lamp_status_map = {
+            0: "Off",
+            1: "On",
+            2: "Not available",
+            3: "Error/Reserved"
+        }
+        
+        result["ProtectLampStatus"] = lamp_status_map.get(
+            extract_bits(data_bytes, 0, 2), 
+            f"Unknown ({extract_bits(data_bytes, 0, 2)})"
+        )
+        
+        result["AmberWarningLampStatus"] = lamp_status_map.get(
+            extract_bits(data_bytes, 2, 2),
+            f"Unknown ({extract_bits(data_bytes, 2, 2)})"
+        )
+        
+        result["RedStopLampState"] = lamp_status_map.get(
+            extract_bits(data_bytes, 4, 2),
+            f"Unknown ({extract_bits(data_bytes, 4, 2)})"
+        )
+        
+        result["MalfunctionIndicatorLampStatus"] = lamp_status_map.get(
+            extract_bits(data_bytes, 6, 2),
+            f"Unknown ({extract_bits(data_bytes, 6, 2)})"
+        )
+        
+        # Parse Flash Lamp Fields (2 bits each)
+        flash_map = {
+            0: "Do Not Flash",
+            1: "Flash",
+            2: "Unavailable / Do Not Flash",
+            3: "Reserved"
+        }
+        
+        result["FlashProtectLamp"] = flash_map.get(
+            extract_bits(data_bytes, 8, 2),
+            f"Unknown ({extract_bits(data_bytes, 8, 2)})"
+        )
+        
+        result["FlashAmberWarningLamp"] = flash_map.get(
+            extract_bits(data_bytes, 10, 2),
+            f"Unknown ({extract_bits(data_bytes, 10, 2)})"
+        )
+        
+        result["FlashRedStopLamp"] = flash_map.get(
+            extract_bits(data_bytes, 12, 2),
+            f"Unknown ({extract_bits(data_bytes, 12, 2)})"
+        )
+        
+        result["FlashMalfunctionIndicatorLamp"] = flash_map.get(
+            extract_bits(data_bytes, 14, 2),
+            f"Unknown ({extract_bits(data_bytes, 14, 2)})"
+        )
+        
+        # Parse DTCs (starting at bit 16, each DTC is 32 bits)
+        dtc_list = []
+        dtc_start_bit = 16
+        dtc_size = 32
+        
+        # Calculate how many DTCs fit in the data
+        max_dtcs = (len(data_bytes) * 8 - dtc_start_bit) // dtc_size
+        
+        for dtc_index in range(max_dtcs):
+            dtc_raw = 0
+            for i in range(dtc_size):
+                byte_index = (dtc_start_bit + dtc_index * dtc_size + i) // 8
+                bit_index = (dtc_start_bit + dtc_index * dtc_size + i) % 8
+                if byte_index < len(data_bytes):
+                    if (data_bytes[byte_index] >> bit_index) & 1:
+                        dtc_raw |= (1 << i)
+            
+            if dtc_raw != 0:  # Only add non-zero DTCs
+                # Parse DTC components (J1939 format)
+                spn = dtc_raw & 0x7FFFF  # Bits 0-18: SPN (19 bits)
+                fmi = (dtc_raw >> 19) & 0x1F  # Bits 19-23: FMI (5 bits)
+                oc = (dtc_raw >> 24) & 0x7F  # Bits 24-30: Occurrence Count (7 bits)
+                cm = (dtc_raw >> 31) & 0x01  # Bit 31: Conversion Method (1 bit)
+                
+                dtc_info = {
+                    "DTC_Number": dtc_index + 1,
+                    "Raw_Value": f"0x{dtc_raw:08X}",
+                    "SPN": spn,
+                    "FMI": fmi,
+                    "Occurrence_Count": oc,
+                    "Conversion_Method": "Active" if cm == 0 else "Previously Active",
+                    "Description": self.get_dtc_description(spn, fmi)
+                }
+                dtc_list.append(dtc_info)
+        
+        result["DTC_Count"] = len(dtc_list)
+        result["DTCs"] = dtc_list
+        
+        return result
+    
+    def get_dtc_description(self, spn, fmi):
+        """Get human-readable description for common SPN/FMI combinations"""
+        # This is a sample mapping - expand based on your vehicle's SPN definitions
+        dtc_descriptions = {
+            (100, 0): "Engine oil pressure too low",
+            (100, 1): "Engine oil pressure too low",
+            (100, 18): "Engine oil pressure too low",
+            (110, 0): "Engine coolant temperature too high",
+            (110, 15): "Engine coolant temperature too high",
+            (91, 0): "Throttle position sensor voltage too high",
+            (91, 1): "Throttle position sensor voltage too low",
+            (190, 0): "Engine speed sensor signal missing",
+            (190, 1): "Engine speed sensor signal erratic",
+            (84, 3): "Vehicle speed sensor voltage too high",
+            (84, 4): "Vehicle speed sensor voltage too low",
+            (108, 1): "Barometric pressure sensor voltage too low",
+            (102, 0): "Intake manifold pressure too high",
+        }
+        
+        return dtc_descriptions.get((spn, fmi), f"SPN {spn}, FMI {fmi} - Refer to vehicle documentation")
+    
+    def decode_dm1_raw(self, data_bytes):
+        """
+        Alternative DM1 decoder that works directly with raw bytes
+        without relying on DBC file
+        """
+        if len(data_bytes) < 2:
+            return None
+        
+        print("\n" + "="*80)
+        print("DM1 MESSAGE DECODING (Raw Parser)")
+        print("="*80)
+        
+        # Extract lamp statuses
+        byte0 = data_bytes[0] if len(data_bytes) > 0 else 0
+        byte1 = data_bytes[1] if len(data_bytes) > 1 else 0
+        
+        protect_lamp = (byte0 >> 0) & 0x03
+        amber_warning = (byte0 >> 2) & 0x03
+        red_stop = (byte0 >> 4) & 0x03
+        mil = (byte0 >> 6) & 0x03
+        
+        flash_protect = (byte1 >> 0) & 0x03
+        flash_amber = (byte1 >> 2) & 0x03
+        flash_red = (byte1 >> 4) & 0x03
+        flash_mil = (byte1 >> 6) & 0x03
+        
+        lamp_status = {
+            0: "OFF",
+            1: "ON",
+            2: "NOT AVAILABLE",
+            3: "RESERVED"
+        }
+        
+        flash_status = {
+            0: "DO NOT FLASH",
+            1: "FLASH",
+            2: "UNAVAILABLE",
+            3: "RESERVED"
+        }
+        
+        print(f"\n--- LAMP STATUSES ---")
+        print(f"Protect Lamp:          {lamp_status.get(protect_lamp, 'UNKNOWN')}")
+        print(f"Amber Warning Lamp:    {lamp_status.get(amber_warning, 'UNKNOWN')}")
+        print(f"Red Stop Lamp:         {lamp_status.get(red_stop, 'UNKNOWN')}")
+        print(f"Malfunction Indicator: {lamp_status.get(mil, 'UNKNOWN')}")
+        
+        print(f"\n--- FLASH COMMANDS ---")
+        print(f"Flash Protect Lamp:          {flash_status.get(flash_protect, 'UNKNOWN')}")
+        print(f"Flash Amber Warning Lamp:    {flash_status.get(flash_amber, 'UNKNOWN')}")
+        print(f"Flash Red Stop Lamp:         {flash_status.get(flash_red, 'UNKNOWN')}")
+        print(f"Flash Malfunction Indicator: {flash_status.get(flash_mil, 'UNKNOWN')}")
+        
+        # Parse DTCs
+        print(f"\n--- DIAGNOSTIC TROUBLE CODES (DTCs) ---")
+        dtc_count = 0
+        
+        for i in range(2, len(data_bytes), 4):
+            if i + 3 < len(data_bytes):
+                dtc_raw = int.from_bytes(data_bytes[i:i+4], byteorder='little')
+                
+                if dtc_raw != 0:
+                    dtc_count += 1
+                    spn = dtc_raw & 0x7FFFF
+                    fmi = (dtc_raw >> 19) & 0x1F
+                    oc = (dtc_raw >> 24) & 0x7F
+                    cm = (dtc_raw >> 31) & 0x01
+                    
+                    print(f"\nDTC #{dtc_count}:")
+                    print(f"  Raw: 0x{dtc_raw:08X}")
+                    print(f"  SPN: {spn}")
+                    print(f"  FMI: {fmi}")
+                    print(f"  Occurrence Count: {oc}")
+                    print(f"  Status: {'Active' if cm == 0 else 'Previously Active'}")
+        
+        if dtc_count == 0:
+            print("  No active DTCs")
+        
+        print("\n" + "="*80)
+        
+        return {
+            "lamp_statuses": {
+                "protect": protect_lamp,
+                "amber_warning": amber_warning,
+                "red_stop": red_stop,
+                "mil": mil
+            },
+            "flash_commands": {
+                "protect": flash_protect,
+                "amber_warning": flash_amber,
+                "red_stop": flash_red,
+                "mil": flash_mil
+            },
+            "dtc_count": dtc_count
+        }
+
     # Main Read Loop
-    def read_messages(self, target_id=None):
+    def read_messages(self, target_id=None, show_dm1_details=True):
+        """
+        Read messages from CAN bus
+        
+        Args:
+            target_id: Specific CAN ID to monitor
+            show_dm1_details: If True, show detailed DM1 decoding
+        """
         print("Listening to CAN bus...\n")
+        print("DM1 Decoder Active - PGN 0x18FECA (65226)")
+        print("-" * 80)
 
         while True:
             msg = self.bus.recv(timeout=1)
@@ -109,6 +387,13 @@ class CANReader:
             ts = msg.timestamp
             human_time = datetime.datetime.fromtimestamp(ts)
 
+            # Check if this is a DM1 message (PGN 0xFECA)
+            is_dm1 = False
+            if msg.is_extended_id:
+                pgn = self.get_pgn(msg.arbitration_id)
+                if pgn == 0xFECA:  # DM1 PGN
+                    is_dm1 = True
+
             # Cycle time (global)
             cycle = self.calculate_cycle_time(msg)
 
@@ -117,46 +402,84 @@ class CANReader:
             if target_id:
                 specific_cycle = self.get_specific_cycle_time(msg, target_id)
 
-            # Decode based on frame type
-            if msg.is_extended_id:
-                pgn, name, decoded = self.decode_j1939_by_pgn(msg)
-                print(f"[{human_time}] J1939 - ID: 0x{msg.arbitration_id:08x}, PGN: 0x{pgn:04x}, Name: {name}")
-                print(f"    Data: {msg.data.hex()}")
-                print(f"    Decoded: {decoded}")
+            if is_dm1 and show_dm1_details:
+                # Use special DM1 parser
+                print(f"\n[{human_time}] DM1 MESSAGE DETECTED - PGN 0x{pgn:04x}")
+                print(f"CAN ID: 0x{msg.arbitration_id:08x}")
+                print(f"Source Address: 0x{msg.arbitration_id & 0xFF:02x}")
+                print(f"Data Length: {len(msg.data)} bytes")
+                print(f"Raw Data: {msg.data.hex().upper()}")
+                
                 if cycle:
-                    print(f"    Cycle Time: {cycle:.2f} ms")
-                if specific_cycle:
-                    print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
+                    print(f"Cycle Time: {cycle:.2f} ms")
+                
+                # Parse DM1
+                dm1_result = self.parse_dm1_message(msg.data)
+                if dm1_result:
+                    print(f"\n--- DM1 DECODED DATA ---")
+                    print(f"Protect Lamp Status: {dm1_result['ProtectLampStatus']}")
+                    print(f"Amber Warning Lamp Status: {dm1_result['AmberWarningLampStatus']}")
+                    print(f"Red Stop Lamp State: {dm1_result['RedStopLampState']}")
+                    print(f"Malfunction Indicator Lamp Status: {dm1_result['MalfunctionIndicatorLampStatus']}")
+                    print(f"Flash Protect Lamp: {dm1_result['FlashProtectLamp']}")
+                    print(f"Flash Amber Warning Lamp: {dm1_result['FlashAmberWarningLamp']}")
+                    print(f"Flash Red Stop Lamp: {dm1_result['FlashRedStopLamp']}")
+                    print(f"Flash Malfunction Indicator Lamp: {dm1_result['FlashMalfunctionIndicatorLamp']}")
+                    
+                    if dm1_result['DTC_Count'] > 0:
+                        print(f"\n--- ACTIVE DTCs ({dm1_result['DTC_Count']}) ---")
+                        for dtc in dm1_result['DTCs']:
+                            print(f"DTC {dtc['DTC_Number']}: {dtc['Description']}")
+                            print(f"  SPN: {dtc['SPN']}, FMI: {dtc['FMI']}, Count: {dtc['Occurrence_Count']}, Status: {dtc['Conversion_Method']}")
+                    else:
+                        print("\nNo Active Diagnostic Trouble Codes")
+                
+                # Also show raw decoder output
+                self.decode_dm1_raw(msg.data)
+                
             else:
-                decoded = self.decode_standard(msg)
-                print(f"[{human_time}] Standard - ID: 0x{msg.arbitration_id:03x}")
-                print(f"    Data: {msg.data.hex()}")
-                print(f"    Decoded: {decoded}")
-                if cycle:
-                    print(f"    Cycle Time: {cycle:.2f} ms")
-                if specific_cycle:
-                    print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
+                # Normal decode for other messages
+                if msg.is_extended_id:
+                    pgn, name, decoded = self.decode_j1939_by_pgn(msg)
+                    print(f"[{human_time}] J1939 - ID: 0x{msg.arbitration_id:08x}, PGN: 0x{pgn:04x}, Name: {name}")
+                    print(f"    Data: {msg.data.hex()}")
+                    print(f"    Decoded: {decoded}")
+                    if cycle:
+                        print(f"    Cycle Time: {cycle:.2f} ms")
+                    if specific_cycle:
+                        print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
+                else:
+                    decoded = self.decode_standard(msg)
+                    print(f"[{human_time}] Standard - ID: 0x{msg.arbitration_id:03x}")
+                    print(f"    Data: {msg.data.hex()}")
+                    print(f"    Decoded: {decoded}")
+                    if cycle:
+                        print(f"    Cycle Time: {cycle:.2f} ms")
+                    if specific_cycle:
+                        print(f"    Specific Cycle Time (target): {specific_cycle:.2f} ms")
             
-            print("-" * 60)
+            print("-" * 80)
 
 
 # Example usage
 if __name__ == "__main__":
-    # Without DBC file
+    # Create CAN reader
     reader = CANReader(channel=0, bitrate=500000)
     
-    # With DBC file (uncomment and provide path)
-    # reader = CANReader(channel=0, bitrate=500000, dbc_file="path/to/your.dbc")
+    # Example DM1 message data for testing (simulated)
+    test_dm1_data = bytes([
+        0x01,  # Protect:01, Amber:00, Red:00, MIL:00
+        0x00,  # Flash commands all 00
+        0x01, 0x02, 0x03, 0x04,  # DTC 1
+        0x05, 0x06, 0x07, 0x08,  # DTC 2
+    ])
     
-    # With filters (example)
-    # filters = [{"can_id": 0x123, "can_mask": 0x7FF}]
-    # reader = CANReader(channel=0, bitrate=500000, filters=filters)
+    print("Testing DM1 Parser with sample data:")
+    reader.parse_dm1_message(test_dm1_data)
+    reader.decode_dm1_raw(test_dm1_data)
     
     try:
-        # Read all messages
-        reader.read_messages()
-        
-        # Or read with specific target ID for cycle time monitoring
-        # reader.read_messages(target_id=0x123)
+        # Read actual CAN messages with DM1 detection
+        reader.read_messages(show_dm1_details=True)
     except KeyboardInterrupt:
         print("\nStopped by user")
