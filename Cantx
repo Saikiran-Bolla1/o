@@ -1,0 +1,889 @@
+"""
+CAN Message Handler Module - Multi-Protocol Support (Normal CAN & J1939)
+Supports reading, parsing, and sending multiple CAN messages with cyclic transmission.
+"""
+
+import threading
+import time
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Union, Callable
+from datetime import datetime
+from collections import defaultdict
+import queue
+import cantools
+from abc import ABC, abstractmethod
+
+# ============================================================================
+# ENUMS & CONSTANTS
+# ============================================================================
+
+class CANProtocol(Enum):
+    """Supported CAN protocols"""
+    NORMAL_CAN = "normal_can"
+    J1939 = "j1939"
+
+
+class TransmissionMode(Enum):
+    """CAN message transmission modes"""
+    SEND_ONCE = "send_once"
+    CYCLIC = "cyclic"
+
+
+# Global Protocol Setting
+GLOBAL_CAN_PROTOCOL = CANProtocol.NORMAL_CAN
+
+
+def set_global_protocol(protocol: CANProtocol):
+    """Set the global CAN protocol"""
+    global GLOBAL_CAN_PROTOCOL
+    GLOBAL_CAN_PROTOCOL = protocol
+
+
+def get_global_protocol() -> CANProtocol:
+    """Get the current global CAN protocol"""
+    return GLOBAL_CAN_PROTOCOL
+
+
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
+
+@dataclass
+class CANMessage:
+    """Standard CAN message structure"""
+    message_id: int
+    data: bytes
+    timestamp: float = field(default_factory=time.time)
+    is_extended: bool = False
+    dlc: int = 8
+
+
+@dataclass
+class J1939Message:
+    """J1939 protocol message structure"""
+    pgn: int  # Parameter Group Number (18-bit)
+    ps: int   # PS field (8-bit) - destination address for PDU1
+    data: bytes
+    timestamp: float = field(default_factory=time.time)
+    priority: int = 6
+    data_length: int = 8
+
+    @property
+    def can_id(self) -> int:
+        """Convert J1939 message to CAN ID (29-bit extended)"""
+        # Format: [Priority(3)][Reserved(1)][DataPage(1)][PF(8)][PS(8)]
+        return (self.priority << 26) | (self.pgn << 8) | self.ps
+
+
+@dataclass
+class CANRXMessage:
+    """Received CAN message with parsed data"""
+    message_id: int
+    pgn: Optional[int] = None
+    message_name: str = ""
+    data: bytes = b""
+    rx_time: float = 0.0
+    signal_values: Dict[str, float] = field(default_factory=dict)
+    raw_can_id: int = 0
+
+
+@dataclass
+class CANTXConfig:
+    """Configuration for transmitting a single CAN message"""
+    message_id: Optional[int] = None  # Normal CAN ID
+    pgn: Optional[int] = None  # J1939 PGN
+    message_name: Optional[str] = None  # Message name from DBC
+    data: bytes = b""
+    data_length: int = 8
+    cyclic_time_ms: Optional[int] = None  # None = send_once, value = cyclic interval
+    send_once: bool = False
+    priority: int = 6  # For J1939
+    ps: int = 0  # For J1939
+    repeat_count: int = 1  # For send_once mode
+
+
+@dataclass
+class MultiCANTXConfig:
+    """Configuration for transmitting multiple CAN messages"""
+    messages: List[CANTXConfig] = field(default_factory=list)
+    stop_event: Optional[threading.Event] = None
+
+
+# ============================================================================
+# ABSTRACT CAN INTERFACE
+# ============================================================================
+
+class CANInterface(ABC):
+    """Abstract CAN interface"""
+
+    @abstractmethod
+    def send_message(self, message: Union[CANMessage, J1939Message]) -> bool:
+        """Send a CAN message"""
+        pass
+
+    @abstractmethod
+    def receive_message(self, timeout: float = 1.0) -> Optional[CANMessage]:
+        """Receive a CAN message"""
+        pass
+
+    @abstractmethod
+    def stop(self):
+        """Stop the CAN interface"""
+        pass
+
+
+# ============================================================================
+# VECTOR CAN INTERFACE IMPLEMENTATION
+# ============================================================================
+
+class VectorCANInterface(CANInterface):
+    """Vector CAN device interface implementation"""
+
+    def __init__(self, channel: int = 0, bitrate: int = 500000, protocol: CANProtocol = None):
+        """
+        Initialize Vector CAN interface
+        
+        Args:
+            channel: CAN channel number
+            bitrate: CAN bus bitrate (default 500kbps)
+            protocol: CAN protocol (uses global if not specified)
+        """
+        self.channel = channel
+        self.bitrate = bitrate
+        self.protocol = protocol or get_global_protocol()
+        self.bus = None
+        self._initialize_bus()
+
+    def _initialize_bus(self):
+        """Initialize the CAN bus connection"""
+        try:
+            import can
+            self.bus = can.interface.Bus(
+                interface='vector',
+                channel=self.channel,
+                bitrate=self.bitrate,
+                fd=False
+            )
+            print(f"[INFO] Vector CAN bus initialized on channel {self.channel}")
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize Vector CAN: {e}")
+            self.bus = None
+
+    def send_message(self, message: Union[CANMessage, J1939Message]) -> bool:
+        """Send a CAN message to the bus"""
+        if not self.bus:
+            print("[ERROR] CAN bus not initialized")
+            return False
+
+        try:
+            import can
+            
+            if isinstance(message, J1939Message):
+                can_msg = can.Message(
+                    arbitration_id=message.can_id,
+                    data=message.data,
+                    is_extended_id=True,
+                    dlc=len(message.data)
+                )
+            else:  # CANMessage
+                can_msg = can.Message(
+                    arbitration_id=message.message_id,
+                    data=message.data,
+                    is_extended_id=message.is_extended,
+                    dlc=len(message.data)
+                )
+
+            self.bus.send(can_msg)
+            print(f"[TX] ID: 0x{can_msg.arbitration_id:X} | Data: {can_msg.data.hex().upper()}")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to send message: {e}")
+            return False
+
+    def receive_message(self, timeout: float = 1.0) -> Optional[CANMessage]:
+        """Receive a CAN message from the bus"""
+        if not self.bus:
+            return None
+
+        try:
+            msg = self.bus.recv(timeout=timeout)
+            if msg:
+                return CANMessage(
+                    message_id=msg.arbitration_id,
+                    data=msg.data,
+                    timestamp=msg.timestamp,
+                    is_extended=msg.is_extended_id,
+                    dlc=msg.dlc
+                )
+        except Exception as e:
+            print(f"[ERROR] Receive error: {e}")
+        return None
+
+    def stop(self):
+        """Stop the CAN bus"""
+        if self.bus:
+            self.bus.shutdown()
+            print("[INFO] Vector CAN bus stopped")
+
+
+# ============================================================================
+# CAN MESSAGE PARSER (DBC-based)
+# ============================================================================
+
+class CANMessageParser:
+    """Parse CAN messages using DBC database"""
+
+    def __init__(self, dbc_file: str, protocol: CANProtocol = None):
+        """
+        Initialize message parser with DBC file
+        
+        Args:
+            dbc_file: Path to DBC file
+            protocol: CAN protocol (uses global if not specified)
+        """
+        self.protocol = protocol or get_global_protocol()
+        self.dbc_db = None
+        self._load_dbc(dbc_file)
+        self._build_message_index()
+
+    def _load_dbc(self, dbc_file: str):
+        """Load DBC database"""
+        try:
+            self.dbc_db = cantools.database.load_file(dbc_file)
+            print(f"[INFO] DBC file loaded: {dbc_file}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load DBC: {e}")
+
+    def _build_message_index(self):
+        """Build indexes for quick lookup"""
+        self.msg_by_id = {}
+        self.msg_by_name = {}
+        self.msg_by_pgn = {}
+
+        if not self.dbc_db:
+            return
+
+        for msg in self.dbc_db.messages:
+            self.msg_by_id[msg.frame_id] = msg
+            self.msg_by_name[msg.name] = msg
+
+            # For J1939, extract PGN from message attributes
+            if self.protocol == CANProtocol.J1939:
+                if hasattr(msg, 'comment') and 'PGN' in str(msg.comment):
+                    pgn = self._extract_pgn_from_comment(msg.comment)
+                    if pgn:
+                        self.msg_by_pgn[pgn] = msg
+
+    def _extract_pgn_from_comment(self, comment: str) -> Optional[int]:
+        """Extract PGN from message comment"""
+        try:
+            if 'PGN' in comment:
+                pgn_str = comment.split('PGN')[1].split()[0].strip(':,')
+                return int(pgn_str, 16)
+        except:
+            pass
+        return None
+
+    def get_message_by_id(self, msg_id: int) -> Optional[cantools.db.Message]:
+        """Get message definition by CAN ID"""
+        return self.msg_by_id.get(msg_id)
+
+    def get_message_by_name(self, msg_name: str) -> Optional[cantools.db.Message]:
+        """Get message definition by name"""
+        return self.msg_by_name.get(msg_name)
+
+    def get_message_by_pgn(self, pgn: int) -> Optional[cantools.db.Message]:
+        """Get message definition by J1939 PGN"""
+        return self.msg_by_pgn.get(pgn)
+
+    def parse_message(self, can_msg: CANMessage) -> CANRXMessage:
+        """Parse CAN message and extract signal values"""
+        msg_def = self.get_message_by_id(can_msg.message_id)
+        
+        if not msg_def:
+            return CANRXMessage(
+                message_id=can_msg.message_id,
+                data=can_msg.data,
+                rx_time=can_msg.timestamp,
+                raw_can_id=can_msg.message_id
+            )
+
+        try:
+            signal_values = msg_def.decode(can_msg.data)
+            return CANRXMessage(
+                message_id=can_msg.message_id,
+                message_name=msg_def.name,
+                data=can_msg.data,
+                rx_time=can_msg.timestamp,
+                signal_values=signal_values,
+                raw_can_id=can_msg.message_id
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to decode message 0x{can_msg.message_id:X}: {e}")
+            return CANRXMessage(
+                message_id=can_msg.message_id,
+                data=can_msg.data,
+                rx_time=can_msg.timestamp,
+                raw_can_id=can_msg.message_id
+            )
+
+    def encode_message(self, msg_name: str, signal_values: Dict[str, float]) -> Optional[bytes]:
+        """Encode signal values into CAN message"""
+        msg_def = self.get_message_by_name(msg_name)
+        if not msg_def:
+            print(f"[ERROR] Message '{msg_name}' not found in DBC")
+            return None
+
+        try:
+            return msg_def.encode(signal_values)
+        except Exception as e:
+            print(f"[ERROR] Failed to encode message: {e}")
+            return None
+
+    def get_message_id_by_name(self, msg_name: str) -> Optional[int]:
+        """Get message ID from message name"""
+        msg_def = self.get_message_by_name(msg_name)
+        return msg_def.frame_id if msg_def else None
+
+    def get_pgn_by_name(self, msg_name: str) -> Optional[int]:
+        """Get PGN from message name (J1939)"""
+        msg_def = self.get_message_by_name(msg_name)
+        if msg_def and msg_name in self.msg_by_pgn.values():
+            for pgn, msg in self.msg_by_pgn.items():
+                if msg.frame_id == msg_def.frame_id:
+                    return pgn
+        return None
+
+
+# ============================================================================
+# MULTI-MESSAGE TRANSMITTER
+# ============================================================================
+
+class MultiMessageTransmitter:
+    """Handle transmission of multiple CAN messages with different cyclic rates"""
+
+    def __init__(self, can_interface: CANInterface, parser: CANMessageParser):
+        """
+        Initialize multi-message transmitter
+        
+        Args:
+            can_interface: CAN interface instance
+            parser: Message parser with DBC
+        """
+        self.can_interface = can_interface
+        self.parser = parser
+        self.protocol = can_interface.protocol
+        self._tx_threads: Dict[int, threading.Thread] = {}
+        self._stop_events: Dict[int, threading.Event] = {}
+        self._tx_queue = queue.Queue()
+        self._next_tx_id = 0
+        self._tx_lock = threading.Lock()
+
+    def add_message(self, config: CANTXConfig) -> int:
+        """
+        Add a message to transmission queue
+        
+        Args:
+            config: CANTXConfig object
+            
+        Returns:
+            TX ID for tracking the message
+        """
+        with self._tx_lock:
+            tx_id = self._next_tx_id
+            self._next_tx_id += 1
+
+        # Start transmission thread
+        stop_event = threading.Event()
+        self._stop_events[tx_id] = stop_event
+
+        thread = threading.Thread(
+            target=self._tx_worker,
+            args=(tx_id, config, stop_event),
+            daemon=True,
+            name=f"TX-Worker-{tx_id}"
+        )
+        self._tx_threads[tx_id] = thread
+        thread.start()
+
+        print(f"[INFO] TX ID {tx_id} added - {self._get_message_info(config)}")
+        return tx_id
+
+    def add_multiple_messages(self, configs: List[CANTXConfig]) -> List[int]:
+        """
+        Add multiple messages to transmission
+        
+        Args:
+            configs: List of CANTXConfig objects
+            
+        Returns:
+            List of TX IDs
+        """
+        tx_ids = []
+        for config in configs:
+            tx_id = self.add_message(config)
+            tx_ids.append(tx_id)
+        return tx_ids
+
+    def _get_message_info(self, config: CANTXConfig) -> str:
+        """Get readable message information"""
+        if config.message_name:
+            return f"Name: {config.message_name}"
+        elif self.protocol == CANProtocol.J1939 and config.pgn:
+            return f"PGN: 0x{config.pgn:X}"
+        else:
+            return f"ID: 0x{config.message_id:X}" if config.message_id else "Unknown"
+
+    def _tx_worker(self, tx_id: int, config: CANTXConfig, stop_event: threading.Event):
+        """Worker thread for transmitting a single message"""
+        can_msg = self._prepare_can_message(config)
+        if not can_msg:
+            print(f"[ERROR] TX {tx_id}: Failed to prepare message")
+            return
+
+        if config.cyclic_time_ms:
+            # Cyclic transmission
+            self._cyclic_transmit(tx_id, can_msg, config.cyclic_time_ms, stop_event)
+        else:
+            # Single/Multiple transmissions
+            for i in range(config.repeat_count):
+                if stop_event.is_set():
+                    break
+                self.can_interface.send_message(can_msg)
+                if i < config.repeat_count - 1:
+                    time.sleep(0.01)  # Small delay between repeats
+
+    def _cyclic_transmit(self, tx_id: int, can_msg: Union[CANMessage, J1939Message],
+                        cyclic_time_ms: int, stop_event: threading.Event):
+        """Cyclic transmission worker"""
+        cycle_time_s = cyclic_time_ms / 1000.0
+        next_send = time.time()
+        send_count = 0
+
+        while not stop_event.is_set():
+            now = time.time()
+            if now >= next_send:
+                self.can_interface.send_message(can_msg)
+                send_count += 1
+                next_send = now + cycle_time_s
+
+            # Sleep to avoid busy waiting
+            sleep_time = min(cycle_time_s / 10, 0.01)
+            time.sleep(sleep_time)
+
+        print(f"[INFO] TX {tx_id} stopped - sent {send_count} messages")
+
+    def _prepare_can_message(self, config: CANTXConfig) -> Optional[Union[CANMessage, J1939Message]]:
+        """Prepare CAN message from config"""
+        
+        # Determine message ID/PGN
+        msg_id = config.message_id
+        pgn = config.pgn
+
+        if config.message_name:
+            msg_id = self.parser.get_message_id_by_name(config.message_name)
+            if self.protocol == CANProtocol.J1939:
+                pgn = self.parser.get_pgn_by_name(config.message_name)
+
+        if self.protocol == CANProtocol.J1939 and pgn is not None:
+            return J1939Message(
+                pgn=pgn,
+                ps=config.ps,
+                data=config.data,
+                priority=config.priority,
+                data_length=len(config.data)
+            )
+        else:
+            return CANMessage(
+                message_id=msg_id or 0,
+                data=config.data,
+                is_extended=self.protocol == CANProtocol.J1939,
+                dlc=len(config.data)
+            )
+
+    def stop_message(self, tx_id: int):
+        """Stop transmission of a specific message"""
+        if tx_id in self._stop_events:
+            self._stop_events[tx_id].set()
+            if tx_id in self._tx_threads:
+                self._tx_threads[tx_id].join(timeout=2)
+            print(f"[INFO] TX {tx_id} stopped")
+
+    def stop_all_messages(self):
+        """Stop transmission of all messages"""
+        for tx_id in list(self._stop_events.keys()):
+            self.stop_message(tx_id)
+
+    def get_status(self) -> Dict:
+        """Get transmission status"""
+        status = {}
+        for tx_id, thread in self._tx_threads.items():
+            status[tx_id] = {
+                'active': thread.is_alive(),
+                'thread_name': thread.name
+            }
+        return status
+
+
+# ============================================================================
+# CAN RECEIVER (RX) HANDLER
+# ============================================================================
+
+class CANReceiver:
+    """Handle CAN message reception and parsing"""
+
+    def __init__(self, can_interface: CANInterface, parser: CANMessageParser):
+        """
+        Initialize CAN receiver
+        
+        Args:
+            can_interface: CAN interface instance
+            parser: Message parser
+        """
+        self.can_interface = can_interface
+        self.parser = parser
+        self.protocol = can_interface.protocol
+        self._rx_thread = None
+        self._stop_event = threading.Event()
+        self._message_buffer: Dict[int, List[CANRXMessage]] = defaultdict(list)
+        self._callbacks: Dict[Union[int, str], List[Callable]] = defaultdict(list)
+        self._buffer_lock = threading.Lock()
+
+    def start(self):
+        """Start CAN message reception"""
+        if self._rx_thread and self._rx_thread.is_alive():
+            print("[WARN] RX already running")
+            return
+
+        self._stop_event.clear()
+        self._rx_thread = threading.Thread(
+            target=self._rx_worker,
+            daemon=True,
+            name="CAN-RX-Worker"
+        )
+        self._rx_thread.start()
+        print("[INFO] CAN RX started")
+
+    def stop(self):
+        """Stop CAN message reception"""
+        self._stop_event.set()
+        if self._rx_thread:
+            self._rx_thread.join(timeout=2)
+        print("[INFO] CAN RX stopped")
+
+    def _rx_worker(self):
+        """Worker thread for receiving messages"""
+        while not self._stop_event.is_set():
+            raw_msg = self.can_interface.receive_message(timeout=0.1)
+            if raw_msg:
+                parsed_msg = self.parser.parse_message(raw_msg)
+                self._store_message(parsed_msg)
+                self._call_callbacks(parsed_msg)
+
+    def _store_message(self, msg: CANRXMessage):
+        """Store received message in buffer"""
+        with self._buffer_lock:
+            self._message_buffer[msg.message_id].append(msg)
+            # Keep last 100 messages per ID
+            if len(self._message_buffer[msg.message_id]) > 100:
+                self._message_buffer[msg.message_id].pop(0)
+
+    def _call_callbacks(self, msg: CANRXMessage):
+        """Call registered callbacks"""
+        # Callbacks by message ID
+        for callback in self._callbacks.get(msg.message_id, []):
+            try:
+                callback(msg)
+            except Exception as e:
+                print(f"[ERROR] Callback error: {e}")
+
+        # Callbacks by message name
+        for callback in self._callbacks.get(msg.message_name, []):
+            try:
+                callback(msg)
+            except Exception as e:
+                print(f"[ERROR] Callback error: {e}")
+
+    def register_callback(self, msg_id_or_name: Union[int, str], callback: Callable):
+        """Register callback for message reception"""
+        self._callbacks[msg_id_or_name].append(callback)
+
+    def get_latest_message(self, msg_id: int) -> Optional[CANRXMessage]:
+        """Get latest received message by ID"""
+        with self._buffer_lock:
+            messages = self._message_buffer.get(msg_id, [])
+            return messages[-1] if messages else None
+
+    def get_message_history(self, msg_id: int, count: int = 10) -> List[CANRXMessage]:
+        """Get message history"""
+        with self._buffer_lock:
+            messages = self._message_buffer.get(msg_id, [])
+            return messages[-count:]
+
+    def get_all_messages(self) -> Dict[int, List[CANRXMessage]]:
+        """Get all buffered messages"""
+        with self._buffer_lock:
+            return dict(self._message_buffer)
+
+    def clear_buffer(self, msg_id: Optional[int] = None):
+        """Clear message buffer"""
+        with self._buffer_lock:
+            if msg_id:
+                self._message_buffer[msg_id].clear()
+            else:
+                self._message_buffer.clear()
+
+
+# ============================================================================
+# MAIN CAN MESSAGE HANDLER
+# ============================================================================
+
+class CANMessageHandler:
+    """Main CAN message handler orchestrating RX and TX"""
+
+    def __init__(self, dbc_file: str, channel: int = 0, bitrate: int = 500000,
+                 protocol: CANProtocol = None):
+        """
+        Initialize CAN message handler
+        
+        Args:
+            dbc_file: Path to DBC database file
+            channel: CAN channel number
+            bitrate: CAN bitrate in bits/second
+            protocol: CAN protocol (uses global if not specified)
+        """
+        self.protocol = protocol or get_global_protocol()
+        set_global_protocol(self.protocol)
+
+        self.can_interface = VectorCANInterface(
+            channel=channel,
+            bitrate=bitrate,
+            protocol=self.protocol
+        )
+
+        self.parser = CANMessageParser(dbc_file, protocol=self.protocol)
+        self.receiver = CANReceiver(self.can_interface, self.parser)
+        self.transmitter = MultiMessageTransmitter(self.can_interface, self.parser)
+
+    # ========== RX Methods ==========
+
+    def start_receiving(self):
+        """Start receiving CAN messages"""
+        self.receiver.start()
+
+    def stop_receiving(self):
+        """Stop receiving CAN messages"""
+        self.receiver.stop()
+
+    def get_latest_message(self, msg_id: int) -> Optional[CANRXMessage]:
+        """Get latest received message"""
+        return self.receiver.get_latest_message(msg_id)
+
+    def get_message_by_name(self, msg_name: str) -> Optional[CANRXMessage]:
+        """Get latest message by name"""
+        msg_id = self.parser.get_message_id_by_name(msg_name)
+        return self.receiver.get_latest_message(msg_id) if msg_id else None
+
+    def get_message_by_pgn(self, pgn: int) -> Optional[CANRXMessage]:
+        """Get latest message by PGN (J1939)"""
+        if self.protocol != CANProtocol.J1939:
+            print("[WARN] PGN lookup only available in J1939 mode")
+            return None
+        msg_def = self.parser.get_message_by_pgn(pgn)
+        return self.receiver.get_latest_message(msg_def.frame_id) if msg_def else None
+
+    def get_message_history(self, msg_id: int, count: int = 10) -> List[CANRXMessage]:
+        """Get message reception history"""
+        return self.receiver.get_message_history(msg_id, count)
+
+    def get_signal_value(self, msg_id: int, signal_name: str) -> Optional[float]:
+        """Get specific signal value from latest message"""
+        msg = self.receiver.get_latest_message(msg_id)
+        if msg:
+            return msg.signal_values.get(signal_name)
+        return None
+
+    def register_rx_callback(self, msg_id_or_name: Union[int, str], callback: Callable):
+        """Register callback for message reception"""
+        self.receiver.register_callback(msg_id_or_name, callback)
+
+    # ========== TX Methods ==========
+
+    def send_message(self, config: CANTXConfig) -> int:
+        """
+        Send a single CAN message
+        
+        Args:
+            config: CANTXConfig object
+            
+        Returns:
+            TX ID for tracking
+        """
+        return self.transmitter.add_message(config)
+
+    def send_multiple_messages(self, configs: List[CANTXConfig]) -> List[int]:
+        """
+        Send multiple CAN messages with different parameters
+        
+        Args:
+            configs: List of CANTXConfig objects
+            
+        Returns:
+            List of TX IDs
+        """
+        return self.transmitter.add_multiple_messages(configs)
+
+    def send_by_message_name(self, msg_name: str, signal_values: Dict[str, float],
+                            cyclic_time_ms: Optional[int] = None) -> int:
+        """
+        Send message by name with signal values
+        
+        Args:
+            msg_name: Message name from DBC
+            signal_values: Dictionary of signal names to values
+            cyclic_time_ms: Cycle time in ms (None = send once)
+            
+        Returns:
+            TX ID
+        """
+        encoded_data = self.parser.encode_message(msg_name, signal_values)
+        if not encoded_data:
+            return -1
+
+        config = CANTXConfig(
+            message_name=msg_name,
+            data=encoded_data,
+            cyclic_time_ms=cyclic_time_ms
+        )
+        return self.transmitter.add_message(config)
+
+    def send_by_id(self, msg_id: int, data: bytes,
+                  cyclic_time_ms: Optional[int] = None) -> int:
+        """Send message by ID"""
+        config = CANTXConfig(
+            message_id=msg_id,
+            data=data,
+            cyclic_time_ms=cyclic_time_ms
+        )
+        return self.transmitter.add_message(config)
+
+    def send_by_pgn(self, pgn: int, data: bytes, ps: int = 0,
+                   cyclic_time_ms: Optional[int] = None) -> int:
+        """Send message by PGN (J1939)"""
+        if self.protocol != CANProtocol.J1939:
+            print("[ERROR] PGN send only available in J1939 mode")
+            return -1
+
+        config = CANTXConfig(
+            pgn=pgn,
+            ps=ps,
+            data=data,
+            cyclic_time_ms=cyclic_time_ms
+        )
+        return self.transmitter.add_message(config)
+
+    def stop_transmission(self, tx_id: int):
+        """Stop a specific transmission"""
+        self.transmitter.stop_message(tx_id)
+
+    def stop_all_transmissions(self):
+        """Stop all transmissions"""
+        self.transmitter.stop_all_messages()
+
+    def get_transmission_status(self) -> Dict:
+        """Get status of all active transmissions"""
+        return self.transmitter.get_status()
+
+    # ========== Utility Methods ==========
+
+    def shutdown(self):
+        """Shutdown handler and cleanup resources"""
+        print("[INFO] Shutting down CAN handler...")
+        self.stop_all_transmissions()
+        self.stop_receiving()
+        self.can_interface.stop()
+        print("[INFO] CAN handler shutdown complete")
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    # Set protocol globally
+    set_global_protocol(CANProtocol.NORMAL_CAN)
+    # OR for J1939:
+    # set_global_protocol(CANProtocol.J1939)
+
+    # Initialize handler
+    handler = CANMessageHandler(
+        dbc_file="example.dbc",
+        channel=0,
+        bitrate=500000,
+        protocol=CANProtocol.NORMAL_CAN
+    )
+
+    # Start receiving
+    handler.start_receiving()
+
+    # Send single message (send once)
+    tx_id_1 = handler.send_by_id(
+        msg_id=0x123,
+        data=bytes([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
+    )
+
+    # Send multiple messages simultaneously
+    configs = [
+        CANTXConfig(
+            message_id=0x100,
+            data=bytes([0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80]),
+            cyclic_time_ms=100  # 100ms cycle
+        ),
+        CANTXConfig(
+            message_id=0x200,
+            data=bytes([0xAA, 0xBB, 0xCC, 0xDD]),
+            cyclic_time_ms=50  # 50ms cycle
+        ),
+        CANTXConfig(
+            message_name="EngineStatus",
+            data=bytes([0x11, 0x22, 0x33, 0x44]),
+            cyclic_time_ms=200  # 200ms cycle
+        )
+    ]
+
+    tx_ids = handler.send_multiple_messages(configs)
+    print(f"Started TX with IDs: {tx_ids}")
+
+    # Monitor reception with callback
+    def message_callback(msg: CANRXMessage):
+        print(f"\n[RX] {msg.message_name or f'0x{msg.message_id:X}'}")
+        print(f"  Signals: {msg.signal_values}")
+        print(f"  RX Time: {msg.rx_time}")
+
+    handler.register_rx_callback(0x300, message_callback)
+
+    # Let it run
+    try:
+        time.sleep(10)
+
+        # Get latest messages
+        latest = handler.get_latest_message(0x100)
+        if latest:
+            print(f"\nLatest message 0x100: {latest.signal_values}")
+
+        # Get message history
+        history = handler.get_message_history(0x100, count=5)
+        print(f"Message history: {len(history)} messages")
+
+        # Stop specific transmission
+        handler.stop_transmission(tx_ids[0])
+
+        # Get status
+        status = handler.get_transmission_status()
+        print(f"TX Status: {status}")
+
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        handler.shutdown()
