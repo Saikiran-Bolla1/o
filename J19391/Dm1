@@ -3,40 +3,58 @@ import time
 import can
 import j1939
 
-logging.getLogger('j1939').setLevel(logging.DEBUG)
-logging.getLogger('can').setLevel(logging.DEBUG)
+logging.getLogger('j1939').setLevel(logging.INFO)
+logging.getLogger('can').setLevel(logging.WARNING)
 
+
+# -----------------------------
+# DM1 CALLBACK (FULL DECODE)
+# -----------------------------
 def dm1_receive(priority, lamp_status, dtc_list, timestamp):
-    """Callback for receiving DM1 messages"""
-    print(f"DM1 Received - Priority: {priority}, Timestamp: {timestamp}")
-    print(f"Lamp Status: {lamp_status}")
-    print(f"Active DTCs: {dtc_list}")
-    for dtc in dtc_list:
-        print(f"  SPN: {dtc['spn']}, FMI: {dtc['fmi']}, OC: {dtc.get('oc', 0)}")
+    print("\n🔥 DM1 RECEIVED")
+    print(f"Priority: {priority} | Time: {timestamp}")
 
+    # Lamp status decoding
+    print("Lamp Status:")
+    print(f"  MIL: {lamp_status.mil}")
+    print(f"  RSL: {lamp_status.rsl}")
+    print(f"  AWL: {lamp_status.awl}")
+    print(f"  PL : {lamp_status.pl}")
+
+    if not dtc_list:
+        print("No active DTCs ✅")
+        return
+
+    print("\nActive DTCs:")
+    for i, dtc in enumerate(dtc_list, 1):
+        spn = dtc['spn']
+        fmi = dtc['fmi']
+        oc = dtc.get('oc', 0)
+
+        print(f"  DTC {i}:")
+        print(f"     SPN: {spn}")
+        print(f"     FMI: {fmi}")
+        print(f"     OC : {oc}")
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
-    print("Initializing DM1 Reader with Vector CAN Driver")
-    
+    print("🚀 Initializing DM1 Reader (Vector + J1939)")
+
     ecu = j1939.ElectronicControlUnit()
-    
-    # Connect using Vector CAN driver
+
     ecu.connect(
         bustype='vector',
         app_name='CANalyzer',
         channel=0,
         bitrate=250000
     )
-    
-    # Subscribe to all messages
-    def on_message(priority, pgn, sa, timestamp, data):
-        if pgn == 0xFECA:  # DM1 PGN
-            # Convert bytearray to hex string
-            hex_data = ''.join(f'{byte:02x}' for byte in data)
-            print(f"Raw DM1 PGN {hex(pgn)} from {hex(sa)}: {hex_data}")
-    
-    ecu.subscribe(on_message)
-    
-    # Create CA
+
+    # -----------------------------
+    # Controller Application
+    # -----------------------------
     name = j1939.Name(
         arbitrary_address_capable=0,
         industry_group=j1939.Name.IndustryGroup.Industrial,
@@ -48,22 +66,34 @@ def main():
         manufacturer_code=666,
         identity_number=1234567
     )
-    
+
     ca = j1939.ControllerApplication(name, 0xF1)
     ecu.add_ca(controller_application=ca)
-    
-    # Subscribe to DM1 messages
+
+    # -----------------------------
+    # DM1 Subscription (IMPORTANT)
+    # -----------------------------
     dm1 = j1939.Dm1(ca)
     dm1.subscribe(dm1_receive)
-    
+
+    # OPTIONAL: Request DM1 (if ECU doesn't broadcast)
+    # dm1.request()
+
     ca.start()
-    
-    print("Listening for DM1 messages... (120 seconds)")
-    time.sleep(120)
-    
-    print("Shutting down")
-    ca.stop()
-    ecu.disconnect()
+
+    print("📡 Listening for DM1 messages...")
+
+    try:
+        while True:
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Stopping...")
+
+    finally:
+        ca.stop()
+        ecu.disconnect()
+
 
 if __name__ == '__main__':
     main()
