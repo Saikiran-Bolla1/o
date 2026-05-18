@@ -73,7 +73,8 @@ class J1939Handler:
         Extract PGN (Parameter Group Number) from CAN ID
         
         J1939 Message ID format (29-bit):
-        Bits 26-28: Priority (3 bits)
+        Bits 24-28: Priority (5 bits) 
+        Bits 16-23: Reserved (8 bits)
         Bits 8-15:  PDU Format (PF) (8 bits)
         Bits 0-7:   PDU Specific (PS) or Destination Address (8 bits)
         
@@ -121,35 +122,35 @@ class J1939Handler:
         """
         Extract priority from CAN ID
         
-        Priority is in bits 26-28 (3 bits)
+        Priority is in bits 24-28 (5 bits)
         """
-        return (arbitration_id >> 26) & 0x07
+        return (arbitration_id >> 24) & 0x1F
 
     @staticmethod
-    def create_pgn_from_components(priority: int, pdu_format: int, 
-                                  pdu_specific: int, source: int) -> int:
+    def create_pgn_from_components(priority: int, reserved: int, pdu_format: int, 
+                                  pdu_specific: int) -> int:
         """
         Create J1939 CAN ID from components
         
         J1939 Message ID format (29-bit):
-        Bits 26-28: Priority (3 bits)
+        Bits 24-28: Priority (5 bits)
+        Bits 16-23: Reserved (8 bits)
         Bits 8-15:  PDU Format (8 bits)
         Bits 0-7:   PDU Specific (8 bits)
-        Source address is combined with other fields
         
         Args:
-            priority: 3-bit priority (0-7)
+            priority: 5-bit priority (0-31)
+            reserved: 8-bit reserved field (0-255)
             pdu_format: 8-bit PDU format
             pdu_specific: 8-bit PDU specific (PS) or destination address
-            source: 8-bit source address
             
         Returns:
             29-bit extended CAN ID
         """
-        can_id = ((priority & 0x07) << 26)
+        can_id = ((priority & 0x1F) << 24)
+        can_id |= ((reserved & 0xFF) << 16)
         can_id |= ((pdu_format & 0xFF) << 8)
-        can_id |= ((pdu_specific & 0xFF) << 0)
-        can_id |= (source & 0xFF)
+        can_id |= (pdu_specific & 0xFF)
         return can_id
 
 
@@ -644,21 +645,24 @@ if __name__ == "__main__":
             # Read and parse single message
             raw_msg = reader.read_message(timeout=1.0)
             if raw_msg:
-                # Parse by ID
-                parsed = reader.parse_message_by_id(raw_msg, raw_msg.arbitration_id)
+                # Parse by message name
+                message_name = "EngineStatus"  # Example message name from DBC
+                parsed = reader.parse_message_by_name(raw_msg, message_name)
                 if parsed:
                     reader.print_message_info(parsed)
 
                     # Get timing info
-                    timing = reader.get_message_timing(raw_msg.arbitration_id)
-                    print(f"Timing info: {timing}")
+                    msg_def = reader.get_message_by_name(message_name)
+                    if msg_def:
+                        timing = reader.get_message_timing(msg_def.frame_id)
+                        print(f"Timing info: {timing}")
 
-                    # Get signal values
-                    signals = reader.get_signal_values(raw_msg, raw_msg.arbitration_id)
+                    # Get signal values by message name
+                    signals = reader.get_signal_values_by_name(raw_msg, message_name)
                     print(f"Signal values: {signals}")
 
-                    # Get full message data
-                    msg_data = reader.get_message_data_by_id(raw_msg, raw_msg.arbitration_id)
+                    # Get full message data by message name
+                    msg_data = reader.get_message_data_by_name(raw_msg, message_name)
                     print(f"Message data: {msg_data}")
 
             # Read multiple messages
