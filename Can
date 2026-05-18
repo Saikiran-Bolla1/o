@@ -74,7 +74,8 @@ class CANReader:
 
         try:
             return self.db.decode_message(msg.arbitration_id, msg.data)
-        except:
+        except Exception as e:
+            print(f"      Standard decode error: {e}")
             return None
 
     # J1939 PGN-based decode
@@ -88,9 +89,11 @@ class CANReader:
             message_def = self.pgn_map[pgn]
 
             try:
-                decoded = message_def.decode(msg.data)
+                # Use db.decode_message with the frame_id from the message definition
+                decoded = self.db.decode_message(message_def.frame_id, msg.data)
                 return pgn, message_def.name, decoded
             except Exception as e:
+                print(f"      J1939 decode error for PGN 0x{pgn:04x}: {e}")
                 return pgn, message_def.name, f"Decode Error: {e}"
 
         return pgn, None, None
