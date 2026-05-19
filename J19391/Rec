@@ -1,0 +1,335 @@
+"""
+Standalone J1939 DM Message Receiver
+
+Simple function to get DM messages by PGN.
+
+Requirements:
+    pip install python-can
+
+Author: DM Message Receiver
+"""
+
+import can
+import logging
+from typing import Optional
+from dataclasses import dataclass
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# ===== DM PGN Constants =====
+class DM_PGN:
+    """Diagnostic Message Parameter Group Numbers"""
+    DM01 = 0xFECA  # 65226 - Active DTCs
+    DM02 = 0xFECB  # 65227 - Previously Active DTCs
+    DM03 = 0xFECC  # 65228 - Diagnostic Data Clear/Reset
+    DM04 = 0xFECD  # 65229 - DTCs in Currently Active Mode
+    DM05 = 0xFECE  # 65230 - DTCs in Previously Active Mode
+    DM06 = 0xFECF  # 65231 - Emissions-related DTCs
+    DM07 = 0xE300  # 58112 - Engine Hours
+    DM08 = 0xFED0  # 65232 - Emissions-related DTCs (GPF)
+    DM10 = 0xFED2  # 65234 - Emissions-related DTCs
+    DM11 = 0xFED3  # 65235 - Diagnostic Data Clear/Reset Previously Active
+    DM12 = 0xFED4  # 65236 - Software Identification
+    DM13 = 0xDF00  # 57088 - Engine Hours
+    DM14 = 0xD900  # 55552 - Memory Access
+    DM15 = 0xD800  # 55296 - Memory Access Response
+    DM16 = 0xD700  # 55040 - Memory Access Data Transfer
+    DM17 = 0xD600  # 54784 - Memory Access
+    DM18 = 0xD400  # 54272 - Memory Access
+    DM19 = 0xD300  # 54016 - OBD Compliance Monitor Status
+    DM20 = 0xC200  # 49664 - Engine Speed
+    DM21 = 0xC100  # 49408 - Diesel Particulate Filter Pressure
+    DM22 = 0xC300  # 49920 - Individual Clear/Reset Control
+
+
+@dataclass
+class DMMessage:
+    """
+    DM Message container
+    
+    Attributes:
+        pgn: Parameter Group Number (hex)
+        source_address: Source address of the message (0x00-0xFE)
+        priority: Message priority (0-7)
+        timestamp: Timestamp when message was received
+        data: Raw message data bytes (0-8 bytes)
+    """
+    pgn: int
+    source_address: int
+    priority: int
+    timestamp: float
+    data: bytes
+    
+    def __repr__(self):
+        return (f"DMMessage(PGN:0x{self.pgn:04X}, SA:0x{self.source_address:02X}, "
+                f"Data:{self.data.hex().upper()})")
+    
+    def __str__(self):
+        return (f"PGN: 0x{self.pgn:04X} | "
+                f"Source: 0x{self.source_address:02X} | "
+                f"Priority: {self.priority} | "
+                f"Data: {self.data.hex().upper()}")
+
+
+class DMReceiver:
+    """Global DM Message Receiver"""
+    
+    def __init__(self, bustype: str = 'virtual', channel: str = 'vcan0', 
+                 bitrate: int = 250000):
+        """
+        Initialize DM Message Receiver
+        
+        :param bustype: CAN interface type ('virtual', 'socketcan', 'pcan', etc.)
+        :param channel: CAN channel name
+        :param bitrate: CAN bus bitrate in bits/sec
+        """
+        self.bustype = bustype
+        self.channel = channel
+        self.bitrate = bitrate
+        self.bus = None
+        self.is_connected = False
+    
+    def connect(self) -> bool:
+        """
+        Connect to CAN bus
+        
+        :return: True if successful, False otherwise
+        """
+        try:
+            self.bus = can.interface.Bus(
+                bustype=self.bustype,
+                channel=self.channel,
+                bitrate=self.bitrate
+            )
+            self.is_connected = True
+            logger.info(f"✓ Connected to {self.bustype}:{self.channel}")
+            return True
+        except Exception as e:
+            logger.error(f"✗ Failed to connect: {e}")
+            self.is_connected = False
+            return False
+    
+    def disconnect(self):
+        """Disconnect from CAN bus"""
+        if self.bus:
+            self.bus.shutdown()
+            self.is_connected = False
+            logger.info("✓ Disconnected from CAN bus")
+    
+    def _extract_pgn_from_can_id(self, can_id: int) -> tuple:
+        """
+        Extract J1939 components from 29-bit CAN ID
+        
+        CAN ID Format (29-bit):
+        [Priority(3bits)][Reserved(1bit)][DataPage(1bit)][PDUFormat(8bits)][PDUSpecific(8bits)][SourceAddress(8bits)]
+        
+        :param can_id: 29-bit CAN identifier
+        :return: (priority, pgn, source_address)
+        """
+        source_address = can_id & 0xFF
+        pdu_specific = (can_id >> 8) & 0xFF
+        pdu_format = (can_id >> 16) & 0xFF
+        data_page = (can_id >> 24) & 0x01
+        priority = (can_id >> 26) & 0x07
+        
+        # Construct PGN (18-bit)
+        pgn = (data_page << 17) | (pdu_format << 8) | pdu_specific
+        
+        return priority, pgn, source_address
+    
+    def get_message(self, pgn: int, timeout: float = 5.0) -> Optional[DMMessage]:
+        """
+        Get a DM message by PGN
+        
+        Waits for and returns a message with the specified PGN.
+        Returns None if timeout occurs.
+        
+        Usage:
+            dm1 = receiver.get_message(pgn=0xFECA)
+            dm2 = receiver.get_message(pgn=DM_PGN.DM02, timeout=10.0)
+        
+        :param pgn: Parameter Group Number (hex) e.g., 0xFECA for DM1
+        :param timeout: Timeout in seconds to wait for message (default: 5.0)
+        :return: DMMessage object or None if timeout
+        """
+        if not self.is_connected:
+            logger.error("✗ Not connected. Call connect() first.")
+            return None
+        
+        logger.info(f"Waiting for message with PGN: 0x{pgn:04X} (timeout: {timeout}s)...")
+        
+        try:
+            while True:
+                # Receive CAN message with timeout
+                can_msg = self.bus.recv(timeout=timeout)
+                
+                if can_msg is None:
+                    # Timeout occurred
+                    logger.warning(f"✗ Timeout - No message with PGN 0x{pgn:04X} received")
+                    return None
+                
+                # Extract J1939 components
+                try:
+                    priority, received_pgn, sa = self._extract_pgn_from_can_id(
+                        can_msg.arbitration_id
+                    )
+                except Exception as e:
+                    logger.debug(f"Error parsing CAN ID: {e}")
+                    continue
+                
+                # Check if this is the PGN we're looking for
+                if received_pgn == pgn:
+                    # Found the message - return it
+                    dm_msg = DMMessage(
+                        pgn=pgn,
+                        source_address=sa,
+                        priority=priority,
+                        timestamp=can_msg.timestamp,
+                        data=bytes(can_msg.data)
+                    )
+                    logger.info(f"✓ Received message: {dm_msg}")
+                    return dm_msg
+        
+        except Exception as e:
+            logger.error(f"✗ Error receiving message: {e}")
+            return None
+
+
+# ===== Global receiver instance =====
+_receiver = None
+
+
+def initialize(bustype: str = 'virtual', channel: str = 'vcan0', bitrate: int = 250000) -> bool:
+    """
+    Initialize the global DM receiver
+    
+    Must be called once before using get_message()
+    
+    :param bustype: CAN interface type ('virtual', 'socketcan', 'pcan', etc.)
+    :param channel: CAN channel name
+    :param bitrate: CAN bus bitrate
+    :return: True if successful
+    """
+    global _receiver
+    _receiver = DMReceiver(bustype=bustype, channel=channel, bitrate=bitrate)
+    return _receiver.connect()
+
+
+def get_message(pgn: int, timeout: float = 5.0) -> Optional[DMMessage]:
+    """
+    Get a DM message by PGN
+    
+    Simple function interface to get DM messages.
+    Call initialize() once before using this function.
+    
+    Examples:
+        # Initialize once at startup
+        initialize(bustype='socketcan', channel='can0')
+        
+        # Get DM1 message
+        dm1 = get_message(pgn=0xFECA)
+        
+        # Get DM2 message with 10 second timeout
+        dm2 = get_message(pgn=DM_PGN.DM02, timeout=10.0)
+        
+        # Check if message was received
+        if dm1:
+            print(f"PGN: 0x{dm1.pgn:04X}")
+            print(f"Data: {dm1.data.hex().upper()}")
+            print(f"Source: 0x{dm1.source_address:02X}")
+    
+    :param pgn: Parameter Group Number (hex) e.g., 0xFECA for DM1
+    :param timeout: Timeout in seconds
+    :return: DMMessage object or None if timeout
+    """
+    global _receiver
+    
+    if _receiver is None:
+        logger.error("✗ Receiver not initialized. Call initialize() first.")
+        return None
+    
+    return _receiver.get_message(pgn=pgn, timeout=timeout)
+
+
+def shutdown():
+    """Shutdown the receiver"""
+    global _receiver
+    if _receiver:
+        _receiver.disconnect()
+
+
+# ===== Example Usage =====
+def main():
+    """Main example"""
+    
+    print("\n" + "="*70)
+    print("J1939 DM MESSAGE RECEIVER - SIMPLE FUNCTION INTERFACE")
+    print("="*70 + "\n")
+    
+    # Initialize receiver
+    print("Initializing receiver...\n")
+    if not initialize(bustype='virtual', channel='vcan0'):
+        logger.error("Failed to initialize receiver")
+        return
+    
+    try:
+        # Example 1: Get DM1 message
+        print("Example 1: Getting DM1 message (PGN: 0xFECA)\n")
+        dm1 = get_message(pgn=0xFECA, timeout=5.0)
+        
+        if dm1:
+            print(f"✓ DM1 Message Received:")
+            print(f"  PGN: 0x{dm1.pgn:04X}")
+            print(f"  Source Address: 0x{dm1.source_address:02X}")
+            print(f"  Priority: {dm1.priority}")
+            print(f"  Timestamp: {dm1.timestamp:.3f}s")
+            print(f"  Data (Hex): {dm1.data.hex().upper()}")
+            print(f"  Data (Bytes): {list(dm1.data)}")
+            print(f"  Data Length: {len(dm1.data)} bytes")
+        else:
+            print("✗ No DM1 message received (timeout)")
+        
+        # Example 2: Get DM2 message
+        print("\n\nExample 2: Getting DM2 message (PGN: 0xFECB)\n")
+        dm2 = get_message(pgn=0xFECB, timeout=5.0)
+        
+        if dm2:
+            print(f"✓ DM2 Message Received:")
+            print(f"  {dm2}")
+        else:
+            print("✗ No DM2 message received (timeout)")
+        
+        # Example 3: Get DM3 message with longer timeout
+        print("\n\nExample 3: Getting DM3 message (PGN: 0xFECC, timeout: 10s)\n")
+        dm3 = get_message(pgn=0xFECC, timeout=10.0)
+        
+        if dm3:
+            print(f"✓ DM3 Message Received:")
+            print(f"  {dm3}")
+        else:
+            print("✗ No DM3 message received (timeout)")
+        
+        # Example 4: Using DM_PGN constants
+        print("\n\nExample 4: Using DM_PGN constants\n")
+        dm_msg = get_message(pgn=DM_PGN.DM01, timeout=5.0)
+        
+        if dm_msg:
+            print(f"✓ Message: {dm_msg}")
+        else:
+            print("✗ Timeout")
+    
+    finally:
+        shutdown()
+        print("\n" + "="*70)
+        print("Receiver shutdown complete")
+        print("="*70 + "\n")
+
+
+if __name__ == '__main__':
+    main()
