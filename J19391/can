@@ -1,0 +1,1066 @@
+import can
+import datetime
+import cantools
+import time
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+import statistics
+import struct
+
+class CANReader:
+    def __init__(self, channel=0, bitrate=500000, dbc_file=None, xml_file=None, filters=None):
+        """
+        Initialize Vector CAN interface
+        
+        Args:
+            channel: CAN channel
+            bitrate: CAN bitrate
+            dbc_file: Path to DBC file (optional)
+            xml_file: Path to XML message config file (optional)
+            filters: CAN filters (optional)
+        """
+        self.bus = can.interface.Bus(
+            bustype='vector',
+            channel=channel,
+            bitrate=bitrate
+        )
+
+        self.last_timestamps = {}  # For cycle time
+        self.db = None
+        self.pgn_map = {}
+        self.xml_messages = {}  # For XML-based message definitions
+
+        if dbc_file:
+            self.load_dbc(dbc_file)
+
+        if xml_file:
+            self.load_xml_messages(xml_file)
+
+        if filters:
+            self.set_filters(filters)
+
+    # ============================================
+    # DBC Load + PGN Mapping
+    # ============================================
+    def load_dbc(self, dbc_file):
+        """Load DBC file and build PGN map"""
+        self.db = cantools.database.load_file(dbc_file)
+
+        self.pgn_map = {}
+        for msg in self.db.messages:
+            if msg.is_extended_frame:
+                pgn = self.extract_pgn_from_dbc_id(msg.frame_id)
+                self.pgn_map[pgn] = msg
+
+    # ============================================
+    # XML Load + Message Mapping
+    # ============================================
+    def load_xml_messages(self, xml_file):
+        """
+        Load XML message configuration file.
+        
+        XML Format:
+        <messages>
+            <message name="MessageName" pgn="0xFECA" dlc="8">
+                <signal name="SignalName" 
+                        bit_position="0" 
+                        length="16" 
+                        byte_order="little_endian" 
+                        unit="rpm" 
+                        scale="0.125" 
+                        offset="0"
+                        min="0"
+                        max="8000" />
+            </message>
+        </messages>
+        """
+        try:
+            tree = ET.parse(xml_file)
+            root = tree.getroot()
+
+            for message_elem in root.findall('message'):
+                msg_name = message_elem.get('name')
+                pgn = message_elem.get('pgn')
+                can_id = message_elem.get('can_id')
+                dlc = int(message_elem.get('dlc', '8'))
+                description = message_elem.get('description', '')
+
+                msg_key = pgn if pgn else can_id
+                msg_key_int = int(msg_key, 16) if msg_key else None
+
+                msg_data = {
+                    'name': msg_name,
+                    'pgn': pgn,
+                    'can_id': can_id,
+                    'dlc': dlc,
+                    'description': description,
+                    'signals': {}
+                }
+
+                # Parse signals
+                for signal_elem in message_elem.findall('signal'):
+                    signal_name = signal_elem.get('name')
+                    bit_position = int(signal_elem.get('bit_position', '0'))
+                    length = int(signal_elem.get('length', '8'))
+                    byte_order = signal_elem.get('byte_order', 'little_endian')
+                    unit = signal_elem.get('unit', '')
+                    scale = float(signal_elem.get('scale', '1'))
+                    offset = float(signal_elem.get('offset', '0'))
+                    
+                    # NEW: Min and Max values
+                    min_value = signal_elem.get('min')
+                    max_value = signal_elem.get('max')
+                    
+                    # Convert to float if available
+                    min_value = float(min_value) if min_value is not None else None
+                    max_value = float(max_value) if max_value is not None else None
+
+                    msg_data['signals'][signal_name] = {
+                        'bit_position': bit_position,
+                        'length': length,
+                        'byte_order': byte_order,
+                        'unit': unit,
+                        'scale': scale,
+                        'offset': offset,
+                        'min': min_value,
+                        'max': max_value
+                    }
+
+                # Store by both PGN and message name
+                if pgn:
+                    self.xml_messages[int(pgn, 16)] = msg_data
+                if can_id:
+                    self.xml_messages[int(can_id, 16)] = msg_data
+                self.xml_messages[msg_name.lower()] = msg_data
+
+            print(f"Loaded {len(set(m for m in self.xml_messages.values()))} messages from XML")
+        except Exception as e:
+            print(f"Error loading XML file: {e}")
+
+    # ============================================
+    # Filters
+    # ============================================
+    def set_filters(self, filter_list):
+        self.bus.set_filters(filter_list)
+
+    # ============================================
+    # PGN Extraction
+    # ============================================
+    def get_pgn(self, arbitration_id):
+        """Extract PGN from J1939 CAN ID"""
+        pf = (arbitration_id >> 16) & 0xFF
+        ps = (arbitration_id >> 8) & 0xFF
+
+        if pf >= 240:  # PDU2
+            return (pf << 8) | ps
+        else:          # PDU1
+            return (pf << 8)
+
+    def extract_pgn_from_dbc_id(self, frame_id):
+        return self.get_pgn(frame_id)
+
+    # ============================================
+    # Cycle Time Calculation
+    # ============================================
+    def calculate_cycle_time(self, msg):
+        msg_id = msg.arbitration_id
+        cycle = None
+
+        if msg_id in self.last_timestamps:
+            cycle = (msg.timestamp - self.last_timestamps[msg_id]) * 1000  # ms
+
+        self.last_timestamps[msg_id] = msg.timestamp
+        return cycle
+
+    def get_specific_cycle_time(self, msg, target_id):
+        if msg.arbitration_id != target_id:
+            return None
+        return self.calculate_cycle_time(msg)
+
+    # ============================================
+    # Message Decoding - Standard CAN
+    # ============================================
+    def decode_standard(self, msg):
+        if not self.db or msg.is_extended_id:
+            return None
+
+        try:
+            return self.db.decode_message(msg.arbitration_id, msg.data)
+        except:
+            return None
+
+    # ============================================
+    # Message Decoding - J1939 PGN
+    # ============================================
+    def decode_j1939_by_pgn(self, msg):
+        if not msg.is_extended_id:
+            return None, None, None
+
+        pgn = self.get_pgn(msg.arbitration_id)
+
+        # Try DBC first
+        if self.db and pgn in self.pgn_map:
+            message_def = self.pgn_map[pgn]
+            try:
+                decoded = message_def.decode(msg.data)
+                return pgn, message_def.name, decoded
+            except Exception as e:
+                return pgn, message_def.name, f"Decode Error: {e}"
+
+        # Try XML
+        if pgn in self.xml_messages:
+            msg_data = self.xml_messages[pgn]
+            try:
+                decoded = self._decode_xml_message(msg.data, msg_data)
+                return pgn, msg_data['name'], decoded
+            except Exception as e:
+                return pgn, msg_data['name'], f"Decode Error: {e}"
+
+        return pgn, None, None
+
+    # ============================================
+    # XML Message Decoding
+    # ============================================
+    def _decode_xml_message(self, data, msg_data):
+        """Decode message data using XML signal definitions"""
+        decoded = {}
+
+        for signal_name, signal_info in msg_data['signals'].items():
+            bit_pos = signal_info['bit_position']
+            length = signal_info['length']
+            byte_order = signal_info['byte_order']
+            scale = signal_info['scale']
+            offset = signal_info['offset']
+
+            # Extract raw value from bits
+            raw_value = self._extract_bits(data, bit_pos, length, byte_order)
+
+            # Apply scale and offset
+            physical_value = (raw_value * scale) + offset
+
+            decoded[signal_name] = physical_value
+
+        return decoded
+
+    def _extract_bits(self, data, bit_position, length, byte_order='little_endian'):
+        """Extract bits from CAN data"""
+        start_byte = bit_position // 8
+        start_bit = bit_position % 8
+
+        raw_value = 0
+
+        if byte_order == 'little_endian':
+            for i in range(length):
+                bit_index = start_bit + i
+                byte_index = start_byte + (bit_index // 8)
+
+                if byte_index >= len(data):
+                    break
+
+                bit = (data[byte_index] >> (bit_index % 8)) & 1
+                raw_value |= (bit << i)
+        else:  # big_endian
+            for i in range(length):
+                bit_index = start_bit + i
+                byte_index = start_byte + (bit_index // 8)
+
+                if byte_index >= len(data):
+                    break
+
+                bit = (data[byte_index] >> (7 - (bit_index % 8))) & 1
+                raw_value |= (bit << i)
+
+        return raw_value
+
+    # ============================================
+    # Convert PGN to possible CAN IDs
+    # ============================================
+    def pgn_to_can_ids(self, pgn):
+        """Convert a PGN to all possible CAN IDs for filtering"""
+        can_ids = []
+        pf = (pgn >> 8) & 0xFF
+        ps = pgn & 0xFF
+        
+        if pf < 240:
+            for ps_val in range(0, 256):
+                arbitration_id = (0x18 << 24) | (pf << 16) | (ps_val << 8)
+                can_ids.append(arbitration_id)
+        else:
+            arbitration_id = (0x18 << 24) | (pf << 16) | (ps << 8)
+            can_ids.append(arbitration_id)
+        
+        return can_ids
+
+    # ============================================
+    # Read messages with duration and PGN filter
+    # ============================================
+    def read_messages(self, target_id=None, duration=5, pgn_filters=None):
+        """
+        Read CAN messages for specified duration (default 5 seconds).
+        
+        Args:
+            target_id: Optional specific CAN ID to monitor
+            duration: Time to read messages in seconds (default: 5)
+            pgn_filters: List of PGN numbers to filter (e.g., [0xFECA, 0xFECB])
+        
+        Returns:
+            messageList: List of [msg, cycle_time] pairs
+        """
+        print(f"Listening to CAN bus for {duration} seconds...\n")
+
+        start_time = time.time()
+        messageList = []
+        
+        can_id_filters = set()
+        if pgn_filters:
+            for pgn in pgn_filters:
+                can_ids = self.pgn_to_can_ids(pgn)
+                can_id_filters.update(can_ids)
+
+        while time.time() - start_time < duration:
+            msg = self.bus.recv(timeout=1)
+
+            if not msg:
+                continue
+
+            ts = msg.timestamp
+            human_time = datetime.datetime.fromtimestamp(ts)
+            cycle = self.calculate_cycle_time(msg)
+
+            if pgn_filters is None:
+                messageList.append([msg, cycle])
+                self._print_message(msg, cycle, human_time)
+            else:
+                if msg.arbitration_id in can_id_filters:
+                    messageList.append([msg, cycle])
+                    self._print_message(msg, cycle, human_time)
+
+        print(f"\nStopped reading after {duration} seconds")
+        print(f"Total messages captured: {len(messageList)}\n")
+        return messageList
+
+    def _print_message(self, msg, cycle, human_time):
+        """Helper function to print message details"""
+        if msg.is_extended_id:
+            pgn, name, decoded = self.decode_j1939_by_pgn(msg)
+            print(f"[{human_time}] J1939 - ID: 0x{msg.arbitration_id:08x}, PGN: 0x{pgn:04x}, Name: {name}")
+            print(f"    Data: {msg.data.hex()}")
+            print(f"    Decoded: {decoded}")
+            if cycle:
+                print(f"    Cycle Time: {cycle:.2f} ms")
+        else:
+            decoded = self.decode_standard(msg)
+            print(f"[{human_time}] Standard - ID: 0x{msg.arbitration_id:03x}")
+            print(f"    Data: {msg.data.hex()}")
+            print(f"    Decoded: {decoded}")
+            if cycle:
+                print(f"    Cycle Time: {cycle:.2f} ms")
+        
+        print("-" * 60)
+
+    # ============================================
+    # Get message from captured messages
+    # ============================================
+    def get_message(self, identifier, duration=5, pgn_filters=None):
+        """
+        Retrieve a message by PGN, CAN ID, or message name.
+        Returns the LAST matching message.
+        
+        Args:
+            identifier: Can be PGN (int), CAN ID (int), or message name (str)
+            duration: Time to read messages in seconds (default: 5)
+            pgn_filters: List of PGN numbers to filter
+        
+        Returns:
+            Dict with message data or None if not found
+        """
+        if not self.db and not self.xml_messages:
+            print("Error: Neither DBC file nor XML file loaded")
+            return None
+
+        if isinstance(identifier, int) and pgn_filters is None:
+            pgn_filters = [identifier]
+
+        messageList = self.read_messages(duration=duration, pgn_filters=pgn_filters)
+
+        if not messageList:
+            print("Error: No messages captured")
+            return None
+
+        for msg, cycle in reversed(messageList):
+            if not msg.is_extended_id:
+                continue
+
+            pgn = self.get_pgn(msg.arbitration_id)
+            can_id = msg.arbitration_id
+
+            if isinstance(identifier, int) and pgn == identifier:
+                decoded = None
+                msg_name = None
+
+                # Try DBC
+                if self.db and pgn in self.pgn_map:
+                    msg_def = self.pgn_map[pgn]
+                    msg_name = msg_def.name
+                    try:
+                        decoded = msg_def.decode(msg.data)
+                    except Exception as e:
+                        decoded = f"Decode Error: {e}"
+
+                # Try XML
+                elif pgn in self.xml_messages:
+                    msg_data = self.xml_messages[pgn]
+                    msg_name = msg_data['name']
+                    try:
+                        decoded = self._decode_xml_message(msg.data, msg_data)
+                    except Exception as e:
+                        decoded = f"Decode Error: {e}"
+                
+                return {
+                    'pgn': f"0x{pgn:04X}",
+                    'can_id': f"0x{can_id:08X}",
+                    'message_name': msg_name,
+                    'decoded': decoded,
+                    'raw_data': msg.data.hex(),
+                    'dlc': len(msg.data),
+                    'cycle_time': f"{cycle:.2f} ms" if cycle else "N/A",
+                    'timestamp': msg.timestamp,
+                    'human_time': datetime.datetime.fromtimestamp(msg.timestamp)
+                }
+
+            if isinstance(identifier, int) and can_id == identifier:
+                # Similar logic as above
+                pgn = self.get_pgn(can_id)
+                decoded = None
+                msg_name = None
+
+                if self.db and pgn in self.pgn_map:
+                    msg_def = self.pgn_map[pgn]
+                    msg_name = msg_def.name
+                    try:
+                        decoded = msg_def.decode(msg.data)
+                    except Exception as e:
+                        decoded = f"Decode Error: {e}"
+
+                elif pgn in self.xml_messages:
+                    msg_data = self.xml_messages[pgn]
+                    msg_name = msg_data['name']
+                    try:
+                        decoded = self._decode_xml_message(msg.data, msg_data)
+                    except Exception as e:
+                        decoded = f"Decode Error: {e}"
+                
+                return {
+                    'pgn': f"0x{pgn:04X}",
+                    'can_id': f"0x{can_id:08X}",
+                    'message_name': msg_name,
+                    'decoded': decoded,
+                    'raw_data': msg.data.hex(),
+                    'dlc': len(msg.data),
+                    'cycle_time': f"{cycle:.2f} ms" if cycle else "N/A",
+                    'timestamp': msg.timestamp,
+                    'human_time': datetime.datetime.fromtimestamp(msg.timestamp)
+                }
+
+            if isinstance(identifier, str):
+                pgn = self.get_pgn(can_id)
+                msg_name = None
+
+                if self.db and pgn in self.pgn_map:
+                    msg_def = self.pgn_map[pgn]
+                    if msg_def.name.lower() == identifier.lower():
+                        msg_name = msg_def.name
+                        try:
+                            decoded = msg_def.decode(msg.data)
+                        except Exception as e:
+                            decoded = f"Decode Error: {e}"
+                        
+                        return {
+                            'pgn': f"0x{pgn:04X}",
+                            'can_id': f"0x{can_id:08X}",
+                            'message_name': msg_name,
+                            'decoded': decoded,
+                            'raw_data': msg.data.hex(),
+                            'dlc': len(msg.data),
+                            'cycle_time': f"{cycle:.2f} ms" if cycle else "N/A",
+                            'timestamp': msg.timestamp,
+                            'human_time': datetime.datetime.fromtimestamp(msg.timestamp)
+                        }
+
+                elif pgn in self.xml_messages:
+                    msg_data = self.xml_messages[pgn]
+                    if msg_data['name'].lower() == identifier.lower():
+                        try:
+                            decoded = self._decode_xml_message(msg.data, msg_data)
+                        except Exception as e:
+                            decoded = f"Decode Error: {e}"
+                        
+                        return {
+                            'pgn': f"0x{pgn:04X}",
+                            'can_id': f"0x{can_id:08X}",
+                            'message_name': msg_data['name'],
+                            'decoded': decoded,
+                            'raw_data': msg.data.hex(),
+                            'dlc': len(msg.data),
+                            'cycle_time': f"{cycle:.2f} ms" if cycle else "N/A",
+                            'timestamp': msg.timestamp,
+                            'human_time': datetime.datetime.fromtimestamp(msg.timestamp)
+                        }
+
+        print(f"Message with identifier {identifier} not found")
+        return None
+
+    # ============================================
+    # NEW: Get Signal Value (Last Message Only)
+    # ============================================
+    def get_signal_value(self, signal_name, duration=5, pgn_filters=None):
+        """
+        Get signal value from the LAST message containing the signal.
+        Supports both DBC and XML message definitions.
+        Includes min/max values from signal definition.
+        
+        Args:
+            signal_name: Name of the signal to find (case-insensitive)
+            duration: Time to read messages in seconds (default: 5)
+            pgn_filters: List of PGN numbers to filter (optional)
+        
+        Returns:
+            Dict with:
+            {
+                'signal_name': 'EngineSpeed',
+                'value': 850.5,
+                'unit': 'rpm',
+                'scale': 0.125,
+                'offset': 0,
+                'min': 0,                    # NEW: Min value from definition
+                'max': 8000,                 # NEW: Max value from definition
+                'in_range': True,            # NEW: Value is within min/max
+                'found_in_message': {
+                    'pgn': '0xF004',
+                    'message_name': 'EngineData',
+                    'can_id': '0x18F00400'
+                },
+                'timestamp': 1234.567,
+                'human_time': datetime,
+                'raw_hex': 'AABBCCDD...'
+            }
+            or None if signal not found
+        """
+        if not self.db and not self.xml_messages:
+            print("Error: Neither DBC file nor XML file loaded")
+            return None
+
+        messageList = self.read_messages(duration=duration, pgn_filters=pgn_filters)
+
+        if not messageList:
+            print("Error: No messages captured")
+            return None
+
+        # Search from the END (last message first)
+        for msg, cycle in reversed(messageList):
+            if not msg.is_extended_id:
+                continue
+
+            pgn = self.get_pgn(msg.arbitration_id)
+            can_id = msg.arbitration_id
+
+            decoded = None
+            msg_name = None
+            signal_unit = 'N/A'
+            signal_scale = 1
+            signal_offset = 0
+            signal_min = None
+            signal_max = None
+
+            # Try DBC first
+            if self.db and pgn in self.pgn_map:
+                msg_def = self.pgn_map[pgn]
+                msg_name = msg_def.name
+                try:
+                    decoded = msg_def.decode(msg.data)
+                    
+                    # Get signal metadata from DBC
+                    for signal in msg_def.signals:
+                        if signal.name.lower() == signal_name.lower():
+                            signal_unit = signal.unit if signal.unit else 'N/A'
+                            signal_scale = signal.scale
+                            signal_offset = signal.offset
+                            # DBC may have min/max
+                            signal_min = signal.minimum if hasattr(signal, 'minimum') else None
+                            signal_max = signal.maximum if hasattr(signal, 'maximum') else None
+                            break
+                except Exception as e:
+                    continue
+
+            # Try XML
+            elif pgn in self.xml_messages:
+                msg_data = self.xml_messages[pgn]
+                msg_name = msg_data['name']
+                try:
+                    decoded = self._decode_xml_message(msg.data, msg_data)
+                    
+                    # Get signal metadata from XML
+                    if signal_name.lower() in [s.lower() for s in msg_data['signals'].keys()]:
+                        for sig_name, sig_info in msg_data['signals'].items():
+                            if sig_name.lower() == signal_name.lower():
+                                signal_unit = sig_info['unit']
+                                signal_scale = sig_info['scale']
+                                signal_offset = sig_info['offset']
+                                signal_min = sig_info.get('min')
+                                signal_max = sig_info.get('max')
+                                break
+                except Exception as e:
+                    continue
+
+            if decoded and isinstance(decoded, dict):
+                # Search for signal in decoded data
+                for key, value in decoded.items():
+                    if key.lower() == signal_name.lower():
+                        # Check if value is in range
+                        in_range = True
+                        if signal_min is not None and value < signal_min:
+                            in_range = False
+                        if signal_max is not None and value > signal_max:
+                            in_range = False
+                        
+                        return {
+                            'signal_name': signal_name,
+                            'value': value,
+                            'unit': signal_unit,
+                            'scale': signal_scale,
+                            'offset': signal_offset,
+                            'min': signal_min,
+                            'max': signal_max,
+                            'in_range': in_range,
+                            'found_in_message': {
+                                'pgn': f"0x{pgn:04X}",
+                                'message_name': msg_name,
+                                'can_id': f"0x{can_id:08X}"
+                            },
+                            'timestamp': msg.timestamp,
+                            'human_time': datetime.datetime.fromtimestamp(msg.timestamp),
+                            'raw_hex': msg.data.hex().upper(),
+                            'dlc': len(msg.data)
+                        }
+
+        print(f"Signal '{signal_name}' not found in any message")
+        return None
+
+    # ============================================
+    # Get DM message from captured messages
+    # ============================================
+    def get_dm_message(self, identifier, duration=5, pgn_filters=None):
+        """
+        Retrieve a DM (Diagnostic Message) from captured messages.
+        Automatically includes 0xEC00 (TP.CM) and 0xEB00 (TP.DT) in filters.
+        Returns the LAST matching DM message.
+        """
+        if not self.db and not self.xml_messages:
+            print("Error: Neither DBC file nor XML file loaded")
+            return None
+
+        tp_pgns = [0xEC00, 0xEB00]
+        dm_pgns = [0xFECA, 0xFECB, 0xFECC, 0xFECD]
+        
+        filters = list(tp_pgns) + list(dm_pgns)
+        if pgn_filters:
+            filters.extend(pgn_filters)
+        
+        filters = list(set(filters))
+
+        messageList = self.read_messages(duration=duration, pgn_filters=filters)
+
+        if not messageList:
+            print("Error: No messages captured")
+            return None
+
+        dm_message = None
+        tp_cm_message = None
+        tp_dt_messages = []
+
+        for msg, cycle in messageList:
+            if not msg.is_extended_id:
+                continue
+
+            pgn = self.get_pgn(msg.arbitration_id)
+
+            match_dm = False
+            if isinstance(identifier, int):
+                if pgn == identifier or msg.arbitration_id == identifier:
+                    match_dm = True
+            elif isinstance(identifier, str):
+                if pgn in self.xml_messages:
+                    if self.xml_messages[pgn]['name'].lower() == identifier.lower():
+                        match_dm = True
+                elif self.db and pgn in self.pgn_map:
+                    if self.pgn_map[pgn].name.lower() == identifier.lower():
+                        match_dm = True
+
+            if match_dm and pgn in [0xFECA, 0xFECB, 0xFECC, 0xFECD]:
+                dm_message = [msg, cycle]
+
+            if pgn == 0xEC00:
+                tp_cm_message = [msg, cycle]
+
+            if pgn == 0xEB00:
+                tp_dt_messages.append([msg, cycle])
+
+        if dm_message:
+            msg, cycle = dm_message
+            return self._parse_dm_message(msg, cycle)
+
+        if tp_cm_message and tp_dt_messages:
+            print("Multi-frame DM message detected (TP.CM + TP.DT)")
+            return self._parse_multiframe_dm(tp_cm_message, tp_dt_messages)
+
+        print(f"DM message with identifier {identifier} not found")
+        return None
+
+    def _parse_dm_message(self, msg, cycle):
+        """Parse a single DM message"""
+        pgn = self.get_pgn(msg.arbitration_id)
+        can_id = msg.arbitration_id
+        dlc = len(msg.data)
+
+        dm_result = {
+            'pgn': f"0x{pgn:04X}",
+            'can_id': f"0x{can_id:08X}",
+            'dlc': dlc,
+            'raw_data': msg.data.hex().upper(),
+            'timestamp': msg.timestamp,
+            'human_time': datetime.datetime.fromtimestamp(msg.timestamp),
+            'cycle_time': cycle,
+            'is_multiframe': False
+        }
+
+        if self.db and pgn in self.pgn_map:
+            dm_result['message_name'] = self.pgn_map[pgn].name
+        elif pgn in self.xml_messages:
+            dm_result['message_name'] = self.xml_messages[pgn]['name']
+
+        if pgn == 0xFECA:
+            dm_result['dm_type'] = 'DM1 (Active DTCs)'
+        elif pgn == 0xFECB:
+            dm_result['dm_type'] = 'DM2 (Previously Active DTCs)'
+        elif pgn == 0xFECC:
+            dm_result['dm_type'] = 'DM3 (DTC Definition)'
+        elif pgn == 0xFECD:
+            dm_result['dm_type'] = 'DM4 (Freeze Frame Data)'
+        else:
+            dm_result['dm_type'] = f'DM (PGN: 0x{pgn:04X})'
+
+        if dlc >= 2:
+            reserved_byte = msg.data[0]
+            dm_result['reserved_byte'] = f"0x{reserved_byte:02X}"
+            
+            num_dtcs = msg.data[1]
+            dm_result['num_dtcs'] = num_dtcs
+
+            dtc_list = []
+            if dlc >= 8 and num_dtcs > 0:
+                for i in range(min(3, num_dtcs)):
+                    dtc_start = 2 + (i * 2)
+                    if dtc_start + 2 <= dlc:
+                        byte1 = msg.data[dtc_start]
+                        byte2 = msg.data[dtc_start + 1]
+                        
+                        spn = ((byte2 & 0x03) << 8) | byte1
+                        fmi = (byte2 >> 2) & 0x1F
+                        
+                        dtc_entry = {
+                            'dtc_raw': f"0x{byte1:02X}{byte2:02X}",
+                            'spn': spn,
+                            'fmi': fmi
+                        }
+                        dtc_list.append(dtc_entry)
+            
+            dm_result['dtc_data'] = dtc_list
+
+        return dm_result
+
+    def _parse_multiframe_dm(self, tp_cm_msg, tp_dt_msgs):
+        """Parse multi-frame DM message (TP.CM + TP.DT)"""
+        cm_msg, cm_cycle = tp_cm_msg
+        
+        dm_result = {
+            'pgn': '0xEC00/0xEB00',
+            'can_id': f"0x{cm_msg.arbitration_id:08X}",
+            'dlc': 8,
+            'dm_type': 'DM1 (Multi-frame - Active DTCs)',
+            'is_multiframe': True,
+            'timestamp': cm_msg.timestamp,
+            'human_time': datetime.datetime.fromtimestamp(cm_msg.timestamp),
+            'cycle_time': cm_cycle
+        }
+
+        if len(cm_msg.data) >= 1:
+            control_byte = cm_msg.data[0]
+            dm_result['control_byte'] = f"0x{control_byte:02X}"
+
+        combined_data = b''
+        for dt_msg, dt_cycle in sorted(tp_dt_msgs, key=lambda x: x[0].timestamp):
+            combined_data += dt_msg.data
+
+        if len(combined_data) >= 2:
+            dm_result['reserved_byte'] = f"0x{combined_data[0]:02X}"
+            
+            num_dtcs = combined_data[1]
+            dm_result['num_dtcs'] = num_dtcs
+
+            dtc_list = []
+            for i in range(min(num_dtcs, (len(combined_data) - 2) // 2)):
+                dtc_start = 2 + (i * 2)
+                if dtc_start + 2 <= len(combined_data):
+                    byte1 = combined_data[dtc_start]
+                    byte2 = combined_data[dtc_start + 1]
+                    
+                    spn = ((byte2 & 0x03) << 8) | byte1
+                    fmi = (byte2 >> 2) & 0x1F
+                    
+                    dtc_entry = {
+                        'dtc_raw': f"0x{byte1:02X}{byte2:02X}",
+                        'spn': spn,
+                        'fmi': fmi
+                    }
+                    dtc_list.append(dtc_entry)
+            
+            dm_result['dtc_data'] = dtc_list
+
+        dm_result['raw_data'] = combined_data.hex().upper()
+        dm_result['num_frames'] = len(tp_dt_msgs)
+
+        return dm_result
+
+    # ============================================
+    # Get Cycle Time Statistics
+    # ============================================
+    def get_cycle_time(self, identifier=None, duration=5, pgn_filters=None):
+        """
+        Calculate cycle time statistics for messages.
+        Analyzes all instances of cycle times and provides comprehensive statistics.
+        """
+        if not self.db and not self.xml_messages:
+            print("Error: Neither DBC file nor XML file loaded")
+            return None
+
+        messageList = self.read_messages(duration=duration, pgn_filters=pgn_filters)
+
+        if not messageList:
+            print("Error: No messages captured")
+            return None
+
+        pgn_data = defaultdict(lambda: {
+            'can_ids': set(),
+            'timestamps': [],
+            'cycle_times': [],
+            'message_name': None
+        })
+
+        for msg, cycle in messageList:
+            if not msg.is_extended_id:
+                continue
+
+            pgn = self.get_pgn(msg.arbitration_id)
+            can_id = msg.arbitration_id
+
+            pgn_data[pgn]['can_ids'].add(f"0x{can_id:08X}")
+            pgn_data[pgn]['timestamps'].append(msg.timestamp)
+            
+            if cycle is not None:
+                pgn_data[pgn]['cycle_times'].append(cycle)
+
+            if self.db and pgn in self.pgn_map:
+                pgn_data[pgn]['message_name'] = self.pgn_map[pgn].name
+            elif pgn in self.xml_messages:
+                pgn_data[pgn]['message_name'] = self.xml_messages[pgn]['name']
+
+        if identifier:
+            filtered_pgn_data = {}
+            for pgn, data in pgn_data.items():
+                match = False
+                
+                if isinstance(identifier, int) and pgn == identifier:
+                    match = True
+                elif isinstance(identifier, str) and data['message_name']:
+                    if data['message_name'].lower() == identifier.lower():
+                        match = True
+                
+                if match:
+                    filtered_pgn_data[pgn] = data
+            
+            pgn_data = filtered_pgn_data
+
+        results = {'messages': {}, 'overall_stats': {}}
+        all_cycle_times = []
+        total_messages = 0
+
+        for pgn, data in pgn_data.items():
+            pgn_key = f"pgn_0x{pgn:04X}"
+            can_ids = sorted(list(data['can_ids']))
+            cycle_times = data['cycle_times']
+
+            results['messages'][pgn_key] = {
+                'pgn': f"0x{pgn:04X}",
+                'message_name': data['message_name'] or 'Unknown',
+                'can_ids': can_ids,
+                'count': len(data['timestamps']),
+                'cycle_times': cycle_times,
+                'cycle_times_count': len(cycle_times)
+            }
+
+            if len(cycle_times) > 0:
+                results['messages'][pgn_key].update({
+                    'min_cycle': round(min(cycle_times), 2),
+                    'max_cycle': round(max(cycle_times), 2),
+                    'avg_cycle': round(statistics.mean(cycle_times), 2),
+                    'median_cycle': round(statistics.median(cycle_times), 2),
+                    'stddev_cycle': round(statistics.stdev(cycle_times), 2) if len(cycle_times) > 1 else 0,
+                    'variance_cycle': round(statistics.variance(cycle_times), 2) if len(cycle_times) > 1 else 0
+                })
+            else:
+                results['messages'][pgn_key].update({
+                    'min_cycle': 'N/A',
+                    'max_cycle': 'N/A',
+                    'avg_cycle': 'N/A',
+                    'median_cycle': 'N/A',
+                    'stddev_cycle': 'N/A',
+                    'variance_cycle': 'N/A'
+                })
+
+            all_cycle_times.extend(cycle_times)
+            total_messages += len(data['timestamps'])
+
+        results['overall_stats'] = {
+            'total_messages': total_messages,
+            'unique_pgns': len(pgn_data),
+            'duration_seconds': duration
+        }
+
+        if len(all_cycle_times) > 0:
+            results['overall_stats'].update({
+                'overall_avg_cycle': round(statistics.mean(all_cycle_times), 2),
+                'overall_min_cycle': round(min(all_cycle_times), 2),
+                'overall_max_cycle': round(max(all_cycle_times), 2),
+                'overall_median_cycle': round(statistics.median(all_cycle_times), 2),
+                'overall_stddev': round(statistics.stdev(all_cycle_times), 2) if len(all_cycle_times) > 1 else 0,
+                'overall_variance': round(statistics.variance(all_cycle_times), 2) if len(all_cycle_times) > 1 else 0
+            })
+
+        return results
+
+    # ============================================
+    # Get all available signal names
+    # ============================================
+    def get_all_signal_names(self):
+        """
+        Get all available signal names from DBC and XML files.
+        """
+        signal_names = {}
+
+        # From DBC
+        if self.db:
+            for pgn, msg_def in self.pgn_map.items():
+                signal_names[msg_def.name] = {
+                    'pgn': f"0x{pgn:04X}",
+                    'source': 'DBC',
+                    'signals': [signal.name for signal in msg_def.signals]
+                }
+
+        # From XML
+        for msg_data in set(self.xml_messages.values()):
+            if isinstance(msg_data, dict) and 'name' in msg_data:
+                if msg_data['name'] not in signal_names:
+                    signal_names[msg_data['name']] = {
+                        'pgn': msg_data.get('pgn', 'N/A'),
+                        'source': 'XML',
+                        'signals': list(msg_data.get('signals', {}).keys())
+                    }
+
+        return signal_names
+
+
+# Example XML format
+XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<messages>
+    <message name="EngineData" pgn="0xF004" dlc="8" description="Engine operating parameters">
+        <signal name="EngineSpeed" 
+                bit_position="0" 
+                length="16" 
+                byte_order="little_endian" 
+                unit="rpm" 
+                scale="0.125" 
+                offset="0"
+                min="0"
+                max="8000" />
+        
+        <signal name="EngineCoolantTemp" 
+                bit_position="16" 
+                length="8" 
+                byte_order="little_endian" 
+                unit="°C" 
+                scale="1" 
+                offset="-40"
+                min="-40"
+                max="215" />
+    </message>
+
+    <message name="FuelSystem" pgn="0xFEF1" dlc="8" description="Fuel level and status">
+        <signal name="FuelLevel" 
+                bit_position="0" 
+                length="16" 
+                byte_order="little_endian" 
+                unit="%" 
+                scale="0.4" 
+                offset="0"
+                min="0"
+                max="100" />
+    </message>
+
+    <message name="DM1" pgn="0xFECA" dlc="8" description="Active Diagnostic Trouble Codes">
+        <signal name="ReservedByte" 
+                bit_position="0" 
+                length="8" 
+                byte_order="little_endian" 
+                unit="" 
+                scale="1" 
+                offset="0" />
+    </message>
+</messages>
+"""
+
+# Example usage
+if __name__ == "__main__":
+    # Create example XML file
+    with open('message_config.xml', 'w') as f:
+        f.write(XML_TEMPLATE)
+
+    # Initialize with both DBC and XML (XML as fallback if DBC not available)
+    reader = CANReader(
+        channel=0, 
+        bitrate=500000, 
+        dbc_file="path/to/your.dbc",      # Optional
+        xml_file="message_config.xml"      # Optional
+    )
+    
+    try:
+        # EXAMPLE 1: Get last signal value with min/max validation
+        # result = reader.get_signal_value("EngineSpeed", duration=5)
+        # if result:
+        #     print(f"Signal: {result['signal_name']}")
+        #     print(f"Value: {result['value']} {result['unit']}")
+        #     print(f"Range: {result['min']} - {result['max']}")
+        #     print(f"In Range: {result['in_range']}")
+        #     print(f"Message: {result['found_in_message']['message_name']}")
+        
+        # EXAMPLE 2: Check signal validity
+        # result = reader.get_signal_value("EngineCoolantTemp", duration=5)
+        # if result:
+        #     if result['in_range']:
+        #         print(f"✓ Signal {result['signal_name']} is within valid range")
+        #     else:
+        #         print(f"✗ Signal {result['signal_name']} exceeds range!")
+        
+        pass
+        
+    except KeyboardInterrupt:
+        print("\nStopped by user")
