@@ -7,6 +7,8 @@ Delta Elektronika Sequence Builder - ControlDesk-style signal editor (PyQt5).
 from __future__ import annotations
 
 import copy
+import math
+import os
 import sys
 
 from PyQt5.QtCore import Qt
@@ -17,7 +19,7 @@ from PyQt5.QtWidgets import (
     QListWidget, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QToolBar,
     QVBoxLayout, QWidget, QHeaderView, QDialog, QDialogButtonBox,
-    QAbstractItemView,
+    QAbstractItemView, QRadioButton, QButtonGroup,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
@@ -236,6 +238,230 @@ class SegmentDialog(QDialog):
         self.canvas.draw_idle()
 
 
+class SampleImportDialog(QDialog):
+    """Load timestamp/value samples and convert them to a Table segment."""
+
+    def __init__(self, parent, channel: str):
+        super().__init__(parent)
+        self.setWindowTitle("Import samples")
+        self.resize(1100, 720)
+        self.rows: list[list[str]] = []
+        self.samples: list[tuple[float, float]] = []
+        self.points: list[list[float]] = []
+        self.path = ""
+
+        main = QHBoxLayout(self)
+        left = QVBoxLayout(); main.addLayout(left, 0)
+
+        # --- file
+        gf = QGroupBox("1. Sample file"); ff = QFormLayout(gf)
+        hb = QHBoxLayout()
+        self.ed_path = QLineEdit(); self.ed_path.setReadOnly(True)
+        b = QPushButton("Browse…"); b.clicked.connect(self.browse)
+        hb.addWidget(self.ed_path, 1); hb.addWidget(b)
+        ff.addRow(hb)
+        self.chk_header = QCheckBox("First row is a header")
+        self.cb_tcol = QComboBox(); self.cb_vcol = QComboBox()
+        ff.addRow(self.chk_header)
+        ff.addRow("Time column", self.cb_tcol)
+        ff.addRow("Value column", self.cb_vcol)
+        self.tbl_raw = QTableWidget(); self.tbl_raw.setMaximumHeight(140)
+        self.tbl_raw.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        ff.addRow(self.tbl_raw)
+        left.addWidget(gf)
+
+        # --- time
+        gt = QGroupBox("2. Time"); ft = QFormLayout(gt)
+        self.cb_unit = QComboBox(); self.cb_unit.addItems(core.TIME_UNITS)
+        self.cb_unit.setCurrentText("ms")
+        self.cb_tmode = QComboBox()
+        self.cb_tmode.addItems(["Timestamp (time of each sample)",
+                                "Duration (hold time of each sample)"])
+        self.chk_zero = QCheckBox("Start at t = 0 (shift first timestamp)")
+        self.chk_zero.setChecked(True)
+        self.sp_last = self._dspin(0.001, 1e6, 3, 1.0)
+        ft.addRow("Time unit", self.cb_unit)
+        ft.addRow("Time column is", self.cb_tmode)
+        ft.addRow(self.chk_zero)
+        ft.addRow("Hold last value [s]", self.sp_last)
+        left.addWidget(gt)
+
+        # --- signal shape
+        gm = QGroupBox("3. Signal shape between samples"); fm = QFormLayout(gm)
+        self.rb_step = QRadioButton("Step – hold each value until the next sample")
+        self.rb_cont = QRadioButton("Continuous – linear interpolation, resampled")
+        self.rb_step.setChecked(True)
+        grp = QButtonGroup(self); grp.addButton(self.rb_step); grp.addButton(self.rb_cont)
+        fm.addRow(self.rb_step); fm.addRow(self.rb_cont)
+        self.sp_dt = self._dspin(1, 1e7, 1, 100.0)
+        b_fit = QPushButton("Fit to 2000 steps"); b_fit.clicked.connect(self.fit_steps)
+        fm.addRow("Resample step [ms]", self._row(self.sp_dt, b_fit))
+        self.sp_minhold = self._dspin(1, 1e7, 1, 1.0)
+        fm.addRow("Minimum hold [ms]", self.sp_minhold)
+        self.sp_scale = self._dspin(-1e6, 1e6, 4, 1.0)
+        self.sp_offset = self._dspin(-1e6, 1e6, 3, 0.0)
+        fm.addRow("Value × scale + offset", self._row(self.sp_scale, self.sp_offset))
+        left.addWidget(gm)
+
+        # --- output
+        go = QGroupBox("4. Output"); fo = QFormLayout(go)
+        self.cb_ch = QComboBox(); self.cb_ch.addItems(CHANNELS)
+        self.cb_ch.setCurrentIndex(list(CHANNELS.values()).index(channel))
+        self.cb_rep = QComboBox()
+        self.cb_rep.addItems(["Play once", "Repeat N times", "Continuous loop (∞)"])
+        self.sp_n = QSpinBox(); self.sp_n.setRange(2, 65535); self.sp_n.setValue(2)
+        self.cb_target = QComboBox()
+        self.cb_target.addItems(["Replace current project", "Append as segment"])
+        fo.addRow("Controlled", self.cb_ch)
+        fo.addRow("Playback", self._row(self.cb_rep, self.sp_n))
+        fo.addRow("Insert", self.cb_target)
+        left.addWidget(go)
+        left.addStretch()
+
+        # --- right: preview
+        right = QVBoxLayout(); main.addLayout(right, 1)
+        self.canvas = PlotCanvas()
+        right.addWidget(NavigationToolbar2QT(self.canvas, self))
+        right.addWidget(self.canvas, 1)
+        self.lbl = QLabel("Choose a file with time and value columns."); self.lbl.setWordWrap(True)
+        right.addWidget(self.lbl)
+        self.bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.bb.button(QDialogButtonBox.Ok).setText("Import")
+        self.bb.accepted.connect(self.accept); self.bb.rejected.connect(self.reject)
+        right.addWidget(self.bb)
+
+        for w in (self.chk_header, self.chk_zero, self.rb_step, self.rb_cont):
+            w.toggled.connect(self.update_preview)
+        for w in (self.cb_tcol, self.cb_vcol, self.cb_unit, self.cb_tmode,
+                  self.cb_ch, self.cb_rep):
+            w.currentIndexChanged.connect(self.update_preview)
+        for w in (self.sp_last, self.sp_dt, self.sp_minhold, self.sp_scale,
+                  self.sp_offset):
+            w.valueChanged.connect(self.update_preview)
+        self.sp_n.valueChanged.connect(self.update_preview)
+        self.update_preview()
+
+    @staticmethod
+    def _dspin(lo, hi, dec, val):
+        s = QDoubleSpinBox(); s.setRange(lo, hi); s.setDecimals(dec)
+        s.setValue(val); s.setKeyboardTracking(False)
+        return s
+
+    @staticmethod
+    def _row(*ws):
+        w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(0, 0, 0, 0)
+        for x in ws: h.addWidget(x)
+        return w
+
+    def browse(self):
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "Open sample file", "",
+            "Samples (*.csv *.txt *.tsv *.dat *.xlsx *.xlsm);;All files (*)")
+        if not fn: return
+        try:
+            self.rows = core.read_table_file(fn)
+        except (OSError, ValueError) as e:
+            QMessageBox.critical(self, "Read failed", str(e)); return
+        if not self.rows:
+            QMessageBox.warning(self, "Read failed", "The file is empty."); return
+        self.path = fn
+        self.ed_path.setText(fn)
+        hdr = core.detect_header(self.rows)
+        ncol = max(len(r) for r in self.rows[:50])
+        names = [(self.rows[0][i] if hdr and i < len(self.rows[0]) else f"Column {i + 1}")
+                 for i in range(ncol)]
+        for cb in (self.cb_tcol, self.cb_vcol):
+            cb.blockSignals(True); cb.clear(); cb.addItems(names); cb.blockSignals(False)
+        self.cb_vcol.setCurrentIndex(1 if ncol > 1 else 0)
+        # guess the time unit from the header text
+        h0 = names[0].lower()
+        for key, unit in (("µs", "µs"), ("us]", "µs"), ("ms", "ms"), ("[s]", "s"),
+                          ("sec", "s"), ("min", "min")):
+            if key in h0:
+                self.cb_unit.setCurrentText(unit); break
+        if any(":" in r[0] for r in self.rows[1:5] if r):
+            self.cb_unit.setCurrentText("hh:mm:ss / date-time")
+        self.chk_header.blockSignals(True); self.chk_header.setChecked(hdr)
+        self.chk_header.blockSignals(False)
+        show = self.rows[:8]
+        self.tbl_raw.setRowCount(len(show)); self.tbl_raw.setColumnCount(ncol)
+        for r, row in enumerate(show):
+            for c, val in enumerate(row):
+                self.tbl_raw.setItem(r, c, QTableWidgetItem(val))
+        self.update_preview()
+
+    def options(self) -> core.SampleImportOptions:
+        return core.SampleImportOptions(
+            time_is_duration=self.cb_tmode.currentIndex() == 1,
+            zero_start=self.chk_zero.isChecked(),
+            continuous=self.rb_cont.isChecked(),
+            resample_dt=self.sp_dt.value() / 1000.0,
+            last_hold=self.sp_last.value(),
+            min_hold=self.sp_minhold.value() / 1000.0,
+            scale=self.sp_scale.value(), offset=self.sp_offset.value())
+
+    def repeat(self) -> int:
+        i = self.cb_rep.currentIndex()
+        return 1 if i == 0 else (self.sp_n.value() if i == 1 else 0)
+
+    def channel(self) -> str:
+        return CHANNELS[self.cb_ch.currentText()]
+
+    def fit_steps(self):
+        if len(self.samples) < 2: return
+        span = self.samples[-1][0] - self.samples[0][0]
+        dt = max(0.001, span / 950)               # ~2 steps per point + margin
+        self.sp_dt.setValue(math.ceil(dt * 1000))
+        self.rb_cont.setChecked(True)
+
+    def update_preview(self, *_):
+        self.sp_dt.setEnabled(self.rb_cont.isChecked())
+        self.sp_minhold.setEnabled(self.rb_step.isChecked())
+        self.sp_n.setEnabled(self.cb_rep.currentIndex() == 1)
+        self.cb_unit.setEnabled(True)
+        ok_btn = self.bb.button(QDialogButtonBox.Ok)
+        self.points = []
+        ax = self.canvas.ax
+        if not self.rows:
+            ok_btn.setEnabled(False); return
+        try:
+            self.samples, skipped = core.extract_samples(
+                self.rows, self.cb_tcol.currentIndex(), self.cb_vcol.currentIndex(),
+                self.cb_unit.currentText(), self.chk_header.isChecked())
+            self.points, warns = core.samples_to_points(self.samples, self.options())
+        except (ValueError, ZeroDivisionError) as e:
+            self.lbl.setText(f"<span style='color:#c00'>{e}</span>")
+            ok_btn.setEnabled(False); return
+        ch = self.channel()
+        self.canvas.plot([tuple(p) for p in self.points], ch, self.repeat(), [], None)
+        o = self.options()
+        if self.samples:
+            t0 = 0 if not o.zero_start or o.time_is_duration else self.samples[0][0]
+            if o.time_is_duration:
+                ts, acc = [], 0.0
+                for d, _v in self.samples:
+                    ts.append(acc); acc += d
+            else:
+                ts = [t - t0 for t, _ in self.samples]
+            ax.plot(ts, [v * o.scale + o.offset for _, v in self.samples], "o",
+                    ms=3, color="#ff7f0e", label="samples")
+            ax.legend(loc="best", fontsize=8)
+            self.canvas.draw_idle()
+        n_steps = 2 * len(self.points) + 4
+        dur = sum(p[1] for p in self.points)
+        msg = [f"{len(self.samples)} samples → {len(self.points)} points ≈ "
+               f"<b>{n_steps} steps</b> (max {core.MAX_STEPS}) · {dur:.3f} s per pass"]
+        if skipped:
+            msg.append(f"{skipped} row(s) without numeric time/value were skipped.")
+        msg += warns
+        if n_steps > core.MAX_STEPS:
+            msg.append("<span style='color:#c00'>Too many steps – use Continuous "
+                       "with a larger resample step (or 'Fit to 2000 steps'), or a "
+                       "larger minimum hold.</span>")
+        self.lbl.setText("<br>".join(msg))
+        ok_btn.setEnabled(bool(self.points) and n_steps <= core.MAX_STEPS)
+
+
 class ImportCanvas(FigureCanvasQTAgg):
     """Multi-channel plot of a simulated (imported) sequence."""
     COLORS = {"SV": "#1f6fb2", "SC": "#d62728", "SP": "#2ca02c",
@@ -317,6 +543,7 @@ class MainWindow(QMainWindow):
             (None, None, None),
             ("Export .txt…", self.export_txt, "Ctrl+E"),
             ("Open sequence .txt…", self.import_txt, "Ctrl+I"),
+            ("Import samples (CSV/Excel)…", self.import_samples, "Ctrl+M"),
             ("Upload to PSU…", self.upload_psu, None),
         ]:
             if text is None:
@@ -673,6 +900,28 @@ class MainWindow(QMainWindow):
         self.txt_import.setPlainText(text)
         self.plot_tabs.setCurrentIndex(1)
         self.run_import_sim()
+
+    def import_samples(self):
+        dlg = SampleImportDialog(self, self.cfg.channel)
+        if dlg.exec_() != QDialog.Accepted or not dlg.points:
+            return
+        seg = {"type": "Table", "points": dlg.points}
+        if dlg.cb_target.currentIndex() == 0:
+            name = "".join(c for c in os.path.splitext(os.path.basename(dlg.path))[0]
+                           if c.isalnum() or c == "_")[:16]
+            if not name or not name[0].isalpha():
+                name = "SAMPLES"
+            self.cfg.segments = [seg]
+            self.cfg.name = name
+            self.current_file = None
+        else:
+            self.cfg.segments.append(seg)
+        self.cfg.channel = dlg.channel()
+        self.cfg.repeat = dlg.repeat()
+        self._load_settings_into_ui()
+        self.settings_changed()
+        self.lst.setCurrentRow(len(self.cfg.segments) - 1)
+        self.plot_tabs.setCurrentIndex(0)
 
     def _parse_inputs(self) -> dict:
         out = {}
