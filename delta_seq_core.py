@@ -699,3 +699,197 @@ def trace_to_points(trace: list[tuple[float, float]], end_time: float,
         else:
             pts.append([v, hold])
     return pts
+
+
+# ==========================================================================
+# Importing measured samples (timestamp / value) from CSV, TXT or Excel
+# ==========================================================================
+TIME_UNITS = {"µs": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0, "h": 3600.0,
+              "hh:mm:ss / date-time": None}
+
+
+def read_table_file(path: str) -> list[list[str]]:
+    """Return the raw cells of a CSV/TXT/TSV or Excel file as strings."""
+    low = path.lower()
+    if low.endswith((".xlsx", ".xlsm")):
+        try:
+            import openpyxl
+        except ImportError:
+            raise ValueError("Reading Excel needs 'openpyxl' (pip install openpyxl).")
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.worksheets[0]
+        rows = [["" if c is None else str(c) for c in r]
+                for r in ws.iter_rows(values_only=True)]
+        wb.close()
+        return [r for r in rows if any(x.strip() for x in r)]
+
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
+        lines = [ln.rstrip("\r\n") for ln in fh if ln.strip()]
+    lines = [ln for ln in lines if not ln.lstrip().startswith(("#", "//"))]
+    sample = lines[:50]
+    # choose delimiter: the one that gives a consistent column count > 1
+    best, best_score = None, 0
+    for d in ("\t", ";", ",", "|"):
+        counts = [len(ln.split(d)) for ln in sample]
+        if counts and min(counts) > 1:
+            score = sum(1 for c in counts if c == counts[-1])
+            if score > best_score:
+                best, best_score = d, score
+    if best is None:
+        return [ln.split() for ln in lines]          # whitespace separated
+    rows = [[c.strip().strip('"') for c in ln.split(best)] for ln in lines]
+    if best == ";":                                  # European decimal comma
+        rows = [[c.replace(",", ".") if re.fullmatch(r"[-+]?\d+,\d+", c) else c
+                 for c in r] for r in rows]
+    return rows
+
+
+def _to_float(s: str) -> float | None:
+    try:
+        return float(str(s).strip().replace(",", ".") if re.fullmatch(
+            r"\s*[-+]?\d+,\d+\s*", str(s)) else s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_clock(s: str) -> float | None:
+    """'12:03:04.5', '03:04', '2026-11-19 12:03:04.500' -> seconds."""
+    from datetime import datetime
+    s = str(s).strip()
+    try:
+        return datetime.fromisoformat(s.replace("/", "-")).timestamp()
+    except ValueError:
+        pass
+    m = re.fullmatch(r"(?:(\d+):)?(\d+):(\d+(?:[.,]\d+)?)", s)
+    if m:
+        h, mi, sec = m.groups()
+        return int(h or 0) * 3600 + int(mi) * 60 + float(sec.replace(",", "."))
+    return None
+
+
+def detect_header(rows: list[list[str]]) -> bool:
+    if not rows:
+        return False
+    first = rows[0]
+    return not any(_to_float(c) is not None or _parse_clock(c) is not None
+                   for c in first if c.strip())
+
+
+def extract_samples(rows: list[list[str]], tcol: int, vcol: int, unit: str,
+                    has_header: bool) -> tuple[list[tuple[float, float]], int]:
+    """Return ([(t_seconds, value)], skipped_row_count)."""
+    out, skipped = [], 0
+    factor = TIME_UNITS[unit]
+    for r in rows[1 if has_header else 0:]:
+        if max(tcol, vcol) >= len(r):
+            skipped += 1; continue
+        v = _to_float(r[vcol])
+        t = _parse_clock(r[tcol]) if factor is None else _to_float(r[tcol])
+        if t is None or v is None:
+            skipped += 1; continue
+        out.append((t if factor is None else t * factor, v))
+    return out, skipped
+
+
+@dataclass
+class SampleImportOptions:
+    time_is_duration: bool = False   # False: timestamps, True: hold time per sample
+    zero_start: bool = True          # shift first timestamp to t = 0
+    continuous: bool = False         # False: step/hold, True: linear interpolation
+    resample_dt: float = 0.1         # s, used when continuous
+    last_hold: float = 1.0           # s, hold time of the last sample
+    min_hold: float = 0.001          # s, shorter steps are merged (step mode)
+    scale: float = 1.0
+    offset: float = 0.0
+    decimals: int = 3
+
+
+def samples_to_points(samples: list[tuple[float, float]],
+                      o: SampleImportOptions) -> tuple[list[list[float]], list[str]]:
+    """Turn (time, value) samples into [value, hold] points for a Table segment."""
+    warn: list[str] = []
+    if not samples:
+        return [], ["No numeric samples found."]
+
+    # durations -> timestamps
+    if o.time_is_duration:
+        ts, acc = [], 0.0
+        for d, v in samples:
+            ts.append((acc, v)); acc += d
+        samples, end_t = ts, acc
+    else:
+        if any(b[0] < a[0] for a, b in zip(samples, samples[1:])):
+            warn.append("Timestamps were not in order – samples sorted by time.")
+            samples = sorted(samples, key=lambda x: x[0])
+        dup = sum(1 for a, b in zip(samples, samples[1:]) if a[0] == b[0])
+        if dup:
+            warn.append(f"{dup} duplicate timestamp(s) – the later value is used.")
+            dedup = {}
+            for t, v in samples:
+                dedup[t] = v
+            samples = sorted(dedup.items())
+        end_t = samples[-1][0] + o.last_hold
+
+    samples = [(t, v * o.scale + o.offset) for t, v in samples]
+    t0 = samples[0][0]
+    lead = []
+    if o.zero_start:
+        samples = [(t - t0, v) for t, v in samples]
+        end_t -= t0
+    elif t0 > 0:
+        lead = [[0.0, t0]]                     # output 0 until the first sample
+        warn.append(f"Output is 0 for the first {t0:g} s (before the first sample).")
+    elif t0 < 0:
+        warn.append("Negative timestamps – enable 'start at 0'.")
+        samples = [(t - t0, v) for t, v in samples]; end_t -= t0
+
+    pts: list[list[float]] = []
+    if o.continuous and len(samples) > 1:
+        if o.resample_dt < MIN_WAIT:
+            raise ValueError("Resample step must be at least 1 ms.")
+        last_t = samples[-1][0]
+        n = max(1, int(math.ceil((last_t - samples[0][0]) / o.resample_dt - 1e-9)))
+        j = 0
+        for k in range(n):
+            t = samples[0][0] + k * o.resample_dt
+            while j < len(samples) - 2 and samples[j + 1][0] <= t:
+                j += 1
+            (ta, va), (tb, vb) = samples[j], samples[j + 1]
+            v = va if tb == ta else va + (vb - va) * (t - ta) / (tb - ta)
+            hold = min(o.resample_dt, last_t - t)
+            pts.append([v, hold])
+        tail = end_t - last_t
+        pts.append([samples[-1][1], tail if tail > 0 else MIN_WAIT])
+    else:
+        for i, (t, v) in enumerate(samples):
+            t_next = samples[i + 1][0] if i + 1 < len(samples) else end_t
+            pts.append([v, t_next - t])
+        if pts[-1][1] <= 0:
+            pts[-1][1] = MIN_WAIT
+
+    # round, merge short steps and equal neighbours
+    merged: list[list[float]] = []
+    short = 0
+    pending_extra = 0.0
+    for v, h in lead + pts:
+        v = round(v, o.decimals)
+        if h < o.min_hold and not o.continuous:
+            short += 1
+            if merged:
+                merged[-1][1] += h        # absorb into previous step
+            else:
+                pending_extra += h
+            continue
+        h += pending_extra; pending_extra = 0.0
+        if merged and merged[-1][0] == v:
+            merged[-1][1] += h
+        else:
+            merged.append([v, h])
+    if pending_extra and merged:
+        merged[0][1] += pending_extra
+    for p in merged:
+        p[1] = max(MIN_WAIT, round(p[1], 3))
+    if short:
+        warn.append(f"{short} sample(s) shorter than the minimum hold "
+                    f"({o.min_hold * 1000:g} ms) were merged into the previous step.")
+    return merged, warn
