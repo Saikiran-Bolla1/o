@@ -52,8 +52,9 @@ def key(path):
 
 
 class OrderedSet(object):
-    def __init__(self):
+    def __init__(self, keep_order=False):
         self._d = {}
+        self._keep = keep_order
 
     def add(self, value):
         self._d.setdefault(key(value), value)
@@ -63,6 +64,8 @@ class OrderedSet(object):
             self.add(v)
 
     def __iter__(self):
+        if self._keep:                     # first-seen order (needed for -I paths)
+            return iter(list(self._d.values()))
         return iter(sorted(self._d.values(), key=key))
 
     def __len__(self):
@@ -147,7 +150,7 @@ RE_SRC = re.compile(r'(?:^|\s)("([^"]+\.c)"|(\S+\.c))(?=\s|$)', re.I)
 
 
 def parse_build_log(logfile):
-    incs, defs, srcs = OrderedSet(), set(), OrderedSet()
+    incs, defs, srcs = OrderedSet(keep_order=True), set(), OrderedSet()
     with open(logfile, "r", errors="replace") as f:
         for line in f:
             if " -c " not in line and " -I" not in line:
