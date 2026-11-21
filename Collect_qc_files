@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+python collect_qac_files.py --build-dir "C:\My Projects\ECU\Debug" --log build.log --out qac_input
 collect_qac_files.py
 Collect every .c / .h file really used by a build (tresos + Eclipse + HighTec GCC)
 and create input lists for a QAC 7.0 analysis.
