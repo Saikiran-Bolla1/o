@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-python collect_qac_files.py --build-dir "C:\My Projects\ECU\Debug" --log build.log --out qac_input
 collect_qac_files.py
 Collect every .c / .h file really used by a build (tresos + Eclipse + HighTec GCC)
 and create input lists for a QAC 7.0 analysis.
@@ -107,6 +106,40 @@ def collect_from_d_files(build_dir):
     return used
 
 
+# --------------------------------------------------------------------------- 1b. .i files
+RE_MARKER = re.compile(r'^#\s*(?:line\s+)?\d+\s+"([^"]+)"')
+
+
+def parse_i_file(filename):
+    """Return files named in the line markers of a preprocessed (.i) file."""
+    seen = set()
+    with open(filename, "r", errors="replace") as f:
+        for line in f:
+            if not line.startswith("#"):
+                continue
+            m = RE_MARKER.match(line)
+            if not m:
+                continue
+            p = m.group(1).replace("\\\\", "\\")
+            if p.startswith("<"):                 # <built-in>, <command-line>
+                continue
+            seen.add(p)
+    return seen
+
+
+def collect_from_i_files(build_dir):
+    used = OrderedSet()
+    count = 0
+    for root, _dirs, names in os.walk(build_dir):
+        for n in names:
+            if n.lower().endswith(".i"):
+                count += 1
+                for p in parse_i_file(os.path.join(root, n)):
+                    used.add(norm(p))
+    print("  parsed %d .i files, %d unique files" % (count, len(used)))
+    return used
+
+
 # --------------------------------------------------------------------------- 2. build log
 RE_INC = re.compile(r'(?:^|\s)-I\s*("([^"]+)"|\'([^\']+)\'|(\S+))')
 RE_DEF = re.compile(r'(?:^|\s)-D\s*("([^"]*)"|\'([^\']*)\'|(\S+))')
@@ -171,6 +204,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--build-dir", help="root folder searched recursively for *.d files")
+    ap.add_argument("--extra-dir", action="append",
+                    help="additional folder with .d/.i files (can be repeated), "
+                         "e.g. the application build folder")
     ap.add_argument("--log", help="build log (make -n -B / Eclipse console output)")
     ap.add_argument("--compiler", help="compiler executable, e.g. tricore-gcc")
     ap.add_argument("--cflags", default="", help='target flags, e.g. "-mcpu=tc27xx"')
@@ -191,6 +227,12 @@ def main():
     if a.build_dir:
         print("Reading dependency files ...")
         used.update(collect_from_d_files(a.build_dir))
+        print("Reading preprocessed .i files ...")
+        used.update(collect_from_i_files(a.build_dir))
+        for extra in (a.extra_dir or []):
+            print("Reading extra dir %s ..." % extra)
+            used.update(collect_from_d_files(extra))
+            used.update(collect_from_i_files(extra))
     if a.log:
         print("Reading build log ...")
         log_incs, log_defs, log_srcs = parse_build_log(a.log)
