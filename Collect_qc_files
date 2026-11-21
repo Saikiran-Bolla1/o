@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+collect_qac_files.py
+Collect every .c / .h file really used by a build (tresos + Eclipse + HighTec GCC)
+and create input lists for a QAC 7.0 analysis.
+
+Sources of information
+  1. *.d dependency files   (compiler option -MD / -MMD)   -> used .c and .h files
+  2. build log              (make -n -B  or Eclipse console) -> -I paths, -D macros, .c files
+  3. compiler itself        (optional)                      -> system include dirs, predefined macros
+
+Outputs (in --out):
+  c_files.txt        all .c files used
+  h_files.txt        all headers used
+  inc_dirs.txt       directories of used headers
+  build_includes.txt -I paths found in the build log
+  build_defines.txt  -D macros found in the build log
+  qac_options.via    -i / -d lines for a QAC -via file
+  used_files_copy/   (only with --copy) copy of all files, folder structure kept
+
+Examples
+  python collect_qac_files.py --build-dir C:\\proj\\Debug --log build.log --out qac_in
+  python collect_qac_files.py --build-dir . --log build.log --compiler tricore-gcc ^
+         --cflags "-mcpu=tc27xx" --out qac_in --copy
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+
+# --------------------------------------------------------------------------- helpers
+def norm(path):
+    """Normalise a path: cygwin / msys style -> drive letter, forward slashes."""
+    p = path.strip().strip('"')
+    m = re.match(r"^/cygdrive/([a-zA-Z])/(.*)", p)
+    if m:
+        p = "%s:/%s" % (m.group(1).upper(), m.group(2))
+    else:
+        m = re.match(r"^/([a-zA-Z])/(.*)", p)      # msys: /c/work/...
+        if m and os.name == "nt":
+            p = "%s:/%s" % (m.group(1).upper(), m.group(2))
+    p = os.path.normpath(p)
+    return p.replace("\\", "/")
+
+
+def key(path):
+    """Key for de-duplication (case-insensitive on Windows)."""
+    return os.path.normcase(path)
+
+
+class OrderedSet(object):
+    def __init__(self):
+        self._d = {}
+
+    def add(self, value):
+        self._d.setdefault(key(value), value)
+
+    def update(self, values):
+        for v in values:
+            self.add(v)
+
+    def __iter__(self):
+        return iter(sorted(self._d.values(), key=key))
+
+    def __len__(self):
+        return len(self._d)
+
+
+def write_list(path, items):
+    with open(path, "w") as f:
+        for i in items:
+            f.write(i + "\n")
+
+
+# --------------------------------------------------------------------------- 1. .d files
+def parse_d_file(filename):
+    """Return list of files mentioned as prerequisites in a make dependency file."""
+    with open(filename, "r", errors="replace") as f:
+        text = f.read()
+    text = re.sub(r"\\\r?\n", " ", text)           # join continuation lines
+    files = []
+    for line in text.splitlines():
+        line = re.sub(r"^\S+?:(?=\s|$)", "", line.strip())  # drop 'target:'
+        if not line:
+            continue
+        for tok in re.split(r"(?<!\\)\s+", line):
+            tok = tok.replace("\\ ", " ").strip()
+            if re.search(r"\.(c|h|inc|hpp|cpp|s)$", tok, re.I):
+                files.append(tok)
+    return files
+
+
+def collect_from_d_files(build_dir):
+    used = OrderedSet()
+    count = 0
+    for root, _dirs, names in os.walk(build_dir):
+        for n in names:
+            if n.lower().endswith(".d"):
+                count += 1
+                for f in parse_d_file(os.path.join(root, n)):
+                    used.add(norm(f))
+    print("  parsed %d .d files, %d unique files" % (count, len(used)))
+    return used
+
+
+# --------------------------------------------------------------------------- 2. build log
+RE_INC = re.compile(r'(?:^|\s)-I\s*("([^"]+)"|\'([^\']+)\'|(\S+))')
+RE_DEF = re.compile(r'(?:^|\s)-D\s*("([^"]*)"|\'([^\']*)\'|(\S+))')
+RE_SRC = re.compile(r'(?:^|\s)("([^"]+\.c)"|(\S+\.c))(?=\s|$)', re.I)
+
+
+def parse_build_log(logfile):
+    incs, defs, srcs = OrderedSet(), set(), OrderedSet()
+    with open(logfile, "r", errors="replace") as f:
+        for line in f:
+            if " -c " not in line and " -I" not in line:
+                continue                          # not a compile command
+            for m in RE_INC.finditer(line):
+                incs.add(norm(m.group(2) or m.group(3) or m.group(4)))
+            for m in RE_DEF.finditer(line):
+                defs.add(m.group(2) or m.group(3) or m.group(4))
+            if " -c " in line:
+                for m in RE_SRC.finditer(line):
+                    srcs.add(norm(m.group(2) or m.group(3)))
+    print("  log: %d include paths, %d defines, %d .c files"
+          % (len(incs), len(defs), len(srcs)))
+    return incs, sorted(defs), srcs
+
+
+# --------------------------------------------------------------------------- 3. compiler
+def run(cmd):
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         universal_newlines=True)
+    out, err = p.communicate()
+    return out, err
+
+
+def compiler_info(compiler, cflags):
+    """Return (system include dirs, predefined macros as 'NAME=VALUE')."""
+    flags = cflags.split() if cflags else []
+    sysinc, macros = [], []
+    try:
+        _out, err = run([compiler] + flags + ["-E", "-v", "-x", "c", os.devnull])
+        take = False
+        for line in err.splitlines():
+            if "search starts here" in line:
+                take = True
+            elif line.startswith("End of search list"):
+                take = False
+            elif take and line.startswith(" "):
+                sysinc.append(norm(line.strip()))
+        out, _err = run([compiler] + flags + ["-dM", "-E", "-x", "c", os.devnull])
+        for line in out.splitlines():
+            m = re.match(r"#define\s+(\S+(?:\([^)]*\))?)\s*(.*)", line)
+            if m:
+                macros.append("%s=%s" % (m.group(1), m.group(2)) if m.group(2)
+                              else m.group(1))
+    except OSError as e:
+        print("  WARNING: cannot run compiler '%s': %s" % (compiler, e))
+    print("  compiler: %d system include dirs, %d predefined macros"
+          % (len(sysinc), len(macros)))
+    return sysinc, macros
+
+
+# --------------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--build-dir", help="root folder searched recursively for *.d files")
+    ap.add_argument("--log", help="build log (make -n -B / Eclipse console output)")
+    ap.add_argument("--compiler", help="compiler executable, e.g. tricore-gcc")
+    ap.add_argument("--cflags", default="", help='target flags, e.g. "-mcpu=tc27xx"')
+    ap.add_argument("--out", default="qac_input", help="output folder")
+    ap.add_argument("--copy", action="store_true",
+                    help="copy all used files to <out>/used_files_copy")
+    ap.add_argument("--no-sysinc", action="store_true",
+                    help="do not add compiler system includes/macros to the via file")
+    a = ap.parse_args()
+
+    if not (a.build_dir or a.log):
+        ap.error("give at least --build-dir or --log")
+    os.makedirs(a.out, exist_ok=True)
+
+    used = OrderedSet()
+    log_incs, log_defs, log_srcs = OrderedSet(), [], OrderedSet()
+
+    if a.build_dir:
+        print("Reading dependency files ...")
+        used.update(collect_from_d_files(a.build_dir))
+    if a.log:
+        print("Reading build log ...")
+        log_incs, log_defs, log_srcs = parse_build_log(a.log)
+        used.update(log_srcs)                      # .c files seen in the log
+
+    sysinc, macros = [], []
+    if a.compiler:
+        print("Querying compiler ...")
+        sysinc, macros = compiler_info(a.compiler, a.cflags)
+
+    c_files = [f for f in used if f.lower().endswith(".c")]
+    h_files = [f for f in used if re.search(r"\.(h|hpp|inc)$", f, re.I)]
+    inc_dirs = OrderedSet()
+    for h in h_files:
+        inc_dirs.add(os.path.dirname(h))
+
+    write_list(os.path.join(a.out, "c_files.txt"), c_files)
+    write_list(os.path.join(a.out, "h_files.txt"), h_files)
+    write_list(os.path.join(a.out, "inc_dirs.txt"), inc_dirs)
+    write_list(os.path.join(a.out, "build_includes.txt"), log_incs)
+    write_list(os.path.join(a.out, "build_defines.txt"), log_defs)
+
+    # QAC via file: project include paths first, then compiler system paths
+    with open(os.path.join(a.out, "qac_options.via"), "w") as f:
+        for i in log_incs:
+            f.write("-i %s\n" % i)
+        if not a.no_sysinc:
+            for i in sysinc:
+                f.write("-i %s\n" % i)
+        for d in log_defs:
+            f.write("-d %s\n" % d)
+        if not a.no_sysinc:
+            for d in macros:
+                f.write("-d %s\n" % d)
+
+    # headers that are not covered by any collected include path
+    known = set(key(i) for i in list(log_incs) + sysinc)
+    uncovered = sorted(set(os.path.dirname(h) for h in h_files
+                           if key(os.path.dirname(h)) not in known))
+    if uncovered:
+        write_list(os.path.join(a.out, "dirs_not_in_log.txt"), uncovered)
+        print("  NOTE: %d header dirs are not in the log's -I list "
+              "(see dirs_not_in_log.txt; probably included relative to the .c file)"
+              % len(uncovered))
+
+    if a.copy:
+        dst_root = os.path.join(a.out, "used_files_copy")
+        n = 0
+        for src in c_files + h_files:
+            if not os.path.isfile(src):
+                continue
+            drive_free = re.sub(r"^[A-Za-z]:", lambda m: m.group(0)[0], src)
+            dst = os.path.join(dst_root, drive_free.lstrip("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            n += 1
+        print("  copied %d files to %s" % (n, dst_root))
+
+    print("\nDone: %d .c files, %d headers, %d include dirs -> %s"
+          % (len(c_files), len(h_files), len(inc_dirs), os.path.abspath(a.out)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
